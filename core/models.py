@@ -45,3 +45,66 @@ class HubConfig(models.Model):
 
     def __str__(self):
         return f"{self.nome} - Loja {self.loja_id}"
+
+class Terminal(models.Model):
+    terminal_uuid = models.UUIDField(
+        default=uuid.uuid4,
+        unique=True,
+        editable=False,
+    )
+
+    hub = models.ForeignKey(
+        HubConfig,
+        on_delete=models.PROTECT,
+        related_name="terminais",
+    )
+
+    nome = models.CharField(
+        max_length=100,
+    )
+
+    codigo = models.CharField(
+        max_length=30,
+        unique=True,
+    )
+
+    caixa_retaguarda_id = models.PositiveBigIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    hostname = models.CharField(
+        max_length=150,
+        blank=True,
+        default="",
+    )
+
+    ultimo_ip = models.GenericIPAddressField(
+        null=True,
+        blank=True,
+    )
+
+    ativo = models.BooleanField(
+        default=True,
+    )
+
+    ultima_conexao_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    criado_em = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    atualizado_em = models.DateTimeField(
+        auto_now=True,
+    )
+
+    class Meta:
+        verbose_name = "Terminal"
+        verbose_name_plural = "Terminais"
+        ordering = ("codigo", "nome")
+
+    def __str__(self):
+        return f"{self.codigo} - {self.nome}"
