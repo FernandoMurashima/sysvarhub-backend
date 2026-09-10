@@ -1,0 +1,55 @@
+# =========================
+# Framework principal
+# =========================
+Django==4.2.11
+djangorestframework==3.14.0
+
+# =========================
+# Extensões úteis
+# =========================
+django-cors-headers==4.7.0
+django-filter==24.1
+django-extensions==3.2.3
+
+# =========================
+# Documentação da API (drf-yasg + deps)
+# =========================
+drf-yasg==1.21.7
+Markdown==3.5.2
+coreapi==2.3.3
+coreschema==0.0.4
+uritemplate==4.1.1
+PyYAML==6.0.2
+inflection==0.5.1
+
+# =========================
+# Banco de dados
+# =========================
+mysqlclient==2.2.4
+
+# =========================
+# Configuração por variáveis de ambiente
+# =========================
+python-decouple==3.8
+# (alternativa: django-environ==0.11.2)
+
+# =========================
+# Tarefas assíncronas (opcional)
+# =========================
+celery==5.3.6
+redis==5.0.1
+
+# =========================
+# Dependências internas do Django / utilitários
+# =========================
+asgiref==3.8.1
+sqlparse==0.5.3
+pytz==2025.2
+tzdata==2025.2
+
+# Necessário para pkg_resources usado por drf-yasg e outros
+setuptools>=65.0.0,<81
+
+validate-docbr==1.10.0
+phonenumbers==8.13.52
+openpyxl==3.1.5
