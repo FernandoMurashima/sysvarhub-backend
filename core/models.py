@@ -15,8 +15,36 @@ class HubConfig(models.Model):
         default="Sysvar Hub",
     )
 
-    empresa_id = models.PositiveBigIntegerField()
-    loja_id = models.PositiveBigIntegerField()
+    empresa_id = models.PositiveBigIntegerField(
+        null=True,
+        blank=True,
+    )
+    loja_id = models.PositiveBigIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    retaguarda_hub_id = models.PositiveBigIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    retaguarda_token = models.TextField(
+        blank=True,
+        default="",
+    )
+
+    empresa_nome = models.CharField(
+        max_length=150,
+        blank=True,
+        default="",
+    )
+
+    loja_nome = models.CharField(
+        max_length=150,
+        blank=True,
+        default="",
+    )
 
     retaguarda_url = models.URLField(
         max_length=255,
@@ -27,6 +55,16 @@ class HubConfig(models.Model):
     )
 
     ultima_sincronizacao_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    ativado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    ultimo_heartbeat_em = models.DateTimeField(
         null=True,
         blank=True,
     )
@@ -44,7 +82,8 @@ class HubConfig(models.Model):
         verbose_name_plural = "Configurações do Hub"
 
     def __str__(self):
-        return f"{self.nome} - Loja {self.loja_id}"
+        loja = self.loja_nome or self.loja_id or "não ativada"
+        return f"{self.nome} - Loja {loja}"
 
 class Terminal(models.Model):
     terminal_uuid = models.UUIDField(

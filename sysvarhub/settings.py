@@ -63,6 +63,7 @@ INSTALLED_APPS = [
 
     # Apps do Sysvar Hub
     "core.apps.CoreConfig",
+    "integracao.apps.IntegracaoConfig",
 ]
 
 
