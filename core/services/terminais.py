@@ -1,6 +1,9 @@
-from django.db import transaction
+from datetime import timedelta
 
-from core.models import CaixaHub, Terminal
+from django.db import transaction
+from django.utils import timezone
+
+from core.models import CaixaHub, PareamentoTerminal, Terminal
 
 
 class TerminalValidationError(Exception):
@@ -52,7 +55,16 @@ def desativar_terminal(hub, codigo):
             raise TerminalValidationError("Terminal nao encontrado.") from exc
 
         terminal.ativo = False
-        terminal.save(update_fields=["ativo", "atualizado_em"])
+        terminal.token_hash = ""
+        terminal.token_prefixo = ""
+        terminal.save(
+            update_fields=[
+                "ativo",
+                "token_hash",
+                "token_prefixo",
+                "atualizado_em",
+            ]
+        )
 
     return terminal
 
@@ -79,3 +91,107 @@ def obter_caixa_terminal(hub, caixa_retaguarda_id):
         hub=hub,
         retaguarda_id=caixa_retaguarda_id,
     ).first()
+
+
+class PareamentoTerminalError(Exception):
+    """Erro controlado no pareamento de terminais."""
+
+
+def gerar_pareamento_terminal(terminal, validade_minutos=15):
+    if not terminal.ativo:
+        raise PareamentoTerminalError("Terminal inativo nao pode gerar pareamento.")
+
+    agora = timezone.now()
+    codigo = PareamentoTerminal.gerar_codigo()
+
+    with transaction.atomic():
+        terminal = Terminal.objects.select_for_update().get(pk=terminal.pk)
+        if not terminal.ativo:
+            raise PareamentoTerminalError("Terminal inativo nao pode gerar pareamento.")
+
+        PareamentoTerminal.objects.filter(
+            terminal=terminal,
+            usado_em__isnull=True,
+            revogado_em__isnull=True,
+            expira_em__gt=agora,
+        ).update(revogado_em=agora)
+
+        pareamento = PareamentoTerminal.objects.create(
+            terminal=terminal,
+            codigo_hash=PareamentoTerminal.hash_codigo(codigo),
+            codigo_prefixo=PareamentoTerminal.normalizar_codigo(codigo)[:4],
+            expira_em=agora + timedelta(minutes=validade_minutos),
+        )
+
+    return pareamento, codigo
+
+
+def parear_terminal(codigo, hostname="", ip=None):
+    codigo_normalizado = PareamentoTerminal.normalizar_codigo(codigo)
+    if not codigo_normalizado:
+        raise PareamentoTerminalError("Codigo de pareamento e obrigatorio.")
+
+    agora = timezone.now()
+
+    with transaction.atomic():
+        try:
+            pareamento = (
+                PareamentoTerminal.objects.select_for_update()
+                .select_related("terminal", "terminal__hub")
+                .get(codigo_hash=PareamentoTerminal.hash_codigo(codigo_normalizado))
+            )
+        except PareamentoTerminal.DoesNotExist as exc:
+            raise PareamentoTerminalError("Codigo de pareamento invalido.") from exc
+
+        if pareamento.usado_em is not None:
+            raise PareamentoTerminalError("Codigo de pareamento ja utilizado.")
+        if pareamento.revogado_em is not None:
+            raise PareamentoTerminalError("Codigo de pareamento revogado.")
+        if pareamento.expira_em <= agora:
+            raise PareamentoTerminalError("Codigo de pareamento expirado.")
+
+        terminal = pareamento.terminal
+        if not terminal.ativo:
+            raise PareamentoTerminalError("Terminal inativo nao pode parear.")
+
+        token = terminal.gerar_token()
+        terminal.pareado_em = agora
+        terminal.ultima_conexao_em = agora
+        if hostname:
+            terminal.hostname = hostname.strip()
+        if ip:
+            terminal.ultimo_ip = ip
+        terminal.save(
+            update_fields=[
+                "token_hash",
+                "token_prefixo",
+                "pareado_em",
+                "hostname",
+                "ultimo_ip",
+                "ultima_conexao_em",
+                "atualizado_em",
+            ]
+        )
+
+        pareamento.usado_em = agora
+        pareamento.save(update_fields=["usado_em"])
+
+    return terminal, token
+
+
+def registrar_heartbeat_terminal(terminal, hostname="", ip=None):
+    agora = timezone.now()
+    terminal.ultima_conexao_em = agora
+    if hostname:
+        terminal.hostname = hostname.strip()
+    if ip:
+        terminal.ultimo_ip = ip
+    terminal.save(
+        update_fields=[
+            "hostname",
+            "ultimo_ip",
+            "ultima_conexao_em",
+            "atualizado_em",
+        ]
+    )
+    return terminal

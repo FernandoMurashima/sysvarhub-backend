@@ -1,5 +1,10 @@
+import hashlib
+import hmac
+import secrets
+import string
 import uuid
 
+from django.conf import settings
 from django.db import models
 
 
@@ -159,7 +164,10 @@ class CaixaHub(models.Model):
     def __str__(self):
         return f"{self.codigo} - {self.descricao or self.retaguarda_id}"
 
+
 class Terminal(models.Model):
+    TOKEN_BYTES = 32
+
     terminal_uuid = models.UUIDField(
         default=uuid.uuid4,
         unique=True,
@@ -181,6 +189,24 @@ class Terminal(models.Model):
     )
 
     caixa_retaguarda_id = models.PositiveBigIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    token_hash = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        db_index=True,
+    )
+
+    token_prefixo = models.CharField(
+        max_length=12,
+        blank=True,
+        default="",
+    )
+
+    pareado_em = models.DateTimeField(
         null=True,
         blank=True,
     )
@@ -226,3 +252,88 @@ class Terminal(models.Model):
 
     def __str__(self):
         return f"{self.codigo} - {self.nome}"
+
+    @staticmethod
+    def hash_token(token):
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def gerar_token(self):
+        token = secrets.token_urlsafe(self.TOKEN_BYTES)
+        self.token_hash = self.hash_token(token)
+        self.token_prefixo = token[:12]
+        return token
+
+
+class PareamentoTerminal(models.Model):
+    CODIGO_GRUPOS = 3
+    CODIGO_TAMANHO_GRUPO = 4
+    CODIGO_ALFABETO = string.ascii_uppercase + string.digits
+
+    terminal = models.ForeignKey(
+        Terminal,
+        on_delete=models.CASCADE,
+        related_name="pareamentos",
+    )
+
+    codigo_hash = models.CharField(
+        max_length=64,
+        db_index=True,
+    )
+
+    codigo_prefixo = models.CharField(
+        max_length=4,
+    )
+
+    criado_em = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    expira_em = models.DateTimeField()
+
+    usado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    revogado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        verbose_name = "Pareamento de Terminal"
+        verbose_name_plural = "Pareamentos de Terminal"
+        ordering = ("-criado_em",)
+        indexes = [
+            models.Index(
+                fields=["terminal", "usado_em", "revogado_em"],
+                name="idx_pareamento_terminal_ativo",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.terminal.codigo} - {self.codigo_prefixo}"
+
+    @classmethod
+    def gerar_codigo(cls):
+        grupos = []
+        for _indice in range(cls.CODIGO_GRUPOS):
+            grupo = "".join(
+                secrets.choice(cls.CODIGO_ALFABETO)
+                for _posicao in range(cls.CODIGO_TAMANHO_GRUPO)
+            )
+            grupos.append(grupo)
+        return "-".join(grupos)
+
+    @staticmethod
+    def normalizar_codigo(codigo):
+        return (codigo or "").strip().upper()
+
+    @classmethod
+    def hash_codigo(cls, codigo):
+        normalizado = cls.normalizar_codigo(codigo)
+        return hmac.new(
+            settings.SECRET_KEY.encode("utf-8"),
+            normalizado.encode("utf-8"),
+            digestmod=hashlib.sha256,
+        ).hexdigest()
