@@ -6,8 +6,10 @@ from unittest.mock import patch
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase
+from django.utils import timezone
 
-from core.models import HubConfig
+from core.models import CaixaHub, HubConfig
+from integracao.services.bootstrap import BootstrapValidationError, sincronizar_bootstrap
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 
 
@@ -81,6 +83,26 @@ class RetaguardaClientTests(TestCase):
         self.assertEqual(captured["url"], "http://central.test/api/hub/heartbeat/")
         self.assertEqual(captured["payload"], {"hostname": "loja-01", "versao": "0.1.0"})
         self.assertEqual(captured["headers"]["Authorization"], "Hub TOKEN-SECRETO")
+
+    def test_bootstrap_usa_get_authorization_hub_token_sem_payload(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["data"] = req.data
+            captured["headers"] = dict(req.header_items())
+            return _JsonResponse({"bootstrap_versao": 1})
+
+        with patch("integracao.services.retaguarda.request.urlopen", fake_urlopen):
+            RetaguardaClient("http://central.test").bootstrap(token="TOKEN-SECRETO")
+
+        self.assertEqual(captured["url"], "http://central.test/api/hub/bootstrap/")
+        self.assertEqual(captured["method"], "GET")
+        self.assertIsNone(captured["data"])
+        self.assertEqual(captured["headers"]["Authorization"], "Hub TOKEN-SECRETO")
+        self.assertNotIn("empresa_id", captured["url"])
+        self.assertNotIn("loja_id", captured["url"])
 
     def test_indisponibilidade_gera_erro_controlado(self):
         with patch(
@@ -285,3 +307,177 @@ class HeartbeatHubCommandTests(TestCase):
         hub.refresh_from_db()
         self.assertEqual(hub.retaguarda_token, "TOKEN-SECRETO")
         self.assertIsNone(hub.ultimo_heartbeat_em)
+
+
+class BootstrapHubServiceTests(TestCase):
+    def setUp(self):
+        self.hub = HubConfig.objects.create(
+            retaguarda_url="http://central.test",
+            ativo=True,
+            retaguarda_token="TOKEN-SECRETO",
+            retaguarda_hub_id=99,
+            empresa_id=3,
+            loja_id=7,
+        )
+
+    def resposta(self, **overrides):
+        payload = {
+            "bootstrap_versao": 1,
+            "hub": {"id": 99, "hub_uuid": str(self.hub.hub_uuid), "versao": "0.1.0"},
+            "empresa": {"id": 3, "nome": "Empresa Teste"},
+            "loja": {
+                "id": 7,
+                "nome_loja": "Filial 1",
+                "apelido_loja": "F1",
+                "cnpj": "12345678000199",
+                "estado": "SP",
+            },
+            "caixas": [
+                {"id": 10, "codigo": "CX01", "descricao": "Caixa 1", "ativo": True},
+            ],
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_bootstrap_versao_1_e_aceito_e_atualiza_config(self):
+        sincronizar_bootstrap(self.hub, self.resposta())
+
+        self.hub.refresh_from_db()
+        self.assertEqual(self.hub.bootstrap_versao, 1)
+        self.assertEqual(self.hub.empresa_nome, "Empresa Teste")
+        self.assertEqual(self.hub.loja_nome, "Filial 1")
+        self.assertEqual(self.hub.loja_apelido, "F1")
+        self.assertEqual(self.hub.loja_cnpj, "12345678000199")
+        self.assertEqual(self.hub.loja_estado, "SP")
+        self.assertIsNotNone(self.hub.ultima_sincronizacao_em)
+
+    def test_versao_nao_suportada_e_rejeitada(self):
+        with self.assertRaises(BootstrapValidationError):
+            sincronizar_bootstrap(self.hub, self.resposta(bootstrap_versao=2))
+
+    def test_hub_uuid_divergente_e_rejeitado(self):
+        resposta = self.resposta()
+        resposta["hub"]["hub_uuid"] = str(uuid.uuid4())
+
+        with self.assertRaises(BootstrapValidationError):
+            sincronizar_bootstrap(self.hub, resposta)
+
+    def test_hub_id_divergente_e_rejeitado(self):
+        resposta = self.resposta()
+        resposta["hub"]["id"] = 100
+
+        with self.assertRaises(BootstrapValidationError):
+            sincronizar_bootstrap(self.hub, resposta)
+
+    def test_empresa_id_divergente_e_rejeitado(self):
+        resposta = self.resposta()
+        resposta["empresa"]["id"] = 4
+
+        with self.assertRaises(BootstrapValidationError):
+            sincronizar_bootstrap(self.hub, resposta)
+
+    def test_loja_id_divergente_e_rejeitado(self):
+        resposta = self.resposta()
+        resposta["loja"]["id"] = 8
+
+        with self.assertRaises(BootstrapValidationError):
+            sincronizar_bootstrap(self.hub, resposta)
+
+    def test_resposta_invalida_nao_altera_configuracao(self):
+        self.hub.empresa_nome = "Empresa Antiga"
+        self.hub.save(update_fields=["empresa_nome"])
+
+        with self.assertRaises(BootstrapValidationError):
+            sincronizar_bootstrap(self.hub, {"bootstrap_versao": 1})
+
+        self.hub.refresh_from_db()
+        self.assertEqual(self.hub.empresa_nome, "Empresa Antiga")
+        self.assertFalse(CaixaHub.objects.exists())
+
+    def test_caixa_novo_e_criado(self):
+        sincronizar_bootstrap(self.hub, self.resposta())
+
+        caixa = CaixaHub.objects.get(hub=self.hub, retaguarda_id=10)
+        self.assertEqual(caixa.codigo, "CX01")
+        self.assertEqual(caixa.descricao, "Caixa 1")
+        self.assertTrue(caixa.ativo)
+
+    def test_caixa_existente_e_atualizado(self):
+        CaixaHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=10,
+            codigo="OLD",
+            descricao="Antigo",
+            ativo=False,
+            sincronizado_em=timezone.now(),
+        )
+
+        sincronizar_bootstrap(self.hub, self.resposta())
+
+        caixa = CaixaHub.objects.get(hub=self.hub, retaguarda_id=10)
+        self.assertEqual(caixa.codigo, "CX01")
+        self.assertEqual(caixa.descricao, "Caixa 1")
+        self.assertTrue(caixa.ativo)
+
+    def test_caixa_ausente_e_inativado_sem_deletar(self):
+        caixa = CaixaHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=11,
+            codigo="CX02",
+            descricao="Caixa 2",
+            ativo=True,
+            sincronizado_em=timezone.now(),
+        )
+
+        sincronizar_bootstrap(self.hub, self.resposta())
+
+        caixa.refresh_from_db()
+        self.assertFalse(caixa.ativo)
+
+    def test_duas_sincronizacoes_nao_duplicam_caixas(self):
+        sincronizar_bootstrap(self.hub, self.resposta())
+        sincronizar_bootstrap(self.hub, self.resposta())
+
+        self.assertEqual(CaixaHub.objects.filter(hub=self.hub, retaguarda_id=10).count(), 1)
+
+    def test_ultima_sincronizacao_em_atualiza_somente_com_sucesso(self):
+        with self.assertRaises(BootstrapValidationError):
+            sincronizar_bootstrap(self.hub, self.resposta(bootstrap_versao=2))
+
+        self.hub.refresh_from_db()
+        self.assertIsNone(self.hub.ultima_sincronizacao_em)
+
+
+class SincronizarBootstrapHubCommandTests(TestCase):
+    def test_token_nao_aparece_na_saida_do_command(self):
+        hub = HubConfig.objects.create(
+            retaguarda_url="http://central.test",
+            ativo=True,
+            retaguarda_token="TOKEN-SECRETO",
+            retaguarda_hub_id=99,
+            empresa_id=3,
+            loja_id=7,
+        )
+        resposta = {
+            "bootstrap_versao": 1,
+            "hub": {"id": 99, "hub_uuid": str(hub.hub_uuid)},
+            "empresa": {"id": 3, "nome": "Empresa Teste"},
+            "loja": {"id": 7, "nome_loja": "Filial 1"},
+            "caixas": [],
+        }
+        out = io.StringIO()
+
+        with patch(
+            "integracao.management.commands.sincronizar_bootstrap_hub.RetaguardaClient.bootstrap",
+            return_value=resposta,
+        ):
+            call_command("sincronizar_bootstrap_hub", stdout=out)
+
+        self.assertNotIn("TOKEN-SECRETO", out.getvalue())
+
+    def test_mais_de_um_hubconfig_gera_erro(self):
+        HubConfig.objects.create(retaguarda_url="http://one.test")
+        HubConfig.objects.create(retaguarda_url="http://two.test")
+
+        with self.assertRaises(CommandError):
+            call_command("sincronizar_bootstrap_hub", stdout=io.StringIO())

@@ -46,6 +46,29 @@ class HubConfig(models.Model):
         default="",
     )
 
+    loja_apelido = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+    )
+
+    loja_cnpj = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+    )
+
+    loja_estado = models.CharField(
+        max_length=2,
+        blank=True,
+        default="",
+    )
+
+    bootstrap_versao = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+    )
+
     retaguarda_url = models.URLField(
         max_length=255,
     )
@@ -84,6 +107,57 @@ class HubConfig(models.Model):
     def __str__(self):
         loja = self.loja_nome or self.loja_id or "não ativada"
         return f"{self.nome} - Loja {loja}"
+
+
+class CaixaHub(models.Model):
+    hub = models.ForeignKey(
+        HubConfig,
+        on_delete=models.PROTECT,
+        related_name="caixas",
+    )
+
+    retaguarda_id = models.PositiveBigIntegerField()
+
+    codigo = models.CharField(
+        max_length=30,
+    )
+
+    descricao = models.CharField(
+        max_length=150,
+        blank=True,
+        default="",
+    )
+
+    ativo = models.BooleanField(
+        default=True,
+    )
+
+    sincronizado_em = models.DateTimeField()
+
+    criado_em = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    atualizado_em = models.DateTimeField(
+        auto_now=True,
+    )
+
+    class Meta:
+        verbose_name = "Caixa do Hub"
+        verbose_name_plural = "Caixas do Hub"
+        ordering = ("codigo", "retaguarda_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["hub", "retaguarda_id"],
+                name="uniq_caixa_hub_por_retaguarda",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "ativo"], name="idx_caixa_hub_ativo"),
+        ]
+
+    def __str__(self):
+        return f"{self.codigo} - {self.descricao or self.retaguarda_id}"
 
 class Terminal(models.Model):
     terminal_uuid = models.UUIDField(

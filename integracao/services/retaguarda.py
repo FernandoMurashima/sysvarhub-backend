@@ -41,13 +41,28 @@ class RetaguardaClient:
             headers={"Authorization": f"Hub {token}"},
         )
 
+    def bootstrap(self, *, token):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._request_json(
+            "api/hub/bootstrap/",
+            method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
     def _post_json(self, path, payload, headers=None):
+        return self._request_json(path, method="POST", payload=payload, headers=headers)
+
+    def _request_json(self, path, *, method, payload=None, headers=None):
         url = urljoin(self.base_url, path)
-        body = json.dumps(payload).encode("utf-8")
+        body = None
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
         req_headers = {
-            "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        if body is not None:
+            req_headers["Content-Type"] = "application/json"
         if headers:
             req_headers.update(headers)
 
@@ -55,7 +70,7 @@ class RetaguardaClient:
             url,
             data=body,
             headers=req_headers,
-            method="POST",
+            method=method,
         )
 
         try:
