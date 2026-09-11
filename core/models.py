@@ -178,7 +178,6 @@ class Terminal(models.Model):
 
     codigo = models.CharField(
         max_length=30,
-        unique=True,
     )
 
     caixa_retaguarda_id = models.PositiveBigIntegerField(
@@ -218,6 +217,12 @@ class Terminal(models.Model):
         verbose_name = "Terminal"
         verbose_name_plural = "Terminais"
         ordering = ("codigo", "nome")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["hub", "codigo"],
+                name="uniq_terminal_hub_codigo",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.codigo} - {self.nome}"
