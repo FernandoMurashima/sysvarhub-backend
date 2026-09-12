@@ -74,6 +74,38 @@ class HubConfig(models.Model):
         blank=True,
     )
 
+    catalogo_versao = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    catalogo_gerado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    catalogo_sincronizado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    tabela_preco_retaguarda_id = models.PositiveBigIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    tabela_preco_codigo = models.CharField(
+        max_length=30,
+        blank=True,
+        default="",
+    )
+
+    tabela_preco_nome = models.CharField(
+        max_length=150,
+        blank=True,
+        default="",
+    )
+
     retaguarda_url = models.URLField(
         max_length=255,
     )
@@ -163,6 +195,80 @@ class CaixaHub(models.Model):
 
     def __str__(self):
         return f"{self.codigo} - {self.descricao or self.retaguarda_id}"
+
+
+class CatalogoItemHub(models.Model):
+    hub = models.ForeignKey(
+        HubConfig,
+        on_delete=models.PROTECT,
+        related_name="catalogo_itens",
+    )
+
+    retaguarda_produto_id = models.PositiveBigIntegerField()
+    retaguarda_sku_id = models.PositiveBigIntegerField()
+
+    tipo_produto = models.CharField(max_length=30)
+    referencia = models.CharField(max_length=80, blank=True, default="")
+    descricao = models.CharField(max_length=200)
+    descricao_reduzida = models.CharField(max_length=120, blank=True, default="")
+    ean13 = models.CharField(max_length=13, blank=True, default="", db_index=True)
+    codigo_item_ref = models.CharField(max_length=80, blank=True, default="")
+
+    cor_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    cor_descricao = models.CharField(max_length=80, blank=True, default="")
+
+    tamanho_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    tamanho_descricao = models.CharField(max_length=80, blank=True, default="")
+
+    unidade_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    unidade_codigo = models.CharField(max_length=20, blank=True, default="")
+    unidade_descricao = models.CharField(max_length=80, blank=True, default="")
+
+    preco = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    preco_promocional = models.DecimalField(
+        max_digits=12,
+        decimal_places=4,
+        null=True,
+        blank=True,
+    )
+    preco_venda = models.DecimalField(
+        max_digits=12,
+        decimal_places=4,
+        null=True,
+        blank=True,
+    )
+
+    estoque_fisico = models.DecimalField(max_digits=14, decimal_places=3, default=0)
+    reserva = models.DecimalField(max_digits=14, decimal_places=3, default=0)
+    estoque_disponivel = models.DecimalField(max_digits=14, decimal_places=3, default=0)
+
+    vendavel = models.BooleanField(default=False)
+    motivos_bloqueio = models.JSONField(default=list, blank=True)
+    fiscal = models.JSONField(default=dict, blank=True)
+    ativo = models.BooleanField(default=True)
+    sincronizado_em = models.DateTimeField()
+
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Item de catálogo do Hub"
+        verbose_name_plural = "Itens de catálogo do Hub"
+        ordering = ("descricao", "retaguarda_sku_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["hub", "retaguarda_sku_id"],
+                name="uniq_catalogo_hub_sku",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "ativo"], name="idx_catalogo_hub_ativo"),
+            models.Index(fields=["hub", "vendavel"], name="idx_catalogo_hub_vendavel"),
+            models.Index(fields=["hub", "referencia"], name="idx_catalogo_hub_ref"),
+        ]
+
+    def __str__(self):
+        return f"{self.retaguarda_sku_id} - {self.descricao}"
 
 
 class Terminal(models.Model):
