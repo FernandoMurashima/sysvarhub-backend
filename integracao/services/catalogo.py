@@ -8,6 +8,8 @@ from core.models import CatalogoItemHub
 
 
 CATALOGO_VERSOES_SUPORTADAS = {1}
+CATALOGO_TABELA_PRECO_CODIGO_V1 = "PADRAO"
+CATALOGO_TABELA_PRECO_NOME_V1 = "Tabela Padrão"
 MOTIVOS_BLOQUEIO_V1 = {"SEM_PRECO", "SEM_ESTOQUE"}
 
 
@@ -146,7 +148,7 @@ def _validar_tabela_preco(tabela_preco):
     if not isinstance(tabela_preco, dict):
         raise CatalogoValidationError("Catálogo retornou tabela_preco inválida.")
     _exigir_campos(tabela_preco, ("id", "codigo", "nome"))
-    if tabela_preco["codigo"] != "VAREJO":
+    if tabela_preco["codigo"] != CATALOGO_TABELA_PRECO_CODIGO_V1:
         raise CatalogoValidationError("Catálogo V1 retornou tabela de preço incompatível.")
     return {
         "id": tabela_preco["id"],

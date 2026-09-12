@@ -555,7 +555,7 @@ class CatalogoHubServiceTests(TestCase):
             "hub": {"id": 99, "hub_uuid": str(self.hub.hub_uuid)},
             "empresa": {"id": 3, "nome": "Empresa Teste"},
             "loja": {"id": 7, "nome": "Filial 1", "apelido": "F1"},
-            "tabela_preco": {"id": 5, "codigo": "VAREJO", "nome": "Varejo"},
+            "tabela_preco": {"id": 5, "codigo": "PADRAO", "nome": "Tabela Padrão"},
             "total_itens": len(itens),
             "itens": itens,
         }
@@ -639,13 +639,13 @@ class CatalogoHubServiceTests(TestCase):
 
         self.assertIsNone(CatalogoItemHub.objects.get().preco_venda)
 
-    def test_tabela_varejo_e_persistida(self):
+    def test_tabela_padrao_e_persistida(self):
         sincronizar_catalogo(self.hub, self.resposta())
 
         self.hub.refresh_from_db()
         self.assertEqual(self.hub.tabela_preco_retaguarda_id, 5)
-        self.assertEqual(self.hub.tabela_preco_codigo, "VAREJO")
-        self.assertEqual(self.hub.tabela_preco_nome, "Varejo")
+        self.assertEqual(self.hub.tabela_preco_codigo, "PADRAO")
+        self.assertEqual(self.hub.tabela_preco_nome, "Tabela Padrão")
 
     def test_tabela_null_e_aceita(self):
         sincronizar_catalogo(self.hub, self.resposta(tabela_preco=None))
@@ -657,6 +657,11 @@ class CatalogoHubServiceTests(TestCase):
     def test_codigo_tabela_incompativel_rejeita_v1(self):
         self.assert_rejeita(
             self.resposta(tabela_preco={"id": 5, "codigo": "ATACADO", "nome": "Atacado"})
+        )
+
+    def test_codigo_tabela_varejo_rejeita_v1(self):
+        self.assert_rejeita(
+            self.resposta(tabela_preco={"id": 5, "codigo": "VAREJO", "nome": "Varejo"})
         )
 
     def test_sku_id_duplicado_rejeita_snapshot(self):
@@ -755,7 +760,7 @@ class CatalogoHubServiceTests(TestCase):
         self.hub.refresh_from_db()
         self.assertIsNotNone(self.hub.catalogo_gerado_em)
         self.assertIsNotNone(self.hub.catalogo_sincronizado_em)
-        self.assertEqual(self.hub.tabela_preco_codigo, "VAREJO")
+        self.assertEqual(self.hub.tabela_preco_codigo, "PADRAO")
 
     def test_tabela_null_limpa_metadados_anteriores(self):
         sincronizar_catalogo(self.hub, self.resposta())
