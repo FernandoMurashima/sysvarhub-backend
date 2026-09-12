@@ -1,3 +1,4 @@
+from django.db.models import Case, IntegerField, Q, Value, When
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
@@ -5,13 +6,17 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from core.authentication import TerminalTokenAuthentication
-from core.models import CaixaHub
+from core.models import CaixaHub, CatalogoItemHub
 from core.permissions import IsTerminalAuthenticated
 from core.services.terminais import (
     PareamentoTerminalError,
     parear_terminal,
     registrar_heartbeat_terminal,
 )
+
+
+CATALOGO_TERMINAL_LIMIT_DEFAULT = 40
+CATALOGO_TERMINAL_LIMIT_MAX = 100
 
 
 class ParearTerminalView(APIView):
@@ -63,6 +68,122 @@ class TerminalHeartbeatView(APIView):
                 "servidor_em": timezone.now().isoformat(),
             }
         )
+
+
+class TerminalCatalogoView(APIView):
+    authentication_classes = [TerminalTokenAuthentication]
+    permission_classes = [IsTerminalAuthenticated]
+
+    def get(self, request):
+        terminal = request.sysvar_terminal
+        hub = terminal.hub
+        termo = (request.query_params.get("q") or "").strip()
+        limit = _normalizar_limit(request.query_params.get("limit"))
+
+        itens = CatalogoItemHub.objects.filter(hub=hub, ativo=True)
+        if termo:
+            itens = _aplicar_busca_catalogo(itens, termo)
+        else:
+            itens = itens.order_by("descricao", "retaguarda_sku_id")
+
+        total = itens.count()
+        itens = itens[:limit]
+
+        return Response(
+            {
+                "catalogo_versao": hub.catalogo_versao,
+                "catalogo_sincronizado_em": (
+                    hub.catalogo_sincronizado_em.isoformat()
+                    if hub.catalogo_sincronizado_em
+                    else None
+                ),
+                "tabela_preco": {
+                    "codigo": hub.tabela_preco_codigo,
+                    "nome": hub.tabela_preco_nome,
+                },
+                "q": termo,
+                "total": total,
+                "limit": limit,
+                "itens": [_serializar_catalogo_item(item) for item in itens],
+            }
+        )
+
+
+def _normalizar_limit(valor):
+    try:
+        limit = int(valor)
+    except (TypeError, ValueError):
+        return CATALOGO_TERMINAL_LIMIT_DEFAULT
+    if limit <= 0:
+        return CATALOGO_TERMINAL_LIMIT_DEFAULT
+    return min(limit, CATALOGO_TERMINAL_LIMIT_MAX)
+
+
+def _aplicar_busca_catalogo(queryset, termo):
+    busca = (
+        Q(ean13__icontains=termo)
+        | Q(referencia__icontains=termo)
+        | Q(codigo_item_ref__icontains=termo)
+        | Q(descricao__icontains=termo)
+        | Q(descricao_reduzida__icontains=termo)
+        | Q(cor_descricao__icontains=termo)
+        | Q(tamanho_descricao__icontains=termo)
+    )
+    prioridade = Case(
+        When(ean13__iexact=termo, then=Value(1)),
+        When(codigo_item_ref__iexact=termo, then=Value(2)),
+        When(referencia__iexact=termo, then=Value(3)),
+        When(referencia__icontains=termo, then=Value(4)),
+        When(descricao__icontains=termo, then=Value(5)),
+        default=Value(6),
+        output_field=IntegerField(),
+    )
+    return queryset.filter(busca).annotate(prioridade_busca=prioridade).order_by(
+        "prioridade_busca",
+        "descricao",
+        "retaguarda_sku_id",
+    )
+
+
+def _serializar_catalogo_item(item):
+    return {
+        "produto_id": item.retaguarda_produto_id,
+        "sku_id": item.retaguarda_sku_id,
+        "tipo_produto": item.tipo_produto,
+        "referencia": item.referencia,
+        "descricao": item.descricao,
+        "descricao_reduzida": item.descricao_reduzida,
+        "ean13": item.ean13 or None,
+        "codigo_item_ref": item.codigo_item_ref,
+        "cor": {
+            "id": item.cor_retaguarda_id,
+            "descricao": item.cor_descricao,
+        },
+        "tamanho": {
+            "id": item.tamanho_retaguarda_id,
+            "descricao": item.tamanho_descricao,
+        },
+        "unidade": {
+            "id": item.unidade_retaguarda_id,
+            "codigo": item.unidade_codigo,
+            "descricao": item.unidade_descricao,
+        },
+        "preco": _decimal_para_string(item.preco),
+        "preco_promocional": _decimal_para_string(item.preco_promocional),
+        "preco_venda": _decimal_para_string(item.preco_venda),
+        "estoque_fisico": _decimal_para_string(item.estoque_fisico),
+        "reserva": _decimal_para_string(item.reserva),
+        "estoque_disponivel": _decimal_para_string(item.estoque_disponivel),
+        "vendavel": item.vendavel,
+        "motivos_bloqueio": item.motivos_bloqueio,
+        "fiscal": item.fiscal,
+    }
+
+
+def _decimal_para_string(valor):
+    if valor is None:
+        return None
+    return str(valor)
 
 
 def _montar_contexto_terminal(terminal, incluir_ativo_terminal=True):

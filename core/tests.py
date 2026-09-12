@@ -1,4 +1,5 @@
 from io import StringIO
+from unittest.mock import patch
 
 from django.core.management import call_command
 from django.core.management.base import CommandError
@@ -8,7 +9,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework.throttling import ScopedRateThrottle
 
-from core.models import CaixaHub, HubConfig, PareamentoTerminal, Terminal
+from core.models import CaixaHub, CatalogoItemHub, HubConfig, PareamentoTerminal, Terminal
 from core.api import ParearTerminalView
 from core.services.terminais import (
     PareamentoTerminalError,
@@ -515,3 +516,339 @@ class TerminalPareamentoApiTests(TestCase):
         resposta = self.client.get("/api/terminal/contexto/")
 
         self.assertIn(resposta.status_code, (401, 403))
+
+
+class TerminalCatalogoApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.hub = HubConfig.objects.create(
+            retaguarda_url="http://central.test",
+            empresa_id=11,
+            loja_id=41,
+            empresa_nome="Sysvar Moda Comercio e Confeccoes Ltda",
+            loja_nome="Loja Barra",
+            loja_apelido="Barra",
+            loja_estado="RJ",
+            catalogo_versao=1,
+            catalogo_sincronizado_em=timezone.now(),
+            tabela_preco_codigo="PADRAO",
+            tabela_preco_nome="Tabela Padrão",
+        )
+        CaixaHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=29,
+            codigo="CX-BARRA",
+            descricao="Caixa Loja Barra",
+            ativo=True,
+            sincronizado_em=timezone.now(),
+        )
+        self.terminal = configurar_terminal(self.hub, "PDV-01", "PDV 01", 29)
+        self.token = self.terminal.gerar_token()
+        self.terminal.save()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Terminal {self.token}")
+
+    def criar_item(self, hub=None, **overrides):
+        dados = {
+            "hub": hub or self.hub,
+            "retaguarda_produto_id": 181,
+            "retaguarda_sku_id": 10825,
+            "tipo_produto": "1",
+            "referencia": "27-01-01001",
+            "descricao": "Calça Jeans Reta Aurora",
+            "descricao_reduzida": "Calça Jeans",
+            "ean13": "7892701000013",
+            "codigo_item_ref": "00001",
+            "cor_retaguarda_id": 7,
+            "cor_descricao": "Azul",
+            "tamanho_retaguarda_id": 3,
+            "tamanho_descricao": "M",
+            "unidade_retaguarda_id": 1,
+            "unidade_codigo": "UN",
+            "unidade_descricao": "Unidade",
+            "preco": "199.9000",
+            "preco_promocional": None,
+            "preco_venda": "199.9000",
+            "estoque_fisico": "4.000",
+            "reserva": "0.000",
+            "estoque_disponivel": "4.000",
+            "vendavel": True,
+            "motivos_bloqueio": [],
+            "fiscal": {"ncm": "62034200"},
+            "ativo": True,
+            "sincronizado_em": timezone.now(),
+        }
+        dados.update(overrides)
+        return CatalogoItemHub.objects.create(**dados)
+
+    def get_catalogo(self, **params):
+        return self.client.get("/api/terminal/catalogo/", params)
+
+    def test_terminal_autenticado_acessa_catalogo(self):
+        self.criar_item()
+
+        resposta = self.get_catalogo()
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(len(resposta.data["itens"]), 1)
+
+    def test_sem_token_e_rejeitado(self):
+        self.client.credentials()
+
+        resposta = self.get_catalogo()
+
+        self.assertIn(resposta.status_code, (401, 403))
+
+    def test_token_invalido_e_rejeitado(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Terminal invalido")
+
+        resposta = self.get_catalogo()
+
+        self.assertIn(resposta.status_code, (401, 403))
+
+    def test_terminal_inativo_e_rejeitado(self):
+        self.terminal.ativo = False
+        self.terminal.save()
+
+        resposta = self.get_catalogo()
+
+        self.assertIn(resposta.status_code, (401, 403))
+
+    def test_retorna_somente_itens_ativos(self):
+        self.criar_item(retaguarda_sku_id=1, ativo=True)
+        self.criar_item(retaguarda_sku_id=2, ativo=False)
+
+        resposta = self.get_catalogo()
+
+        self.assertEqual(resposta.data["total"], 1)
+        self.assertEqual(resposta.data["itens"][0]["sku_id"], 1)
+
+    def test_nao_esconde_item_nao_vendavel(self):
+        self.criar_item(
+            vendavel=False,
+            motivos_bloqueio=["SEM_ESTOQUE"],
+            estoque_fisico="0.000",
+            estoque_disponivel="0.000",
+        )
+
+        item = self.get_catalogo().data["itens"][0]
+
+        self.assertFalse(item["vendavel"])
+        self.assertEqual(item["motivos_bloqueio"], ["SEM_ESTOQUE"])
+
+    def test_busca_ean_exato(self):
+        self.criar_item()
+
+        resposta = self.get_catalogo(q="7892701000013")
+
+        self.assertEqual(resposta.data["total"], 1)
+        self.assertEqual(resposta.data["itens"][0]["ean13"], "7892701000013")
+
+    def test_busca_referencia_exata(self):
+        self.criar_item()
+
+        resposta = self.get_catalogo(q="27-01-01001")
+
+        self.assertEqual(resposta.data["itens"][0]["referencia"], "27-01-01001")
+
+    def test_busca_referencia_parcial(self):
+        self.criar_item()
+
+        resposta = self.get_catalogo(q="01001")
+
+        self.assertEqual(resposta.data["total"], 1)
+
+    def test_busca_descricao_parcial_case_insensitive(self):
+        self.criar_item()
+
+        resposta = self.get_catalogo(q="jeans reta")
+
+        self.assertEqual(resposta.data["total"], 1)
+
+    def test_busca_codigo_item_ref(self):
+        self.criar_item()
+
+        resposta = self.get_catalogo(q="00001")
+
+        self.assertEqual(resposta.data["itens"][0]["codigo_item_ref"], "00001")
+
+    def test_busca_sem_q_funciona(self):
+        self.criar_item()
+
+        resposta = self.get_catalogo()
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(resposta.data["q"], "")
+
+    def test_limit_default_e_40(self):
+        resposta = self.get_catalogo(limit="invalido")
+
+        self.assertEqual(resposta.data["limit"], 40)
+
+    def test_limit_maximo_e_100(self):
+        resposta = self.get_catalogo(limit=150)
+
+        self.assertEqual(resposta.data["limit"], 100)
+
+    def test_limit_invalido_ou_menor_igual_zero_usa_default(self):
+        resposta = self.get_catalogo(limit=0)
+
+        self.assertEqual(resposta.data["limit"], 40)
+
+    def test_total_representa_total_antes_do_limit(self):
+        for indice in range(45):
+            self.criar_item(
+                retaguarda_produto_id=indice + 1,
+                retaguarda_sku_id=indice + 1,
+                descricao=f"Produto Total {indice:02d}",
+                referencia=f"REF-{indice:02d}",
+                ean13=str(7892701000000 + indice),
+                codigo_item_ref=f"IT-{indice:02d}",
+            )
+
+        resposta = self.get_catalogo(q="Produto Total", limit=10)
+
+        self.assertEqual(resposta.data["total"], 45)
+        self.assertEqual(len(resposta.data["itens"]), 10)
+
+    def test_sku_sem_ean_retorna_null(self):
+        self.criar_item(ean13="")
+
+        item = self.get_catalogo().data["itens"][0]
+
+        self.assertIsNone(item["ean13"])
+
+    def test_preco_e_retornado(self):
+        self.criar_item(preco="199.9000", preco_promocional="179.9000", preco_venda="179.9000")
+
+        item = self.get_catalogo().data["itens"][0]
+
+        self.assertEqual(item["preco"], "199.9000")
+        self.assertEqual(item["preco_promocional"], "179.9000")
+        self.assertEqual(item["preco_venda"], "179.9000")
+
+    def test_estoque_fisico_e_retornado(self):
+        self.criar_item(estoque_fisico="4.000")
+
+        self.assertEqual(self.get_catalogo().data["itens"][0]["estoque_fisico"], "4.000")
+
+    def test_reserva_e_retornada(self):
+        self.criar_item(reserva="1.000")
+
+        self.assertEqual(self.get_catalogo().data["itens"][0]["reserva"], "1.000")
+
+    def test_estoque_disponivel_e_retornado(self):
+        self.criar_item(estoque_disponivel="3.000")
+
+        self.assertEqual(self.get_catalogo().data["itens"][0]["estoque_disponivel"], "3.000")
+
+    def test_vendavel_e_retornado(self):
+        self.criar_item(vendavel=True)
+
+        self.assertTrue(self.get_catalogo().data["itens"][0]["vendavel"])
+
+    def test_motivos_bloqueio_sao_retornados(self):
+        self.criar_item(vendavel=False, motivos_bloqueio=["SEM_PRECO"])
+
+        self.assertEqual(self.get_catalogo().data["itens"][0]["motivos_bloqueio"], ["SEM_PRECO"])
+
+    def test_fiscal_e_retornado(self):
+        self.criar_item(fiscal={"ncm": "62034200", "origem": "0"})
+
+        self.assertEqual(self.get_catalogo().data["itens"][0]["fiscal"]["ncm"], "62034200")
+
+    def test_produto_id_vem_de_retaguarda_produto_id(self):
+        self.criar_item(retaguarda_produto_id=181)
+
+        self.assertEqual(self.get_catalogo().data["itens"][0]["produto_id"], 181)
+
+    def test_sku_id_vem_de_retaguarda_sku_id(self):
+        self.criar_item(retaguarda_sku_id=10825)
+
+        self.assertEqual(self.get_catalogo().data["itens"][0]["sku_id"], 10825)
+
+    def test_cor_e_mapeada(self):
+        self.criar_item(cor_retaguarda_id=7, cor_descricao="Azul")
+
+        self.assertEqual(self.get_catalogo().data["itens"][0]["cor"], {"id": 7, "descricao": "Azul"})
+
+    def test_tamanho_e_mapeado(self):
+        self.criar_item(tamanho_retaguarda_id=3, tamanho_descricao="M")
+
+        self.assertEqual(self.get_catalogo().data["itens"][0]["tamanho"], {"id": 3, "descricao": "M"})
+
+    def test_unidade_e_mapeada(self):
+        self.criar_item(unidade_retaguarda_id=1, unidade_codigo="UN", unidade_descricao="Unidade")
+
+        self.assertEqual(
+            self.get_catalogo().data["itens"][0]["unidade"],
+            {"id": 1, "codigo": "UN", "descricao": "Unidade"},
+        )
+
+    def test_catalogo_versao_e_retornado(self):
+        resposta = self.get_catalogo()
+
+        self.assertEqual(resposta.data["catalogo_versao"], 1)
+
+    def test_tabela_padrao_e_retornada(self):
+        resposta = self.get_catalogo()
+
+        self.assertEqual(resposta.data["tabela_preco"], {"codigo": "PADRAO", "nome": "Tabela Padrão"})
+
+    def test_hub_a_nao_recebe_catalogo_hub_b(self):
+        hub_b = HubConfig.objects.create(retaguarda_url="http://central-b.test", empresa_id=22, loja_id=55)
+        self.criar_item(retaguarda_sku_id=1, descricao="Item Hub A")
+        self.criar_item(hub=hub_b, retaguarda_sku_id=2, descricao="Item Hub B")
+
+        resposta = self.get_catalogo()
+
+        self.assertEqual(resposta.data["total"], 1)
+        self.assertEqual(resposta.data["itens"][0]["descricao"], "Item Hub A")
+
+    def test_query_hub_id_nao_muda_escopo(self):
+        hub_b = HubConfig.objects.create(retaguarda_url="http://central-b.test", empresa_id=22, loja_id=55)
+        self.criar_item(retaguarda_sku_id=1, descricao="Item Hub A")
+        self.criar_item(hub=hub_b, retaguarda_sku_id=2, descricao="Item Hub B")
+
+        resposta = self.get_catalogo(hub_id=hub_b.id)
+
+        self.assertEqual(resposta.data["total"], 1)
+        self.assertEqual(resposta.data["itens"][0]["descricao"], "Item Hub A")
+
+    def test_query_loja_id_nao_muda_escopo(self):
+        hub_b = HubConfig.objects.create(retaguarda_url="http://central-b.test", empresa_id=22, loja_id=55)
+        self.criar_item(retaguarda_sku_id=1, descricao="Item Hub A")
+        self.criar_item(hub=hub_b, retaguarda_sku_id=2, descricao="Item Hub B")
+
+        resposta = self.get_catalogo(loja_id=hub_b.loja_id)
+
+        self.assertEqual(resposta.data["total"], 1)
+        self.assertEqual(resposta.data["itens"][0]["descricao"], "Item Hub A")
+
+    def test_ean_exato_recebe_prioridade_sobre_busca_textual(self):
+        self.criar_item(
+            retaguarda_sku_id=1,
+            ean13="111",
+            descricao="Produto 7892701000013 textual",
+            referencia="REF-TEXT",
+            codigo_item_ref="TEXT",
+        )
+        self.criar_item(
+            retaguarda_sku_id=2,
+            ean13="7892701000013",
+            descricao="Produto EAN Exato",
+            referencia="REF-EAN",
+            codigo_item_ref="EAN",
+        )
+
+        resposta = self.get_catalogo(q="7892701000013")
+
+        self.assertEqual(resposta.data["itens"][0]["sku_id"], 2)
+
+    def test_endpoint_nao_chama_retaguardaclient_central(self):
+        self.criar_item()
+
+        with patch("integracao.services.retaguarda.RetaguardaClient.catalogo") as catalogo:
+            resposta = self.get_catalogo()
+
+        self.assertEqual(resposta.status_code, 200)
+        catalogo.assert_not_called()
