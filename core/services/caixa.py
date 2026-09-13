@@ -86,7 +86,8 @@ def abrir_caixa(terminal, operador, sessao_operador, *, valor_abertura):
             sessao_operador_abertura=sessao_operador,
         )
         try:
-            sessao.save()
+            with transaction.atomic():
+                sessao.save()
         except IntegrityError as exc:
             sessao_aberta = obter_sessao_caixa_aberta(caixa_bloqueado)
             if sessao_aberta:
@@ -149,9 +150,12 @@ def validar_valor_abertura(valor):
 
     if not decimal.is_finite() or decimal < 0:
         raise ValorAberturaError("Valor de abertura inválido.")
-    if decimal.as_tuple().exponent < -2:
+    casas_decimais = max(-decimal.as_tuple().exponent, 0)
+    digitos_inteiros = max(decimal.adjusted() + 1, 1)
+
+    if casas_decimais > 2:
         raise ValorAberturaError("Valor de abertura inválido.")
-    if len(decimal.as_tuple().digits) + max(decimal.as_tuple().exponent, 0) > 12:
+    if digitos_inteiros > 10:
         raise ValorAberturaError("Valor de abertura inválido.")
 
     return decimal.quantize(Decimal("0.01"))

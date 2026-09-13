@@ -182,6 +182,25 @@ class CaixaServiceTests(CaixaHubTestMixin, TestCase):
     def test_valor_positivo_permitido(self):
         self.assertEqual(validar_valor_abertura("100.00"), Decimal("100.00"))
 
+    def test_maior_valor_do_decimalfield_permitido(self):
+        self.assertEqual(validar_valor_abertura("9999999999.99"), Decimal("9999999999.99"))
+
+    def test_primeiro_valor_acima_do_limite_rejeitado(self):
+        with self.assertRaises(ValorAberturaError):
+            validar_valor_abertura("10000000000.00")
+
+    def test_onze_digitos_inteiros_rejeitados(self):
+        with self.assertRaises(ValorAberturaError):
+            validar_valor_abertura("99999999999")
+
+    def test_doze_digitos_inteiros_rejeitados(self):
+        with self.assertRaises(ValorAberturaError):
+            validar_valor_abertura("999999999999")
+
+    def test_erro_de_limite_e_valor_abertura_error(self):
+        with self.assertRaises(ValorAberturaError):
+            validar_valor_abertura("10000000000.00")
+
     def test_valor_negativo_rejeitado(self):
         with self.assertRaises(ValorAberturaError):
             validar_valor_abertura("-0.01")
@@ -214,6 +233,22 @@ class CaixaServiceTests(CaixaHubTestMixin, TestCase):
             abrir_caixa(self.terminal, self.operador, self.sessao_operador, valor_abertura="50.00")
 
         self.assertEqual(contexto.exception.sessao, sessao)
+
+    def test_integrity_error_recupera_sessao_atual_com_savepoint(self):
+        sessao_atual = object()
+
+        with patch("core.services.caixa.obter_sessao_caixa_aberta", side_effect=[None, sessao_atual]):
+            with patch.object(SessaoCaixaHub, "save", side_effect=IntegrityError("duplicado")):
+                with self.assertRaises(CaixaConflictError) as contexto:
+                    abrir_caixa(self.terminal, self.operador, self.sessao_operador, valor_abertura="100.00")
+
+        self.assertEqual(contexto.exception.sessao, sessao_atual)
+
+    def test_integrity_error_sem_sessao_atual_repropaga(self):
+        with patch("core.services.caixa.obter_sessao_caixa_aberta", side_effect=[None, None]):
+            with patch.object(SessaoCaixaHub, "save", side_effect=IntegrityError("duplicado")):
+                with self.assertRaises(IntegrityError):
+                    abrir_caixa(self.terminal, self.operador, self.sessao_operador, valor_abertura="100.00")
 
     def test_dois_terminais_mesmo_caixa_nao_duplicam(self):
         outro_terminal = configurar_terminal(self.hub, "PDV-02", "PDV 02", 29)
@@ -328,6 +363,12 @@ class CaixaApiTests(CaixaHubTestMixin, TestCase):
         self.assertEqual(resposta.status_code, 409)
         self.assertEqual(resposta.data["detail"], "Caixa já está aberto.")
         self.assertEqual(resposta.data["sessao"]["valor_abertura"], "100.00")
+
+    def test_abrir_valor_acima_do_maximo_retorna_400(self):
+        resposta = self.abrir_api("10000000000.00")
+
+        self.assertEqual(resposta.status_code, 400)
+        self.assertEqual(resposta.data["detail"], "Valor de abertura inválido.")
 
     def test_fechar_corretamente(self):
         self.abrir_api("100.00")
