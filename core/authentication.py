@@ -1,6 +1,7 @@
 from rest_framework import authentication, exceptions
 
 from core.models import Terminal
+from core.services.operadores import OperadorAuthenticationError, validar_sessao_operador
 
 
 class TerminalTokenAuthentication(authentication.BaseAuthentication):
@@ -28,3 +29,28 @@ class TerminalTokenAuthentication(authentication.BaseAuthentication):
 
         request.sysvar_terminal = terminal
         return (None, terminal)
+
+
+class TerminalOperadorAuthentication(TerminalTokenAuthentication):
+    operador_header = "HTTP_X_SYSVAR_OPERADOR_SESSION"
+
+    def authenticate(self, request):
+        resultado = super().authenticate(request)
+        if resultado is None:
+            return None
+
+        _user, terminal = resultado
+        token = request.META.get(self.operador_header)
+        try:
+            sessao = validar_sessao_operador(
+                terminal,
+                token,
+                ip=request.META.get("REMOTE_ADDR"),
+            )
+        except OperadorAuthenticationError as exc:
+            raise exceptions.AuthenticationFailed(str(exc)) from exc
+
+        request.sysvar_terminal = terminal
+        request.sysvar_operador = sessao.operador
+        request.sysvar_operador_sessao = sessao
+        return (None, sessao)

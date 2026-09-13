@@ -89,6 +89,21 @@ class HubConfig(models.Model):
         blank=True,
     )
 
+    operadores_versao = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    operadores_gerado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    operadores_sincronizado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
     tabela_preco_retaguarda_id = models.PositiveBigIntegerField(
         null=True,
         blank=True,
@@ -271,6 +286,49 @@ class CatalogoItemHub(models.Model):
         return f"{self.retaguarda_sku_id} - {self.descricao}"
 
 
+class OperadorHub(models.Model):
+    hub = models.ForeignKey(
+        HubConfig,
+        on_delete=models.PROTECT,
+        related_name="operadores",
+    )
+
+    retaguarda_usuario_id = models.PositiveBigIntegerField()
+    codigo = models.CharField(max_length=30, db_index=True)
+    nome = models.CharField(max_length=150)
+    tipo = models.CharField(max_length=30)
+    perfil_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    perfil_nome = models.CharField(max_length=150, blank=True, default="")
+    credencial_hash = models.CharField(max_length=128, blank=True, default="")
+    ativo = models.BooleanField(default=True)
+    sincronizado_em = models.DateTimeField()
+
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Operador do Hub"
+        verbose_name_plural = "Operadores do Hub"
+        ordering = ("codigo", "nome")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["hub", "retaguarda_usuario_id"],
+                name="uniq_operador_hub_usuario",
+            ),
+            models.UniqueConstraint(
+                fields=["hub", "codigo"],
+                name="uniq_operador_hub_codigo",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "ativo"], name="idx_operador_hub_ativo"),
+            models.Index(fields=["hub", "codigo"], name="idx_operador_hub_codigo"),
+        ]
+
+    def __str__(self):
+        return f"{self.codigo} - {self.nome}"
+
+
 class Terminal(models.Model):
     TOKEN_BYTES = 32
 
@@ -358,6 +416,58 @@ class Terminal(models.Model):
 
     def __str__(self):
         return f"{self.codigo} - {self.nome}"
+
+    @staticmethod
+    def hash_token(token):
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def gerar_token(self):
+        token = secrets.token_urlsafe(self.TOKEN_BYTES)
+        self.token_hash = self.hash_token(token)
+        self.token_prefixo = token[:12]
+        return token
+
+
+class SessaoOperadorHub(models.Model):
+    TOKEN_BYTES = 32
+
+    sessao_uuid = models.UUIDField(default=uuid.uuid4, unique=True)
+    terminal = models.ForeignKey(
+        Terminal,
+        on_delete=models.PROTECT,
+        related_name="sessoes_operador",
+    )
+    operador = models.ForeignKey(
+        OperadorHub,
+        on_delete=models.PROTECT,
+        related_name="sessoes",
+    )
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    token_prefixo = models.CharField(max_length=12, blank=True, default="")
+    ativa = models.BooleanField(default=True, db_index=True)
+    iniciada_em = models.DateTimeField(auto_now_add=True)
+    ultima_atividade_em = models.DateTimeField()
+    encerrada_em = models.DateTimeField(null=True, blank=True)
+    motivo_encerramento = models.CharField(max_length=30, blank=True, default="")
+    ultimo_ip = models.GenericIPAddressField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Sessão de operador do Hub"
+        verbose_name_plural = "Sessões de operador do Hub"
+        ordering = ("-iniciada_em",)
+        indexes = [
+            models.Index(
+                fields=["terminal", "ativa"],
+                name="idx_sessao_oper_terminal",
+            ),
+            models.Index(
+                fields=["operador", "ativa"],
+                name="idx_sessao_oper_operador",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.terminal.codigo} - {self.operador.codigo}"
 
     @staticmethod
     def hash_token(token):

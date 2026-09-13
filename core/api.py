@@ -5,9 +5,15 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from core.authentication import TerminalTokenAuthentication
+from core.authentication import TerminalOperadorAuthentication, TerminalTokenAuthentication
 from core.models import CaixaHub, CatalogoItemHub
-from core.permissions import IsTerminalAuthenticated
+from core.permissions import IsOperadorAuthenticated, IsTerminalAuthenticated
+from core.services.operadores import (
+    OperadorAuthenticationError,
+    autenticar_operador_terminal,
+    encerrar_sessao,
+    serializar_operador,
+)
 from core.services.terminais import (
     PareamentoTerminalError,
     parear_terminal,
@@ -107,6 +113,62 @@ class TerminalCatalogoView(APIView):
                 "itens": [_serializar_catalogo_item(item) for item in itens],
             }
         )
+
+
+class OperadorLoginView(APIView):
+    authentication_classes = [TerminalTokenAuthentication]
+    permission_classes = [IsTerminalAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "operador_login"
+
+    def post(self, request):
+        try:
+            sessao, token = autenticar_operador_terminal(
+                request.sysvar_terminal,
+                codigo=request.data.get("codigo"),
+                senha=request.data.get("senha"),
+                ip=_obter_ip_requisicao(request),
+            )
+        except OperadorAuthenticationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {
+                "sessao_token": token,
+                "sessao": {
+                    "uuid": str(sessao.sessao_uuid),
+                    "iniciada_em": sessao.iniciada_em.isoformat(),
+                },
+                "operador": serializar_operador(sessao.operador),
+            }
+        )
+
+
+class OperadorContextoView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        sessao = request.sysvar_operador_sessao
+        return Response(
+            {
+                "sessao": {
+                    "uuid": str(sessao.sessao_uuid),
+                    "iniciada_em": sessao.iniciada_em.isoformat(),
+                    "ultima_atividade_em": sessao.ultima_atividade_em.isoformat(),
+                },
+                "operador": serializar_operador(request.sysvar_operador),
+            }
+        )
+
+
+class OperadorLogoutView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request):
+        encerrar_sessao(request.sysvar_operador_sessao)
+        return Response({"status": "ok"})
 
 
 def _normalizar_limit(valor):

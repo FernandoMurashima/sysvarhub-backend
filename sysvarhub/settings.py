@@ -211,6 +211,7 @@ REST_FRAMEWORK = {
     "PAGE_SIZE": 25,
     "DEFAULT_THROTTLE_RATES": {
         "terminal_pareamento": "20/min",
+        "operador_login": "10/min",
     },
 }
 
