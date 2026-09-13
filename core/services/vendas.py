@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 from django.db import IntegrityError, transaction
 from django.db.models import Sum
@@ -19,6 +19,12 @@ class VendaError(Exception):
 
 class VendaConflictError(VendaError):
     pass
+
+
+class SaldoInsuficienteError(VendaConflictError):
+    def __init__(self, mensagem, estoque_disponivel):
+        super().__init__(mensagem)
+        self.estoque_disponivel = estoque_disponivel
 
 
 class VendaNotFoundError(VendaError):
@@ -71,7 +77,7 @@ def adicionar_item(terminal, operador, sessao_operador, *, sku_id, quantidade=1)
         catalogo_item = obter_catalogo_item_bloqueado(terminal_bloqueado.hub, sku_id)
         validar_catalogo_vendavel(catalogo_item)
         venda = obter_venda_aberta_terminal(terminal_bloqueado)
-        validar_disponibilidade(catalogo_item, quantidade, venda=venda)
+        validar_disponibilidade(catalogo_item, quantidade)
         venda, criada = obter_ou_criar_venda_aberta(
             terminal_bloqueado,
             operador,
@@ -126,7 +132,7 @@ def alterar_quantidade_item(terminal, operador, sessao_operador, *, item_uuid, q
         delta = quantidade - quantidade_anterior
         if delta > 0:
             validar_catalogo_vendavel(catalogo_item)
-            validar_disponibilidade(catalogo_item, delta, venda=venda)
+            validar_disponibilidade(catalogo_item, delta)
 
         item.quantidade = quantidade
         item.total_item = calcular_total_item(item.quantidade, item.preco_unitario, item.desconto)
@@ -237,7 +243,8 @@ def obter_ou_criar_venda_aberta(terminal, operador, sessao_operador, sessao_caix
         total=ZERO_2,
     )
     try:
-        venda.save()
+        with transaction.atomic():
+            venda.save()
     except IntegrityError as exc:
         venda = VendaHub.objects.select_for_update().filter(
             hub=terminal.hub,
@@ -276,44 +283,47 @@ def validar_catalogo_vendavel(item):
 
 
 def validar_quantidade(quantidade):
-    try:
-        valor = int(quantidade)
-    except (TypeError, ValueError) as exc:
-        raise VendaValidationError("Quantidade inválida.") from exc
-    if valor <= 0:
-        raise VendaValidationError("Quantidade inválida.")
+    valor = validar_inteiro_positivo(quantidade, "Quantidade inválida.")
     return valor
 
 
 def validar_sku_id(sku_id):
-    try:
-        valor = int(sku_id)
-    except (TypeError, ValueError) as exc:
-        raise VendaValidationError("Produto inválido.") from exc
-    if valor <= 0:
-        raise VendaValidationError("Produto inválido.")
+    valor = validar_inteiro_positivo(sku_id, "Produto inválido.")
     return valor
 
 
-def validar_disponibilidade(catalogo_item, quantidade_adicional, *, venda):
-    disponivel = calcular_disponivel_local(catalogo_item, venda=venda)
+def validar_inteiro_positivo(valor, mensagem):
+    if valor is None or isinstance(valor, bool):
+        raise VendaValidationError(mensagem)
+    if isinstance(valor, int):
+        inteiro = valor
+    elif isinstance(valor, str) and valor.isdecimal():
+        inteiro = int(valor)
+    else:
+        raise VendaValidationError(mensagem)
+
+    if inteiro <= 0:
+        raise VendaValidationError(mensagem)
+    return inteiro
+
+
+def validar_disponibilidade(catalogo_item, quantidade_adicional):
+    disponivel = calcular_disponivel_local(catalogo_item)
     if Decimal(quantidade_adicional) > disponivel:
-        raise VendaConflictError("Saldo disponível insuficiente.")
+        raise SaldoInsuficienteError("Saldo disponível insuficiente.", disponivel)
 
 
-def calcular_disponivel_local(catalogo_item, *, venda=None):
-    reservas = calcular_reserva_sku(catalogo_item.hub, catalogo_item.retaguarda_sku_id, venda_ignorada=venda)
+def calcular_disponivel_local(catalogo_item):
+    reservas = calcular_reserva_sku(catalogo_item.hub, catalogo_item.retaguarda_sku_id)
     return catalogo_item.estoque_disponivel - reservas
 
 
-def calcular_reserva_sku(hub, sku_id, *, venda_ignorada=None):
+def calcular_reserva_sku(hub, sku_id):
     queryset = VendaItemHub.objects.filter(
         venda__hub=hub,
         venda__status=VendaHub.STATUS_ABERTA,
         retaguarda_sku_id=sku_id,
     )
-    if venda_ignorada is not None:
-        queryset = queryset.exclude(venda=venda_ignorada)
     total = queryset.aggregate(total=Sum("quantidade")).get("total") or 0
     return Decimal(total)
 
@@ -344,12 +354,16 @@ def criar_item_venda(venda, catalogo_item, quantidade, operador, sessao_operador
 
 def calcular_total_item(quantidade, preco_unitario, desconto):
     total = Decimal(quantidade) * preco_unitario - desconto
-    return total.quantize(Decimal("0.01"))
+    return money(total)
+
+
+def money(valor):
+    return Decimal(valor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def recalcular_totais(venda):
     subtotal = venda.itens.aggregate(total=Sum("total_item")).get("total") or ZERO_2
-    venda.subtotal = subtotal.quantize(Decimal("0.01"))
+    venda.subtotal = money(subtotal)
     venda.desconto_itens = ZERO_2
     venda.desconto_geral = ZERO_2
     venda.total = venda.subtotal

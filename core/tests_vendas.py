@@ -9,7 +9,14 @@ from core.models import CatalogoItemHub, SessaoCaixaHub, VendaEventoHub, VendaHu
 from core.services.caixa import CaixaConflictError, abrir_caixa, fechar_caixa
 from core.services.operadores import encerrar_sessao
 from core.services.terminais import configurar_terminal
-from core.services.vendas import adicionar_item, calcular_reserva_sku, cancelar_venda
+from core.services.vendas import (
+    adicionar_item,
+    calcular_reserva_sku,
+    calcular_total_item,
+    obter_ou_criar_venda_aberta,
+    validar_quantidade,
+    validar_sku_id,
+)
 from core.tests_caixa import CaixaHubTestMixin
 
 
@@ -165,6 +172,66 @@ class VendaItemApiTests(VendaHubTestMixin, TestCase):
 
 
 class VendaReservaTests(VendaHubTestMixin, TestCase):
+    def test_mesma_venda_nao_excede_estoque_ao_bipar(self):
+        self.post_item({"quantidade": 3})
+
+        resposta = self.post_item({"quantidade": 2})
+        item = VendaItemHub.objects.get()
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(resposta.data["detail"], "Saldo disponível insuficiente.")
+        self.assertEqual(resposta.data["estoque_disponivel"], "1.000")
+        self.assertEqual(item.quantidade, 3)
+        self.assertEqual(calcular_reserva_sku(self.hub, self.catalogo_item.retaguarda_sku_id), Decimal("3"))
+
+    def test_mesma_venda_nao_excede_estoque_por_patch(self):
+        resposta = self.post_item({"quantidade": 3})
+        item_uuid = resposta.data["venda"]["itens"][0]["uuid"]
+
+        patch_resposta = self.client.patch(
+            f"/api/terminal/venda/item/{item_uuid}/",
+            {"quantidade": 5},
+            format="json",
+        )
+        item = VendaItemHub.objects.get()
+
+        self.assertEqual(patch_resposta.status_code, 409)
+        self.assertEqual(patch_resposta.data["estoque_disponivel"], "1.000")
+        self.assertEqual(item.quantidade, 3)
+
+    def test_limite_exato_permitido_e_novo_incremento_bloqueado(self):
+        self.post_item({"quantidade": 3})
+        resposta_limite = self.post_item({"quantidade": 1})
+        resposta_excesso = self.post_item({"quantidade": 1})
+        item = VendaItemHub.objects.get()
+
+        self.assertEqual(resposta_limite.status_code, 200)
+        self.assertEqual(item.quantidade, 4)
+        self.assertEqual(resposta_excesso.status_code, 409)
+        self.assertEqual(resposta_excesso.data["estoque_disponivel"], "0.000")
+        item.refresh_from_db()
+        self.assertEqual(item.quantidade, 4)
+
+    def test_reducao_libera_saldo_para_nova_inclusao(self):
+        resposta = self.post_item({"quantidade": 3})
+        item_uuid = resposta.data["venda"]["itens"][0]["uuid"]
+
+        self.client.patch(f"/api/terminal/venda/item/{item_uuid}/", {"quantidade": 2}, format="json")
+        nova = self.post_item({"quantidade": 2})
+        item = VendaItemHub.objects.get()
+
+        self.assertEqual(nova.status_code, 200)
+        self.assertEqual(item.quantidade, 4)
+
+    def test_reserva_total_nunca_fica_maior_que_estoque(self):
+        self.post_item({"quantidade": 3})
+        self.post_item({"quantidade": 2})
+
+        self.assertLessEqual(
+            calcular_reserva_sku(self.hub, self.catalogo_item.retaguarda_sku_id),
+            self.catalogo_item.estoque_disponivel,
+        )
+
     def test_reserva_considera_vendas_abertas_e_dois_terminais(self):
         self.post_item({"quantidade": 2})
         outro_terminal = configurar_terminal(self.hub, "PDV-02", "PDV 02", self.caixa.retaguarda_id)
@@ -181,6 +248,7 @@ class VendaReservaTests(VendaHubTestMixin, TestCase):
 
         self.assertEqual(resposta.status_code, 409)
         self.assertEqual(resposta.data["detail"], "Saldo disponível insuficiente.")
+        self.assertEqual(resposta.data["estoque_disponivel"], "2.000")
         self.assertEqual(calcular_reserva_sku(self.hub, self.catalogo_item.retaguarda_sku_id), Decimal("2"))
 
     def test_reducao_remocao_e_cancelamento_liberam_reserva_sem_alterar_catalogo(self):
@@ -294,6 +362,44 @@ class VendaCaixaConcorrenciaTests(VendaHubTestMixin, TestCase):
                 sessao_operador_criacao=self.sessao_operador,
             )
 
+    def test_integrity_error_recupera_venda_aberta_com_savepoint(self):
+        venda_existente = VendaHub.objects.create(
+            hub=self.hub,
+            sessao_caixa=self.sessao_caixa,
+            terminal=self.terminal,
+            status=VendaHub.STATUS_ABERTA,
+            chave_venda_aberta_terminal=self.terminal.pk,
+            operador_criacao=self.operador,
+            sessao_operador_criacao=self.sessao_operador,
+        )
+
+        with patch("core.services.vendas.VendaHub.objects.select_for_update") as select_for_update:
+            queryset_vazio = VendaHub.objects.none()
+            queryset_existente = VendaHub.objects.filter(pk=venda_existente.pk)
+            select_for_update.return_value.filter.side_effect = [queryset_vazio, queryset_existente]
+            with patch.object(VendaHub, "save", side_effect=IntegrityError("duplicado")):
+                venda, criada = obter_ou_criar_venda_aberta(
+                    self.terminal,
+                    self.operador,
+                    self.sessao_operador,
+                    self.sessao_caixa,
+                )
+
+        self.assertEqual(venda, venda_existente)
+        self.assertFalse(criada)
+
+    def test_integrity_error_sem_venda_existente_repropaga(self):
+        with patch("core.services.vendas.VendaHub.objects.select_for_update") as select_for_update:
+            select_for_update.return_value.filter.return_value = VendaHub.objects.none()
+            with patch.object(VendaHub, "save", side_effect=IntegrityError("duplicado")):
+                with self.assertRaises(IntegrityError):
+                    obter_ou_criar_venda_aberta(
+                        self.terminal,
+                        self.operador,
+                        self.sessao_operador,
+                        self.sessao_caixa,
+                    )
+
     def test_lock_catalogo_item_usado_na_inclusao(self):
         with patch("core.services.vendas.CatalogoItemHub.objects") as manager:
             manager.select_for_update.side_effect = RuntimeError("lock chamado")
@@ -305,3 +411,30 @@ class VendaCaixaConcorrenciaTests(VendaHubTestMixin, TestCase):
                     sku_id=self.catalogo_item.retaguarda_sku_id,
                     quantidade=1,
                 )
+
+
+class VendaValidacaoPuraTests(TestCase):
+    def test_quantidade_rejeita_bool_float_decimal_string_null_zero_e_negativo(self):
+        for valor in (True, False, 1.1, 1.9, 0.5, "1.5", None, 0, -1):
+            with self.subTest(valor=valor):
+                with self.assertRaises(Exception):
+                    validar_quantidade(valor)
+
+    def test_quantidade_aceita_inteiros_e_string_inteira(self):
+        for valor in (1, 2, 10, "1", "2"):
+            with self.subTest(valor=valor):
+                self.assertEqual(validar_quantidade(valor), int(valor))
+
+    def test_sku_id_rejeita_bool_float_decimal_string_null_zero_e_negativo(self):
+        for valor in (True, False, 1.5, "1.5", None, 0, -1):
+            with self.subTest(valor=valor):
+                with self.assertRaises(Exception):
+                    validar_sku_id(valor)
+
+    def test_sku_id_aceita_inteiros_positivos(self):
+        for valor in (1, 2, 10825, "10825"):
+            with self.subTest(valor=valor):
+                self.assertEqual(validar_sku_id(valor), int(valor))
+
+    def test_total_item_usa_round_half_up(self):
+        self.assertEqual(calcular_total_item(1, Decimal("1.0050"), Decimal("0.00")), Decimal("1.01"))

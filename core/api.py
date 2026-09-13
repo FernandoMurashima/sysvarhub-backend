@@ -29,6 +29,7 @@ from core.services.terminais import (
     registrar_heartbeat_terminal,
 )
 from core.services.vendas import (
+    SaldoInsuficienteError,
     VendaConflictError,
     VendaError,
     VendaNotFoundError,
@@ -277,6 +278,14 @@ class VendaItemView(APIView):
             )
         except VendaValidationError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except SaldoInsuficienteError as exc:
+            return Response(
+                {
+                    "detail": str(exc),
+                    "estoque_disponivel": f"{exc.estoque_disponivel:.3f}",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
         except VendaConflictError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         except VendaError as exc:
@@ -305,6 +314,14 @@ class VendaItemDetalheView(APIView):
             return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
         except VendaValidationError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except SaldoInsuficienteError as exc:
+            return Response(
+                {
+                    "detail": str(exc),
+                    "estoque_disponivel": f"{exc.estoque_disponivel:.3f}",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
         except VendaConflictError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         except VendaError as exc:
