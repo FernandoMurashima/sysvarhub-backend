@@ -8,6 +8,15 @@ from rest_framework.views import APIView
 from core.authentication import TerminalOperadorAuthentication, TerminalTokenAuthentication
 from core.models import CaixaHub, CatalogoItemHub
 from core.permissions import IsOperadorAuthenticated, IsTerminalAuthenticated
+from core.services.caixa import (
+    CaixaConflictError,
+    CaixaError,
+    ValorAberturaError,
+    abrir_caixa,
+    consultar_status_caixa,
+    fechar_caixa,
+    serializar_sessao_caixa,
+)
 from core.services.operadores import (
     OperadorAuthenticationError,
     autenticar_operador_terminal,
@@ -169,6 +178,61 @@ class OperadorLogoutView(APIView):
     def post(self, request):
         encerrar_sessao(request.sysvar_operador_sessao)
         return Response({"status": "ok"})
+
+
+class CaixaStatusView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        try:
+            return Response(consultar_status_caixa(request.sysvar_terminal))
+        except CaixaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class CaixaAbrirView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request):
+        try:
+            sessao = abrir_caixa(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                valor_abertura=request.data.get("valor_abertura"),
+            )
+        except ValorAberturaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except CaixaConflictError as exc:
+            payload = {"detail": str(exc)}
+            if exc.sessao:
+                payload["sessao"] = serializar_sessao_caixa(exc.sessao)
+            return Response(payload, status=status.HTTP_409_CONFLICT)
+        except CaixaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(serializar_sessao_caixa(sessao), status=status.HTTP_201_CREATED)
+
+
+class CaixaFecharView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request):
+        try:
+            sessao = fechar_caixa(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+            )
+        except CaixaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except CaixaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"status": "ok", "sessao": serializar_sessao_caixa(sessao)})
 
 
 def _normalizar_limit(valor):

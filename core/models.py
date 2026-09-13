@@ -480,6 +480,79 @@ class SessaoOperadorHub(models.Model):
         return token
 
 
+class SessaoCaixaHub(models.Model):
+    STATUS_ABERTO = "ABERTO"
+    STATUS_FECHADO = "FECHADO"
+    STATUS_CHOICES = [
+        (STATUS_ABERTO, "Aberto"),
+        (STATUS_FECHADO, "Fechado"),
+    ]
+
+    sessao_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    caixa = models.ForeignKey(
+        CaixaHub,
+        on_delete=models.PROTECT,
+        related_name="sessoes",
+    )
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_ABERTO)
+    chave_caixa_aberto = models.PositiveBigIntegerField(null=True, blank=True, unique=True)
+    valor_abertura = models.DecimalField(max_digits=12, decimal_places=2)
+    aberto_em = models.DateTimeField()
+    terminal_abertura = models.ForeignKey(
+        Terminal,
+        on_delete=models.PROTECT,
+        related_name="sessoes_caixa_abertura",
+    )
+    operador_abertura = models.ForeignKey(
+        OperadorHub,
+        on_delete=models.PROTECT,
+        related_name="sessoes_caixa_abertura",
+    )
+    sessao_operador_abertura = models.ForeignKey(
+        SessaoOperadorHub,
+        on_delete=models.PROTECT,
+        related_name="sessoes_caixa_abertura",
+    )
+    fechado_em = models.DateTimeField(null=True, blank=True)
+    terminal_fechamento = models.ForeignKey(
+        Terminal,
+        on_delete=models.PROTECT,
+        related_name="sessoes_caixa_fechamento",
+        null=True,
+        blank=True,
+    )
+    operador_fechamento = models.ForeignKey(
+        OperadorHub,
+        on_delete=models.PROTECT,
+        related_name="sessoes_caixa_fechamento",
+        null=True,
+        blank=True,
+    )
+    sessao_operador_fechamento = models.ForeignKey(
+        SessaoOperadorHub,
+        on_delete=models.PROTECT,
+        related_name="sessoes_caixa_fechamento",
+        null=True,
+        blank=True,
+    )
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Sessão de caixa do Hub"
+        verbose_name_plural = "Sessões de caixa do Hub"
+        ordering = ("-aberto_em",)
+        indexes = [
+            models.Index(fields=["caixa", "status"], name="idx_sessao_caixa_status"),
+            models.Index(fields=["aberto_em"], name="idx_sessao_caixa_aberto"),
+            models.Index(fields=["terminal_abertura"], name="idx_sessao_caixa_term_ab"),
+            models.Index(fields=["operador_abertura"], name="idx_sessao_caixa_oper_ab"),
+        ]
+
+    def __str__(self):
+        return f"{self.caixa.codigo} - {self.status}"
+
+
 class PareamentoTerminal(models.Model):
     CODIGO_GRUPOS = 3
     CODIGO_TAMANHO_GRUPO = 4
