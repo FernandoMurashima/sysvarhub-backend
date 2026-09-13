@@ -28,6 +28,18 @@ from core.services.terminais import (
     parear_terminal,
     registrar_heartbeat_terminal,
 )
+from core.services.vendas import (
+    VendaConflictError,
+    VendaError,
+    VendaNotFoundError,
+    VendaValidationError,
+    adicionar_item,
+    alterar_quantidade_item,
+    cancelar_venda,
+    remover_item,
+    serializar_venda,
+    venda_atual,
+)
 
 
 CATALOGO_TERMINAL_LIMIT_DEFAULT = 40
@@ -233,6 +245,108 @@ class CaixaFecharView(APIView):
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({"status": "ok", "sessao": serializar_sessao_caixa(sessao)})
+
+
+class VendaAtualView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        try:
+            venda = venda_atual(request.sysvar_terminal)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"venda": serializar_venda(venda)})
+
+
+class VendaItemView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request):
+        try:
+            venda, criou_primeira_linha = adicionar_item(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                sku_id=request.data.get("sku_id"),
+                quantidade=request.data.get("quantidade", 1),
+            )
+        except VendaValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {"venda": serializar_venda(venda)},
+            status=status.HTTP_201_CREATED if criou_primeira_linha else status.HTTP_200_OK,
+        )
+
+
+class VendaItemDetalheView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def patch(self, request, item_uuid):
+        try:
+            venda = alterar_quantidade_item(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                item_uuid=item_uuid,
+                quantidade=request.data.get("quantidade"),
+            )
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"venda": serializar_venda(venda)})
+
+    def delete(self, request, item_uuid):
+        try:
+            venda = remover_item(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                item_uuid=item_uuid,
+            )
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"venda": serializar_venda(venda)})
+
+
+class VendaCancelarView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request):
+        try:
+            venda = cancelar_venda(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+            )
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"venda": serializar_venda(venda)})
 
 
 def _normalizar_limit(valor):

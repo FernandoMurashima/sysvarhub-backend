@@ -553,6 +553,185 @@ class SessaoCaixaHub(models.Model):
         return f"{self.caixa.codigo} - {self.status}"
 
 
+class VendaHub(models.Model):
+    STATUS_ABERTA = "ABERTA"
+    STATUS_FINALIZADA = "FINALIZADA"
+    STATUS_CANCELADA = "CANCELADA"
+    STATUS_CHOICES = [
+        (STATUS_ABERTA, "Aberta"),
+        (STATUS_FINALIZADA, "Finalizada"),
+        (STATUS_CANCELADA, "Cancelada"),
+    ]
+
+    venda_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="vendas")
+    sessao_caixa = models.ForeignKey(
+        SessaoCaixaHub,
+        on_delete=models.PROTECT,
+        related_name="vendas",
+    )
+    terminal = models.ForeignKey(Terminal, on_delete=models.PROTECT, related_name="vendas")
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default=STATUS_ABERTA)
+    chave_venda_aberta_terminal = models.PositiveBigIntegerField(
+        null=True,
+        blank=True,
+        unique=True,
+    )
+    operador_criacao = models.ForeignKey(
+        OperadorHub,
+        on_delete=models.PROTECT,
+        related_name="vendas_criadas",
+    )
+    sessao_operador_criacao = models.ForeignKey(
+        SessaoOperadorHub,
+        on_delete=models.PROTECT,
+        related_name="vendas_criadas",
+    )
+    criada_em = models.DateTimeField(auto_now_add=True)
+    atualizada_em = models.DateTimeField(auto_now=True)
+    cancelada_em = models.DateTimeField(null=True, blank=True)
+    operador_cancelamento = models.ForeignKey(
+        OperadorHub,
+        on_delete=models.PROTECT,
+        related_name="vendas_canceladas",
+        null=True,
+        blank=True,
+    )
+    sessao_operador_cancelamento = models.ForeignKey(
+        SessaoOperadorHub,
+        on_delete=models.PROTECT,
+        related_name="vendas_canceladas",
+        null=True,
+        blank=True,
+    )
+    terminal_cancelamento = models.ForeignKey(
+        Terminal,
+        on_delete=models.PROTECT,
+        related_name="vendas_canceladas",
+        null=True,
+        blank=True,
+    )
+    subtotal = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    desconto_itens = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    desconto_geral = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    cliente_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    cliente_nome = models.CharField(max_length=150, blank=True, default="")
+    vendedor_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    vendedor_nome = models.CharField(max_length=150, blank=True, default="")
+
+    class Meta:
+        verbose_name = "Venda do Hub"
+        verbose_name_plural = "Vendas do Hub"
+        ordering = ("-criada_em",)
+        indexes = [
+            models.Index(fields=["hub", "status"], name="idx_venda_hub_status"),
+            models.Index(fields=["terminal", "status"], name="idx_venda_terminal_status"),
+            models.Index(fields=["sessao_caixa", "status"], name="idx_venda_caixa_status"),
+        ]
+
+    def __str__(self):
+        return f"{self.venda_uuid} - {self.status}"
+
+
+class VendaItemHub(models.Model):
+    item_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    venda = models.ForeignKey(VendaHub, on_delete=models.PROTECT, related_name="itens")
+    catalogo_item = models.ForeignKey(
+        CatalogoItemHub,
+        on_delete=models.PROTECT,
+        related_name="venda_itens",
+    )
+    retaguarda_produto_id = models.PositiveBigIntegerField()
+    retaguarda_sku_id = models.PositiveBigIntegerField()
+    ean13 = models.CharField(max_length=13, blank=True, default="")
+    referencia = models.CharField(max_length=80, blank=True, default="")
+    codigo_item_ref = models.CharField(max_length=80, blank=True, default="")
+    descricao = models.CharField(max_length=200)
+    descricao_reduzida = models.CharField(max_length=120, blank=True, default="")
+    cor_descricao = models.CharField(max_length=80, blank=True, default="")
+    tamanho_descricao = models.CharField(max_length=80, blank=True, default="")
+    unidade_codigo = models.CharField(max_length=20, blank=True, default="")
+    quantidade = models.PositiveIntegerField()
+    preco_unitario = models.DecimalField(max_digits=18, decimal_places=4)
+    desconto = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total_item = models.DecimalField(max_digits=18, decimal_places=2)
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+    operador_inclusao = models.ForeignKey(
+        OperadorHub,
+        on_delete=models.PROTECT,
+        related_name="venda_itens_incluidos",
+    )
+    sessao_operador_inclusao = models.ForeignKey(
+        SessaoOperadorHub,
+        on_delete=models.PROTECT,
+        related_name="venda_itens_incluidos",
+    )
+    terminal_inclusao = models.ForeignKey(
+        Terminal,
+        on_delete=models.PROTECT,
+        related_name="venda_itens_incluidos",
+    )
+
+    class Meta:
+        verbose_name = "Item de venda do Hub"
+        verbose_name_plural = "Itens de venda do Hub"
+        ordering = ("criado_em", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["venda", "retaguarda_sku_id"],
+                name="uniq_venda_hub_sku",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["venda", "retaguarda_sku_id"], name="idx_venda_item_sku"),
+            models.Index(fields=["retaguarda_sku_id"], name="idx_venda_item_sku_global"),
+        ]
+
+    def __str__(self):
+        return f"{self.venda_id} - {self.retaguarda_sku_id}"
+
+
+class VendaEventoHub(models.Model):
+    TIPO_VENDA_CRIADA = "VENDA_CRIADA"
+    TIPO_ITEM_ADICIONADO = "ITEM_ADICIONADO"
+    TIPO_ITEM_QUANTIDADE_ALTERADA = "ITEM_QUANTIDADE_ALTERADA"
+    TIPO_ITEM_REMOVIDO = "ITEM_REMOVIDO"
+    TIPO_VENDA_CANCELADA = "VENDA_CANCELADA"
+    TIPO_CHOICES = [
+        (TIPO_VENDA_CRIADA, "Venda criada"),
+        (TIPO_ITEM_ADICIONADO, "Item adicionado"),
+        (TIPO_ITEM_QUANTIDADE_ALTERADA, "Item alterado"),
+        (TIPO_ITEM_REMOVIDO, "Item removido"),
+        (TIPO_VENDA_CANCELADA, "Venda cancelada"),
+    ]
+
+    venda = models.ForeignKey(VendaHub, on_delete=models.PROTECT, related_name="eventos")
+    tipo = models.CharField(max_length=40, choices=TIPO_CHOICES)
+    terminal = models.ForeignKey(Terminal, on_delete=models.PROTECT, related_name="eventos_venda")
+    operador = models.ForeignKey(OperadorHub, on_delete=models.PROTECT, related_name="eventos_venda")
+    sessao_operador = models.ForeignKey(
+        SessaoOperadorHub,
+        on_delete=models.PROTECT,
+        related_name="eventos_venda",
+    )
+    criado_em = models.DateTimeField(auto_now_add=True)
+    dados = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        verbose_name = "Evento de venda do Hub"
+        verbose_name_plural = "Eventos de venda do Hub"
+        ordering = ("criado_em", "id")
+        indexes = [
+            models.Index(fields=["venda", "tipo"], name="idx_venda_evento_tipo"),
+            models.Index(fields=["criado_em"], name="idx_venda_evento_criado"),
+        ]
+
+    def __str__(self):
+        return f"{self.venda_id} - {self.tipo}"
+
+
 class PareamentoTerminal(models.Model):
     CODIGO_GRUPOS = 3
     CODIGO_TAMANHO_GRUPO = 4

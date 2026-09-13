@@ -11,6 +11,10 @@ from core.api import (
     TerminalCatalogoView,
     TerminalContextoView,
     TerminalHeartbeatView,
+    VendaAtualView,
+    VendaCancelarView,
+    VendaItemDetalheView,
+    VendaItemView,
 )
 
 
@@ -25,4 +29,8 @@ urlpatterns = [
     path("caixa/status/", CaixaStatusView.as_view(), name="terminal-caixa-status"),
     path("caixa/abrir/", CaixaAbrirView.as_view(), name="terminal-caixa-abrir"),
     path("caixa/fechar/", CaixaFecharView.as_view(), name="terminal-caixa-fechar"),
+    path("venda/atual/", VendaAtualView.as_view(), name="terminal-venda-atual"),
+    path("venda/item/", VendaItemView.as_view(), name="terminal-venda-item"),
+    path("venda/item/<uuid:item_uuid>/", VendaItemDetalheView.as_view(), name="terminal-venda-item-detalhe"),
+    path("venda/cancelar/", VendaCancelarView.as_view(), name="terminal-venda-cancelar"),
 ]
