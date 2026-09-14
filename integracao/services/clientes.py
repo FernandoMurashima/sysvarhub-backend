@@ -177,7 +177,25 @@ def _validar_cliente(item):
             "origem_consentimento",
             "ativo",
         ),
-        permitir_nulos={"documento", "motivo_bloqueio", "aniversario", "consentimento_em"},
+        permitir_nulos={
+            "documento",
+            "motivo_bloqueio",
+            "aniversario",
+            "consentimento_em",
+            "apelido",
+            "endereco",
+            "numero",
+            "complemento",
+            "cep",
+            "bairro",
+            "cidade",
+            "estado",
+            "telefone1",
+            "telefone2",
+            "email",
+            "categoria",
+            "origem_consentimento",
+        },
         permitir_vazios={
             "apelido",
             "endereco",
@@ -301,16 +319,19 @@ def _inteiro_positivo(valor, campo):
 def _exigir_campos(payload, campos, *, permitir_nulos=None, permitir_vazios=None):
     permitir_nulos = permitir_nulos or set()
     permitir_vazios = permitir_vazios or set()
-    faltando = []
     for campo in campos:
         if campo not in payload:
-            faltando.append(campo)
+            raise ClientesValidationError(
+                f"Clientes retornou campo obrigatório ausente: {campo}."
+            )
         elif campo not in permitir_nulos and payload.get(campo) is None:
-            faltando.append(campo)
+            raise ClientesValidationError(
+                f"Clientes retornou campo obrigatório nulo: {campo}."
+            )
         elif campo not in permitir_vazios and payload.get(campo) == "":
-            faltando.append(campo)
-    if faltando:
-        raise ClientesValidationError("Resposta de clientes incompleta.")
+            raise ClientesValidationError(
+                f"Clientes retornou campo obrigatório vazio: {campo}."
+            )
 
 
 def _validar_identidade(campo, recebido, esperado):

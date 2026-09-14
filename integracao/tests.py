@@ -271,6 +271,12 @@ class ClientesSyncTests(TestCase):
     def test_rejeita_payload_invalido(self):
         self.assert_rejeita(self.resposta(clientes=[self.cliente(nome_cliente="")]))
 
+    def test_rejeita_campo_obrigatorio_nulo(self):
+        with self.assertRaises(ClientesValidationError) as ctx:
+            sincronizar_clientes(self.hub, self.resposta(clientes=[self.cliente(nome_cliente=None)]))
+
+        self.assertIn("campo obrigatório nulo: nome_cliente", str(ctx.exception))
+
     def test_rejeita_id_duplicado(self):
         self.assert_rejeita(self.resposta(clientes=[self.cliente(id=1), self.cliente(id=1, documento="12345678902")]))
 
@@ -285,6 +291,48 @@ class ClientesSyncTests(TestCase):
         self.assertTrue(cliente.presente_retaguarda)
         self.assertEqual(cliente.origem, ClienteHub.ORIGEM_RETAGUARDA)
         self.assertEqual(resultado["clientes_recebidos"], 1)
+
+    def test_aceita_nulos_em_campos_opcionais_do_contrato(self):
+        payload = self.cliente(
+            documento=None,
+            apelido=None,
+            endereco=None,
+            numero=None,
+            complemento=None,
+            cep=None,
+            bairro=None,
+            cidade=None,
+            estado=None,
+            telefone1=None,
+            telefone2=None,
+            email=None,
+            categoria=None,
+            motivo_bloqueio=None,
+            aniversario=None,
+            consentimento_em=None,
+            origem_consentimento=None,
+        )
+
+        sincronizar_clientes(self.hub, self.resposta(clientes=[payload]))
+
+        cliente = ClienteHub.objects.get(hub=self.hub, retaguarda_id=123)
+        self.assertIsNone(cliente.documento)
+        self.assertEqual(cliente.apelido, "")
+        self.assertEqual(cliente.endereco, "")
+        self.assertEqual(cliente.numero, "")
+        self.assertEqual(cliente.complemento, "")
+        self.assertEqual(cliente.cep, "")
+        self.assertEqual(cliente.bairro, "")
+        self.assertEqual(cliente.cidade, "")
+        self.assertEqual(cliente.estado, "")
+        self.assertEqual(cliente.telefone1, "")
+        self.assertEqual(cliente.telefone2, "")
+        self.assertEqual(cliente.email, "")
+        self.assertEqual(cliente.categoria, "")
+        self.assertIsNone(cliente.motivo_bloqueio)
+        self.assertIsNone(cliente.aniversario)
+        self.assertIsNone(cliente.consentimento_em)
+        self.assertEqual(cliente.origem_consentimento, "")
 
     def test_atualiza_cliente_existente(self):
         sincronizar_clientes(self.hub, self.resposta())
