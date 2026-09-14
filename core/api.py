@@ -35,8 +35,12 @@ from core.services.vendas import (
     VendaNotFoundError,
     VendaValidationError,
     adicionar_item,
+    adicionar_pagamento,
     alterar_quantidade_item,
     cancelar_venda,
+    finalizar_venda,
+    listar_formas_pagamento,
+    remover_pagamento,
     remover_item,
     serializar_venda,
     venda_atual,
@@ -263,6 +267,14 @@ class VendaAtualView(APIView):
         return Response({"venda": serializar_venda(venda)})
 
 
+class FormasPagamentoView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        return Response(listar_formas_pagamento(request.sysvar_terminal))
+
+
 class VendaItemView(APIView):
     authentication_classes = [TerminalOperadorAuthentication]
     permission_classes = [IsOperadorAuthenticated]
@@ -357,6 +369,90 @@ class VendaCancelarView(APIView):
                 request.sysvar_terminal,
                 request.sysvar_operador,
                 request.sysvar_operador_sessao,
+            )
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"venda": serializar_venda(venda)})
+
+
+class VendaPagamentoView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request):
+        try:
+            venda = adicionar_pagamento(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                venda_uuid=request.data.get("venda_uuid"),
+                operacao_uuid=request.data.get("operacao_uuid"),
+                forma_pagamento_id=request.data.get("forma_pagamento_id"),
+                valor=request.data.get("valor"),
+                autorizacao=request.data.get("autorizacao") or "",
+            )
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"venda": serializar_venda(venda)}, status=status.HTTP_201_CREATED)
+
+
+class VendaPagamentoDetalheView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def delete(self, request, pagamento_uuid):
+        try:
+            venda = remover_pagamento(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                pagamento_uuid=pagamento_uuid,
+            )
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"venda": serializar_venda(venda)})
+
+
+class VendaFinalizarView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request):
+        try:
+            venda = finalizar_venda(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                venda_uuid=request.data.get("venda_uuid"),
+            )
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except SaldoInsuficienteError as exc:
+            return Response(
+                {
+                    "detail": str(exc),
+                    "estoque_disponivel": f"{exc.estoque_disponivel:.3f}",
+                },
+                status=status.HTTP_409_CONFLICT,
             )
         except VendaConflictError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)

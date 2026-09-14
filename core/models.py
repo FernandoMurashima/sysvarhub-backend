@@ -723,10 +723,34 @@ class VendaHub(models.Model):
         null=True,
         blank=True,
     )
+    finalizada_em = models.DateTimeField(null=True, blank=True)
+    terminal_finalizacao = models.ForeignKey(
+        Terminal,
+        on_delete=models.PROTECT,
+        related_name="vendas_finalizadas",
+        null=True,
+        blank=True,
+    )
+    operador_finalizacao = models.ForeignKey(
+        OperadorHub,
+        on_delete=models.PROTECT,
+        related_name="vendas_finalizadas",
+        null=True,
+        blank=True,
+    )
+    sessao_operador_finalizacao = models.ForeignKey(
+        SessaoOperadorHub,
+        on_delete=models.PROTECT,
+        related_name="vendas_finalizadas",
+        null=True,
+        blank=True,
+    )
     subtotal = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     desconto_itens = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     desconto_geral = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     total = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    valor_recebido = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    troco = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     cliente_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
     cliente_nome = models.CharField(max_length=150, blank=True, default="")
     vendedor_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
@@ -811,12 +835,18 @@ class VendaEventoHub(models.Model):
     TIPO_ITEM_QUANTIDADE_ALTERADA = "ITEM_QUANTIDADE_ALTERADA"
     TIPO_ITEM_REMOVIDO = "ITEM_REMOVIDO"
     TIPO_VENDA_CANCELADA = "VENDA_CANCELADA"
+    TIPO_PAGAMENTO_ADICIONADO = "PAGAMENTO_ADICIONADO"
+    TIPO_PAGAMENTO_REMOVIDO = "PAGAMENTO_REMOVIDO"
+    TIPO_VENDA_FINALIZADA = "VENDA_FINALIZADA"
     TIPO_CHOICES = [
         (TIPO_VENDA_CRIADA, "Venda criada"),
         (TIPO_ITEM_ADICIONADO, "Item adicionado"),
         (TIPO_ITEM_QUANTIDADE_ALTERADA, "Item alterado"),
         (TIPO_ITEM_REMOVIDO, "Item removido"),
         (TIPO_VENDA_CANCELADA, "Venda cancelada"),
+        (TIPO_PAGAMENTO_ADICIONADO, "Pagamento adicionado"),
+        (TIPO_PAGAMENTO_REMOVIDO, "Pagamento removido"),
+        (TIPO_VENDA_FINALIZADA, "Venda finalizada"),
     ]
 
     venda = models.ForeignKey(VendaHub, on_delete=models.PROTECT, related_name="eventos")
@@ -842,6 +872,159 @@ class VendaEventoHub(models.Model):
 
     def __str__(self):
         return f"{self.venda_id} - {self.tipo}"
+
+
+class VendaPagamentoHub(models.Model):
+    ORIGEM_MANUAL = "MANUAL"
+    ORIGEM_CHOICES = [
+        (ORIGEM_MANUAL, "Manual"),
+    ]
+    STATUS_ATIVO = "ATIVO"
+    STATUS_REMOVIDO = "REMOVIDO"
+    STATUS_CHOICES = [
+        (STATUS_ATIVO, "Ativo"),
+        (STATUS_REMOVIDO, "Removido"),
+    ]
+
+    pagamento_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    operacao_uuid = models.UUIDField(editable=False)
+    venda = models.ForeignKey(VendaHub, on_delete=models.PROTECT, related_name="pagamentos")
+    forma_pagamento = models.ForeignKey(
+        FormaPagamentoHub,
+        on_delete=models.PROTECT,
+        related_name="pagamentos_venda",
+    )
+    retaguarda_forma_pagamento_id = models.PositiveBigIntegerField()
+    codigo = models.CharField(max_length=10)
+    descricao = models.CharField(max_length=120)
+    tipo = models.CharField(max_length=24)
+    num_parcelas = models.PositiveIntegerField()
+    adquirente = models.CharField(max_length=80, null=True, blank=True)
+    conta_liquidacao_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    gera_recebivel_bancario = models.BooleanField(default=False)
+    prazo_credito_dias = models.PositiveIntegerField(default=0)
+    taxa_percentual = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    taxa_fixa = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    valor = models.DecimalField(max_digits=18, decimal_places=2)
+    autorizacao = models.CharField(max_length=120, blank=True, default="")
+    origem_captura = models.CharField(max_length=10, choices=ORIGEM_CHOICES, default=ORIGEM_MANUAL)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_ATIVO)
+    terminal_inclusao = models.ForeignKey(Terminal, on_delete=models.PROTECT, related_name="pagamentos_incluidos")
+    operador_inclusao = models.ForeignKey(OperadorHub, on_delete=models.PROTECT, related_name="pagamentos_incluidos")
+    sessao_operador_inclusao = models.ForeignKey(
+        SessaoOperadorHub,
+        on_delete=models.PROTECT,
+        related_name="pagamentos_incluidos",
+    )
+    criado_em = models.DateTimeField(auto_now_add=True)
+    removido_em = models.DateTimeField(null=True, blank=True)
+    terminal_remocao = models.ForeignKey(
+        Terminal,
+        on_delete=models.PROTECT,
+        related_name="pagamentos_removidos",
+        null=True,
+        blank=True,
+    )
+    operador_remocao = models.ForeignKey(
+        OperadorHub,
+        on_delete=models.PROTECT,
+        related_name="pagamentos_removidos",
+        null=True,
+        blank=True,
+    )
+    sessao_operador_remocao = models.ForeignKey(
+        SessaoOperadorHub,
+        on_delete=models.PROTECT,
+        related_name="pagamentos_removidos",
+        null=True,
+        blank=True,
+    )
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Pagamento de venda do Hub"
+        verbose_name_plural = "Pagamentos de venda do Hub"
+        ordering = ("criado_em", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["venda", "operacao_uuid"],
+                name="uniq_vpag_oper",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.venda_id} - {self.codigo} - {self.valor}"
+
+
+class VendaPagamentoParcelaHub(models.Model):
+    pagamento = models.ForeignKey(
+        VendaPagamentoHub,
+        on_delete=models.CASCADE,
+        related_name="parcelas_snapshot",
+    )
+    ordem = models.PositiveIntegerField()
+    dias = models.IntegerField()
+    percentual = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    valor_fixo = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Parcela snapshot de pagamento do Hub"
+        verbose_name_plural = "Parcelas snapshot de pagamento do Hub"
+        ordering = ("ordem", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["pagamento", "ordem"],
+                name="uniq_vpag_parc_ord",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.pagamento_id} - {self.ordem}"
+
+
+class EstoqueMovimentoHub(models.Model):
+    TIPO_SAIDA_VENDA = "SAIDA_VENDA"
+    TIPO_CHOICES = [
+        (TIPO_SAIDA_VENDA, "Saída por venda"),
+    ]
+
+    movimento_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="movimentos_estoque")
+    venda = models.ForeignKey(VendaHub, on_delete=models.PROTECT, related_name="movimentos_estoque")
+    venda_item = models.ForeignKey(
+        VendaItemHub,
+        on_delete=models.PROTECT,
+        related_name="movimentos_estoque",
+    )
+    catalogo_item = models.ForeignKey(
+        CatalogoItemHub,
+        on_delete=models.PROTECT,
+        related_name="movimentos_estoque",
+    )
+    retaguarda_produto_id = models.PositiveBigIntegerField()
+    retaguarda_sku_id = models.PositiveBigIntegerField()
+    ean13 = models.CharField(max_length=13, blank=True, default="")
+    referencia = models.CharField(max_length=80, blank=True, default="")
+    tipo = models.CharField(max_length=20, choices=TIPO_CHOICES, default=TIPO_SAIDA_VENDA)
+    quantidade = models.DecimalField(max_digits=14, decimal_places=3)
+    sincronizado_central_em = models.DateTimeField(null=True, blank=True)
+    reconciliado_em = models.DateTimeField(null=True, blank=True)
+    criado_em = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Movimento de estoque do Hub"
+        verbose_name_plural = "Movimentos de estoque do Hub"
+        ordering = ("criado_em", "id")
+        indexes = [
+            models.Index(fields=["hub", "retaguarda_sku_id"], name="idx_est_mov_hub_sku"),
+            models.Index(fields=["reconciliado_em"], name="idx_est_mov_reconc"),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=["venda_item"], name="uniq_est_mov_item"),
+        ]
+
+    def __str__(self):
+        return f"{self.tipo} - {self.retaguarda_sku_id} - {self.quantidade}"
 
 
 class PareamentoTerminal(models.Model):

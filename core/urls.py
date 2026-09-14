@@ -4,6 +4,7 @@ from core.api import (
     CaixaAbrirView,
     CaixaFecharView,
     CaixaStatusView,
+    FormasPagamentoView,
     OperadorContextoView,
     OperadorLoginView,
     OperadorLogoutView,
@@ -13,8 +14,11 @@ from core.api import (
     TerminalHeartbeatView,
     VendaAtualView,
     VendaCancelarView,
+    VendaFinalizarView,
     VendaItemDetalheView,
     VendaItemView,
+    VendaPagamentoDetalheView,
+    VendaPagamentoView,
 )
 
 
@@ -29,8 +33,16 @@ urlpatterns = [
     path("caixa/status/", CaixaStatusView.as_view(), name="terminal-caixa-status"),
     path("caixa/abrir/", CaixaAbrirView.as_view(), name="terminal-caixa-abrir"),
     path("caixa/fechar/", CaixaFecharView.as_view(), name="terminal-caixa-fechar"),
+    path("formas-pagamento/", FormasPagamentoView.as_view(), name="terminal-formas-pagamento"),
     path("venda/atual/", VendaAtualView.as_view(), name="terminal-venda-atual"),
     path("venda/item/", VendaItemView.as_view(), name="terminal-venda-item"),
     path("venda/item/<uuid:item_uuid>/", VendaItemDetalheView.as_view(), name="terminal-venda-item-detalhe"),
+    path("venda/pagamento/", VendaPagamentoView.as_view(), name="terminal-venda-pagamento"),
+    path(
+        "venda/pagamento/<uuid:pagamento_uuid>/",
+        VendaPagamentoDetalheView.as_view(),
+        name="terminal-venda-pagamento-detalhe",
+    ),
+    path("venda/finalizar/", VendaFinalizarView.as_view(), name="terminal-venda-finalizar"),
     path("venda/cancelar/", VendaCancelarView.as_view(), name="terminal-venda-cancelar"),
 ]
