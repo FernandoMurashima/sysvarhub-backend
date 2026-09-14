@@ -6,7 +6,7 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from core.authentication import TerminalOperadorAuthentication, TerminalTokenAuthentication
-from core.models import CaixaHub, CatalogoItemHub
+from core.models import CaixaHub, CatalogoItemHub, ClienteHub
 from core.permissions import IsOperadorAuthenticated, IsTerminalAuthenticated
 from core.services.caixa import (
     CaixaConflictError,
@@ -49,6 +49,7 @@ from core.services.vendas import (
 
 CATALOGO_TERMINAL_LIMIT_DEFAULT = 40
 CATALOGO_TERMINAL_LIMIT_MAX = 100
+CLIENTES_TERMINAL_LIMIT = 50
 
 
 class ParearTerminalView(APIView):
@@ -273,6 +274,41 @@ class FormasPagamentoView(APIView):
 
     def get(self, request):
         return Response(listar_formas_pagamento(request.sysvar_terminal))
+
+
+class TerminalClientesView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        hub = request.sysvar_terminal.hub
+        termo = " ".join((request.query_params.get("q") or "").split())
+        clientes = ClienteHub.objects.filter(hub=hub).filter(
+            Q(presente_retaguarda=True)
+            | Q(origem=ClienteHub.ORIGEM_LOCAL, retaguarda_id__isnull=True)
+        )
+        if termo:
+            clientes = _aplicar_busca_clientes(clientes, termo)
+        else:
+            clientes = clientes.order_by("nome_cliente", "retaguarda_id", "cliente_uuid")
+
+        total = clientes.count()
+        clientes = clientes[:CLIENTES_TERMINAL_LIMIT]
+
+        return Response(
+            {
+                "clientes_versao": hub.clientes_versao,
+                "clientes_sincronizado_em": (
+                    hub.clientes_sincronizado_em.isoformat()
+                    if hub.clientes_sincronizado_em
+                    else None
+                ),
+                "q": termo,
+                "total": total,
+                "limit": CLIENTES_TERMINAL_LIMIT,
+                "clientes": [_serializar_cliente(cliente) for cliente in clientes],
+            }
+        )
 
 
 class VendaItemView(APIView):
@@ -501,6 +537,31 @@ def _aplicar_busca_catalogo(queryset, termo):
     )
 
 
+def _aplicar_busca_clientes(queryset, termo):
+    digitos = "".join(c for c in termo if c.isdigit())
+    busca = (
+        Q(nome_cliente__icontains=termo)
+        | Q(apelido__icontains=termo)
+        | Q(email__icontains=termo)
+    )
+    if digitos:
+        busca |= Q(documento__icontains=digitos) | Q(telefone1__icontains=digitos)
+    prioridade = Case(
+        When(documento=digitos, then=Value(1)) if digitos else When(pk__isnull=True, then=Value(9)),
+        When(nome_cliente__istartswith=termo, then=Value(2)),
+        When(apelido__istartswith=termo, then=Value(3)),
+        When(nome_cliente__icontains=termo, then=Value(4)),
+        default=Value(5),
+        output_field=IntegerField(),
+    )
+    return queryset.filter(busca).annotate(prioridade_busca=prioridade).order_by(
+        "prioridade_busca",
+        "nome_cliente",
+        "retaguarda_id",
+        "cliente_uuid",
+    )
+
+
 def _serializar_catalogo_item(item):
     return {
         "produto_id": item.retaguarda_produto_id,
@@ -533,6 +594,27 @@ def _serializar_catalogo_item(item):
         "vendavel": item.vendavel,
         "motivos_bloqueio": item.motivos_bloqueio,
         "fiscal": item.fiscal,
+    }
+
+
+def _serializar_cliente(cliente):
+    return {
+        "cliente_uuid": str(cliente.cliente_uuid),
+        "retaguarda_id": cliente.retaguarda_id,
+        "origem": cliente.origem,
+        "tipo_pessoa": cliente.tipo_pessoa,
+        "documento": cliente.documento,
+        "cliente_padrao": cliente.cliente_padrao,
+        "nome_cliente": cliente.nome_cliente,
+        "apelido": cliente.apelido,
+        "telefone1": cliente.telefone1,
+        "email": cliente.email,
+        "cidade": cliente.cidade,
+        "estado": cliente.estado,
+        "bloqueio": cliente.bloqueio,
+        "motivo_bloqueio": cliente.motivo_bloqueio,
+        "ativo": cliente.ativo,
+        "presente_retaguarda": cliente.presente_retaguarda,
     }
 
 

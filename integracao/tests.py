@@ -11,6 +11,7 @@ from django.utils import timezone
 from core.models import (
     CaixaHub,
     CatalogoItemHub,
+    ClienteHub,
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
     HubConfig,
@@ -21,6 +22,7 @@ from integracao.services.formas_pagamento import (
     FormasPagamentoValidationError,
     sincronizar_formas_pagamento,
 )
+from integracao.services.clientes import ClientesValidationError, sincronizar_clientes
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 
 
@@ -163,6 +165,30 @@ class RetaguardaClientTests(TestCase):
 
         self.assertNotIn("TOKEN-SECRETO", str(ctx.exception))
 
+    def test_clientes_chama_get_com_authorization_hub(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["data"] = req.data
+            captured["headers"] = dict(req.header_items())
+            return _JsonResponse({"clientes_versao": 1})
+
+        with patch("integracao.services.retaguarda.request.urlopen", fake_urlopen):
+            RetaguardaClient("http://central.test").clientes(token="TOKEN-SECRETO")
+
+        self.assertEqual(captured["url"], "http://central.test/api/hub/clientes/")
+        self.assertEqual(captured["method"], "GET")
+        self.assertIsNone(captured["data"])
+        self.assertEqual(captured["headers"]["Authorization"], "Hub TOKEN-SECRETO")
+
+    def test_clientes_exige_token(self):
+        with self.assertRaises(RetaguardaError) as ctx:
+            RetaguardaClient("http://central.test").clientes(token="")
+
+        self.assertNotIn("TOKEN-SECRETO", str(ctx.exception))
+
     def test_indisponibilidade_gera_erro_controlado(self):
         with patch(
             "integracao.services.retaguarda.request.urlopen",
@@ -176,6 +202,180 @@ class RetaguardaClientTests(TestCase):
                     hostname="loja-01",
                     versao="0.1.0",
                 )
+
+
+class ClientesSyncTests(TestCase):
+    def setUp(self):
+        self.hub = HubConfig.objects.create(
+            retaguarda_url="http://central.test",
+            retaguarda_hub_id=7,
+            empresa_id=11,
+            loja_id=41,
+        )
+
+    def cliente(self, **overrides):
+        dados = {
+            "id": 123,
+            "tipo_pessoa": "PF",
+            "documento": "123.456.789-01",
+            "cliente_padrao": False,
+            "nome_cliente": "Cliente Teste",
+            "apelido": "",
+            "endereco": "",
+            "numero": "",
+            "complemento": "",
+            "cep": "",
+            "bairro": "",
+            "cidade": "Rio de Janeiro",
+            "estado": "RJ",
+            "telefone1": "21999990000",
+            "telefone2": "",
+            "email": "cliente@example.com",
+            "categoria": "",
+            "bloqueio": False,
+            "motivo_bloqueio": None,
+            "aniversario": None,
+            "mala_direta": False,
+            "aceita_email": False,
+            "aceita_whatsapp": False,
+            "aceita_sms": False,
+            "consentimento_em": None,
+            "origem_consentimento": "",
+            "ativo": True,
+        }
+        dados.update(overrides)
+        return dados
+
+    def resposta(self, **overrides):
+        dados = {
+            "clientes_versao": 1,
+            "gerado_em": "2026-09-14T10:00:00-03:00",
+            "hub": {"id": 7, "hub_uuid": str(self.hub.hub_uuid)},
+            "empresa": {"id": 11},
+            "loja": {"id": 41},
+            "clientes": [self.cliente()],
+        }
+        dados.update(overrides)
+        return dados
+
+    def assert_rejeita(self, resposta):
+        with self.assertRaises(ClientesValidationError):
+            sincronizar_clientes(self.hub, resposta)
+
+    def test_valida_identidade(self):
+        self.assert_rejeita(self.resposta(empresa={"id": 99}))
+
+    def test_rejeita_versao_nao_suportada(self):
+        self.assert_rejeita(self.resposta(clientes_versao=2))
+
+    def test_rejeita_payload_invalido(self):
+        self.assert_rejeita(self.resposta(clientes=[self.cliente(nome_cliente="")]))
+
+    def test_rejeita_id_duplicado(self):
+        self.assert_rejeita(self.resposta(clientes=[self.cliente(id=1), self.cliente(id=1, documento="12345678902")]))
+
+    def test_rejeita_documento_duplicado(self):
+        self.assert_rejeita(self.resposta(clientes=[self.cliente(id=1), self.cliente(id=2)]))
+
+    def test_cria_clientes_e_normaliza_documento(self):
+        resultado = sincronizar_clientes(self.hub, self.resposta())
+
+        cliente = ClienteHub.objects.get(hub=self.hub, retaguarda_id=123)
+        self.assertEqual(cliente.documento, "12345678901")
+        self.assertTrue(cliente.presente_retaguarda)
+        self.assertEqual(cliente.origem, ClienteHub.ORIGEM_RETAGUARDA)
+        self.assertEqual(resultado["clientes_recebidos"], 1)
+
+    def test_atualiza_cliente_existente(self):
+        sincronizar_clientes(self.hub, self.resposta())
+        sincronizar_clientes(self.hub, self.resposta(clientes=[self.cliente(nome_cliente="Cliente Atualizado")]))
+
+        self.assertEqual(ClienteHub.objects.get(retaguarda_id=123).nome_cliente, "Cliente Atualizado")
+
+    def test_preserva_cliente_padrao_ativo_inativo_e_bloqueado(self):
+        sincronizar_clientes(
+            self.hub,
+            self.resposta(clientes=[self.cliente(cliente_padrao=True, ativo=False, bloqueio=True, motivo_bloqueio="Bloqueado")]),
+        )
+
+        cliente = ClienteHub.objects.get(retaguarda_id=123)
+        self.assertTrue(cliente.cliente_padrao)
+        self.assertFalse(cliente.ativo)
+        self.assertTrue(cliente.bloqueio)
+
+    def test_ausencia_marca_presente_retaguarda_false(self):
+        sincronizar_clientes(self.hub, self.resposta())
+        resultado = sincronizar_clientes(self.hub, self.resposta(clientes=[]))
+
+        self.assertFalse(ClienteHub.objects.get(retaguarda_id=123).presente_retaguarda)
+        self.assertEqual(resultado["clientes_ausentes_marcados"], 1)
+
+    def test_local_sem_retaguarda_id_nao_e_afetado(self):
+        local = ClienteHub.objects.create(
+            hub=self.hub,
+            origem=ClienteHub.ORIGEM_LOCAL,
+            retaguarda_id=None,
+            tipo_pessoa="PF",
+            documento="12345678901",
+            nome_cliente="Cliente Local",
+            sincronizado_em=timezone.now(),
+        )
+        sincronizar_clientes(self.hub, self.resposta(clientes=[]))
+
+        local.refresh_from_db()
+        self.assertIsNone(local.retaguarda_id)
+        self.assertEqual(local.origem, ClienteHub.ORIGEM_LOCAL)
+
+    def test_reconcilia_cliente_local_por_documento(self):
+        local = ClienteHub.objects.create(
+            hub=self.hub,
+            origem=ClienteHub.ORIGEM_LOCAL,
+            retaguarda_id=None,
+            tipo_pessoa="PF",
+            documento="12345678901",
+            nome_cliente="Cliente Local",
+            sincronizado_em=timezone.now(),
+        )
+        resultado = sincronizar_clientes(self.hub, self.resposta())
+
+        local.refresh_from_db()
+        self.assertEqual(local.retaguarda_id, 123)
+        self.assertEqual(local.origem, ClienteHub.ORIGEM_LOCAL)
+        self.assertEqual(resultado["clientes_reconciliados_por_documento"], 1)
+        self.assertEqual(ClienteHub.objects.count(), 1)
+
+    def test_atomicidade_em_erro_e_timestamps_apenas_apos_sucesso(self):
+        ClienteHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=123,
+            tipo_pessoa="PF",
+            documento="12345678901",
+            nome_cliente="Cliente Original",
+            sincronizado_em=timezone.now(),
+        )
+
+        self.assert_rejeita(self.resposta(clientes=[self.cliente(nome_cliente="Cliente Novo"), self.cliente(id=456, documento="bad")]))
+
+        self.hub.refresh_from_db()
+        self.assertIsNone(self.hub.clientes_versao)
+        self.assertEqual(ClienteHub.objects.get(retaguarda_id=123).nome_cliente, "Cliente Original")
+
+    def test_comando_sincroniza_sem_imprimir_dados_pessoais(self):
+        self.hub.retaguarda_token = "TOKEN-SECRETO"
+        self.hub.bootstrap_versao = 1
+        self.hub.save()
+        out = io.StringIO()
+
+        with patch(
+            "integracao.management.commands.sincronizar_clientes_hub.RetaguardaClient.clientes",
+            return_value=self.resposta(),
+        ):
+            call_command("sincronizar_clientes_hub", stdout=out)
+
+        texto = out.getvalue()
+        self.assertIn("Clientes recebidos: 1", texto)
+        self.assertNotIn("TOKEN-SECRETO", texto)
+        self.assertNotIn("12345678901", texto)
 
 
 class AtivarHubCommandTests(TestCase):

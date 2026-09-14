@@ -9,7 +9,16 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework.throttling import ScopedRateThrottle
 
-from core.models import CaixaHub, CatalogoItemHub, HubConfig, PareamentoTerminal, Terminal
+from core.models import (
+    CaixaHub,
+    CatalogoItemHub,
+    ClienteHub,
+    HubConfig,
+    OperadorHub,
+    PareamentoTerminal,
+    SessaoOperadorHub,
+    Terminal,
+)
 from core.api import ParearTerminalView
 from core.services.terminais import (
     PareamentoTerminalError,
@@ -852,3 +861,148 @@ class TerminalCatalogoApiTests(TestCase):
 
         self.assertEqual(resposta.status_code, 200)
         catalogo.assert_not_called()
+
+
+class TerminalClientesApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.hub = HubConfig.objects.create(
+            retaguarda_url="http://central.test",
+            empresa_id=11,
+            loja_id=41,
+            clientes_versao=1,
+            clientes_sincronizado_em=timezone.now(),
+        )
+        CaixaHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=29,
+            codigo="CX-BARRA",
+            ativo=True,
+            sincronizado_em=timezone.now(),
+        )
+        self.terminal = configurar_terminal(self.hub, "PDV-01", "PDV 01", 29)
+        self.terminal_token = self.terminal.gerar_token()
+        self.terminal.save()
+        self.operador = OperadorHub.objects.create(
+            hub=self.hub,
+            retaguarda_usuario_id=10,
+            codigo="001",
+            nome="Operador",
+            tipo="VENDEDOR",
+            ativo=True,
+            sincronizado_em=timezone.now(),
+        )
+        self.sessao = SessaoOperadorHub.objects.create(
+            terminal=self.terminal,
+            operador=self.operador,
+            token_hash=SessaoOperadorHub.hash_token("SESSAO"),
+            token_prefixo="SESSAO",
+            ativa=True,
+            ultima_atividade_em=timezone.now(),
+        )
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Terminal {self.terminal_token}",
+            HTTP_X_SYSVAR_OPERADOR_SESSION="SESSAO",
+        )
+
+    def criar_cliente(self, hub=None, **overrides):
+        dados = {
+            "hub": hub or self.hub,
+            "retaguarda_id": 123,
+            "origem": ClienteHub.ORIGEM_RETAGUARDA,
+            "presente_retaguarda": True,
+            "tipo_pessoa": "PF",
+            "documento": "12345678901",
+            "cliente_padrao": False,
+            "nome_cliente": "Cliente Teste",
+            "apelido": "Teste",
+            "telefone1": "21999990000",
+            "email": "cliente@example.com",
+            "cidade": "Rio de Janeiro",
+            "estado": "RJ",
+            "bloqueio": False,
+            "motivo_bloqueio": None,
+            "ativo": True,
+            "sincronizado_em": timezone.now(),
+        }
+        dados.update(overrides)
+        return ClienteHub.objects.create(**dados)
+
+    def get_clientes(self, **params):
+        return self.client.get("/api/terminal/clientes/", params)
+
+    def test_exige_operador_autenticado(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f"Terminal {self.terminal_token}")
+
+        resposta = self.get_clientes()
+
+        self.assertIn(resposta.status_code, (401, 403))
+
+    def test_consulta_local_nao_chama_central(self):
+        self.criar_cliente()
+
+        with patch("integracao.services.retaguarda.RetaguardaClient.clientes") as clientes:
+            resposta = self.get_clientes()
+
+        self.assertEqual(resposta.status_code, 200)
+        clientes.assert_not_called()
+
+    def test_pesquisa_por_nome(self):
+        self.criar_cliente(nome_cliente="Maria Silva")
+        self.criar_cliente(retaguarda_id=124, documento="12345678902", nome_cliente="Joao Souza")
+
+        resposta = self.get_clientes(q="maria")
+
+        self.assertEqual(resposta.data["total"], 1)
+        self.assertEqual(resposta.data["clientes"][0]["nome_cliente"], "Maria Silva")
+
+    def test_pesquisa_por_documento(self):
+        self.criar_cliente(documento="12345678901")
+
+        resposta = self.get_clientes(q="123.456.789-01")
+
+        self.assertEqual(resposta.data["total"], 1)
+        self.assertEqual(resposta.data["clientes"][0]["documento"], "12345678901")
+
+    def test_limite_de_resultados(self):
+        for indice in range(60):
+            self.criar_cliente(
+                retaguarda_id=indice + 1,
+                documento=f"123456789{indice:02d}"[:11],
+                nome_cliente=f"Cliente {indice:02d}",
+            )
+
+        resposta = self.get_clientes(q="Cliente")
+
+        self.assertEqual(resposta.data["total"], 60)
+        self.assertEqual(len(resposta.data["clientes"]), 50)
+
+    def test_isolamento_pelo_hub_do_terminal(self):
+        hub_b = HubConfig.objects.create(retaguarda_url="http://central-b.test", empresa_id=22, loja_id=55)
+        self.criar_cliente(nome_cliente="Cliente Hub A")
+        self.criar_cliente(hub=hub_b, retaguarda_id=124, documento="12345678902", nome_cliente="Cliente Hub B")
+
+        resposta = self.get_clientes()
+
+        self.assertEqual(resposta.data["total"], 1)
+        self.assertEqual(resposta.data["clientes"][0]["nome_cliente"], "Cliente Hub A")
+
+    def test_nao_retorna_ausente_da_retaguarda(self):
+        self.criar_cliente(presente_retaguarda=False)
+
+        resposta = self.get_clientes()
+
+        self.assertEqual(resposta.data["total"], 0)
+
+    def test_retorna_local_sem_retaguarda(self):
+        self.criar_cliente(
+            retaguarda_id=None,
+            origem=ClienteHub.ORIGEM_LOCAL,
+            presente_retaguarda=False,
+            documento="12345678901",
+        )
+
+        resposta = self.get_clientes()
+
+        self.assertEqual(resposta.data["total"], 1)
+        self.assertEqual(resposta.data["clientes"][0]["origem"], ClienteHub.ORIGEM_LOCAL)

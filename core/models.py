@@ -119,6 +119,21 @@ class HubConfig(models.Model):
         blank=True,
     )
 
+    clientes_versao = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    clientes_gerado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    clientes_sincronizado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
     tabela_preco_retaguarda_id = models.PositiveBigIntegerField(
         null=True,
         blank=True,
@@ -439,6 +454,86 @@ class FormaPagamentoParcelaHub(models.Model):
 
     def __str__(self):
         return f"{self.forma.codigo} - {self.ordem}"
+
+
+class ClienteHub(models.Model):
+    ORIGEM_RETAGUARDA = "RETAGUARDA"
+    ORIGEM_LOCAL = "LOCAL"
+    ORIGEM_CHOICES = [
+        (ORIGEM_RETAGUARDA, "Retaguarda"),
+        (ORIGEM_LOCAL, "Local"),
+    ]
+
+    hub = models.ForeignKey(
+        HubConfig,
+        on_delete=models.PROTECT,
+        related_name="clientes",
+    )
+    cliente_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    origem = models.CharField(max_length=20, choices=ORIGEM_CHOICES, default=ORIGEM_RETAGUARDA)
+    presente_retaguarda = models.BooleanField(default=False)
+
+    tipo_pessoa = models.CharField(max_length=2)
+    documento = models.CharField(max_length=20, null=True, blank=True)
+    cliente_padrao = models.BooleanField(default=False)
+
+    nome_cliente = models.CharField(max_length=150)
+    apelido = models.CharField(max_length=100, blank=True, default="")
+
+    endereco = models.CharField(max_length=150, blank=True, default="")
+    numero = models.CharField(max_length=20, blank=True, default="")
+    complemento = models.CharField(max_length=100, blank=True, default="")
+    cep = models.CharField(max_length=12, blank=True, default="")
+    bairro = models.CharField(max_length=100, blank=True, default="")
+    cidade = models.CharField(max_length=100, blank=True, default="")
+    estado = models.CharField(max_length=2, blank=True, default="")
+
+    telefone1 = models.CharField(max_length=30, blank=True, default="")
+    telefone2 = models.CharField(max_length=30, blank=True, default="")
+    email = models.EmailField(max_length=254, blank=True, default="")
+    categoria = models.CharField(max_length=80, blank=True, default="")
+
+    bloqueio = models.BooleanField(default=False)
+    motivo_bloqueio = models.CharField(max_length=200, null=True, blank=True)
+
+    aniversario = models.DateField(null=True, blank=True)
+
+    mala_direta = models.BooleanField(default=False)
+    aceita_email = models.BooleanField(default=False)
+    aceita_whatsapp = models.BooleanField(default=False)
+    aceita_sms = models.BooleanField(default=False)
+    consentimento_em = models.DateTimeField(null=True, blank=True)
+    origem_consentimento = models.CharField(max_length=80, blank=True, default="")
+
+    ativo = models.BooleanField(default=True)
+
+    sincronizado_em = models.DateTimeField()
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Cliente do Hub"
+        verbose_name_plural = "Clientes do Hub"
+        ordering = ("nome_cliente", "retaguarda_id", "cliente_uuid")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["hub", "retaguarda_id"],
+                name="uniq_cliente_hub_ret",
+            ),
+            models.UniqueConstraint(
+                fields=["hub", "documento"],
+                name="uniq_cliente_hub_doc",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "presente_retaguarda"], name="idx_cli_hub_pres"),
+            models.Index(fields=["hub", "origem"], name="idx_cli_hub_origem"),
+            models.Index(fields=["hub", "nome_cliente"], name="idx_cli_hub_nome"),
+        ]
+
+    def __str__(self):
+        return f"{self.retaguarda_id or self.cliente_uuid} - {self.nome_cliente}"
 
 
 class Terminal(models.Model):
