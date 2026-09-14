@@ -42,7 +42,9 @@ from core.services.vendas import (
     listar_formas_pagamento,
     remover_pagamento,
     remover_item,
+    remover_cliente,
     serializar_venda,
+    selecionar_cliente,
     venda_atual,
 )
 
@@ -260,6 +262,42 @@ class VendaAtualView(APIView):
     def get(self, request):
         try:
             venda = venda_atual(request.sysvar_terminal)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"venda": serializar_venda(venda)})
+
+
+class VendaClienteView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def put(self, request):
+        try:
+            venda = selecionar_cliente(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                cliente_uuid=request.data.get("cliente_uuid"),
+            )
+        except VendaValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"venda": serializar_venda(venda)})
+
+    def delete(self, request):
+        try:
+            venda = remover_cliente(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+            )
         except VendaConflictError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         except VendaError as exc:

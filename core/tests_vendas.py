@@ -5,7 +5,16 @@ from django.db import IntegrityError
 from django.test import TestCase
 from django.utils import timezone
 
-from core.models import CatalogoItemHub, SessaoCaixaHub, VendaEventoHub, VendaHub, VendaItemHub
+from core.models import (
+    CatalogoItemHub,
+    ClienteHub,
+    FormaPagamentoHub,
+    SessaoCaixaHub,
+    VendaEventoHub,
+    VendaHub,
+    VendaItemHub,
+    VendaPagamentoHub,
+)
 from core.services.caixa import CaixaConflictError, abrir_caixa, fechar_caixa
 from core.services.operadores import encerrar_sessao
 from core.services.terminais import configurar_terminal
@@ -65,6 +74,33 @@ class VendaHubTestMixin(CaixaHubTestMixin):
         if body:
             payload.update(body)
         return self.client.post("/api/terminal/venda/item/", payload, format="json")
+
+    def criar_cliente(self, **overrides):
+        dados = {
+            "hub": self.hub,
+            "retaguarda_id": 123,
+            "origem": ClienteHub.ORIGEM_RETAGUARDA,
+            "presente_retaguarda": True,
+            "tipo_pessoa": "PF",
+            "documento": "12345678901",
+            "cliente_padrao": False,
+            "nome_cliente": "Cliente Teste",
+            "ativo": True,
+            "bloqueio": False,
+            "sincronizado_em": timezone.now(),
+        }
+        dados.update(overrides)
+        return ClienteHub.objects.create(**dados)
+
+    def put_cliente(self, cliente):
+        return self.client.put(
+            "/api/terminal/venda/cliente/",
+            {"cliente_uuid": str(cliente.cliente_uuid)},
+            format="json",
+        )
+
+    def delete_cliente(self):
+        return self.client.delete("/api/terminal/venda/cliente/")
 
 
 class VendaAtualApiTests(VendaHubTestMixin, TestCase):
@@ -169,6 +205,209 @@ class VendaItemApiTests(VendaHubTestMixin, TestCase):
         self.assertEqual(removida.status_code, 200)
         self.assertEqual(removida.data["venda"]["itens"], [])
         self.assertEqual(VendaHub.objects.get().status, VendaHub.STATUS_ABERTA)
+
+
+class VendaClienteApiTests(VendaHubTestMixin, TestCase):
+    def criar_pagamento_ativo(self, venda):
+        forma = FormaPagamentoHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=10,
+            codigo="DIN",
+            descricao="Dinheiro",
+            tipo="DINHEIRO",
+            num_parcelas=1,
+            ativo=True,
+            sincronizado_em=timezone.now(),
+        )
+        return VendaPagamentoHub.objects.create(
+            venda=venda,
+            forma_pagamento=forma,
+            retaguarda_forma_pagamento_id=forma.retaguarda_id,
+            codigo=forma.codigo,
+            descricao=forma.descricao,
+            tipo=forma.tipo,
+            num_parcelas=forma.num_parcelas,
+            valor=venda.total if venda.total > 0 else Decimal("10.00"),
+            terminal_inclusao=self.terminal,
+            operador_inclusao=self.operador,
+            sessao_operador_inclusao=self.sessao_operador,
+        )
+
+    def test_seleciona_cliente_em_venda_existente_e_get_atual_retorna_snapshot(self):
+        self.post_item()
+        cliente = self.criar_cliente()
+
+        resposta = self.put_cliente(cliente)
+        atual = self.client.get("/api/terminal/venda/atual/")
+        venda = VendaHub.objects.get()
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(venda.cliente_uuid, cliente.cliente_uuid)
+        self.assertEqual(venda.cliente_retaguarda_id, cliente.retaguarda_id)
+        self.assertEqual(venda.cliente_tipo_pessoa, "PF")
+        self.assertEqual(venda.cliente_documento, "12345678901")
+        self.assertFalse(venda.cliente_padrao)
+        self.assertEqual(venda.cliente_nome, "Cliente Teste")
+        self.assertEqual(atual.data["venda"]["cliente"], resposta.data["venda"]["cliente"])
+
+    def test_selecao_antes_do_primeiro_item_cria_venda_aberta_com_zero_itens(self):
+        cliente = self.criar_cliente()
+
+        resposta = self.put_cliente(cliente)
+
+        venda = VendaHub.objects.get()
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(venda.status, VendaHub.STATUS_ABERTA)
+        self.assertEqual(venda.itens.count(), 0)
+        self.assertEqual(resposta.data["venda"]["itens"], [])
+
+    def test_troca_mantem_mesma_venda_uuid(self):
+        cliente_a = self.criar_cliente(retaguarda_id=123, documento="12345678901")
+        cliente_b = self.criar_cliente(retaguarda_id=124, documento="12345678902", nome_cliente="Cliente B")
+        primeira = self.put_cliente(cliente_a)
+
+        segunda = self.put_cliente(cliente_b)
+
+        self.assertEqual(segunda.data["venda"]["uuid"], primeira.data["venda"]["uuid"])
+        self.assertEqual(segunda.data["venda"]["cliente"]["cliente_uuid"], str(cliente_b.cliente_uuid))
+
+    def test_selecionar_mesmo_cliente_e_idempotente(self):
+        cliente = self.criar_cliente()
+        self.put_cliente(cliente)
+
+        self.put_cliente(cliente)
+
+        self.assertEqual(VendaHub.objects.count(), 1)
+        self.assertEqual(
+            VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_CLIENTE_SELECIONADO).count(),
+            1,
+        )
+
+    def test_remover_cliente_e_idempotente(self):
+        cliente = self.criar_cliente()
+        self.put_cliente(cliente)
+
+        removida = self.delete_cliente()
+        segunda = self.delete_cliente()
+
+        self.assertIsNone(removida.data["venda"]["cliente"])
+        self.assertIsNone(VendaHub.objects.get().cliente_uuid)
+        self.assertEqual(segunda.status_code, 200)
+        self.assertEqual(
+            VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_CLIENTE_REMOVIDO).count(),
+            1,
+        )
+
+    def test_delete_sem_venda_nao_cria_venda(self):
+        resposta = self.delete_cliente()
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertIsNone(resposta.data["venda"])
+        self.assertEqual(VendaHub.objects.count(), 0)
+
+    def test_cliente_de_outro_hub_rejeitado(self):
+        from core.tests_caixa import criar_hub
+
+        outro_hub = criar_hub(retaguarda_url="http://central-b.test")
+        cliente = self.criar_cliente(hub=outro_hub)
+
+        resposta = self.put_cliente(cliente)
+
+        self.assertEqual(resposta.status_code, 400)
+        self.assertEqual(VendaHub.objects.count(), 0)
+
+    def test_cliente_inativo_bloqueado_ou_ausente_rejeitado(self):
+        cenarios = (
+            {"ativo": False},
+            {"bloqueio": True},
+            {"presente_retaguarda": False},
+        )
+        for indice, overrides in enumerate(cenarios):
+            with self.subTest(overrides=overrides):
+                ClienteHub.objects.all().delete()
+                cliente = self.criar_cliente(retaguarda_id=200 + indice, documento=f"123456789{indice:02d}"[:11], **overrides)
+                resposta = self.put_cliente(cliente)
+                self.assertEqual(resposta.status_code, 409)
+
+    def test_cliente_local_sem_retaguarda_e_cliente_padrao_podem_ser_selecionados(self):
+        local = self.criar_cliente(
+            retaguarda_id=None,
+            origem=ClienteHub.ORIGEM_LOCAL,
+            presente_retaguarda=False,
+            documento="12345678901",
+        )
+        padrao = self.criar_cliente(
+            retaguarda_id=124,
+            documento="12345678902",
+            cliente_padrao=True,
+            nome_cliente="Consumidor",
+        )
+
+        primeira = self.put_cliente(local)
+        segunda = self.put_cliente(padrao)
+
+        self.assertEqual(primeira.status_code, 200)
+        self.assertEqual(segunda.status_code, 200)
+        self.assertTrue(segunda.data["venda"]["cliente"]["cliente_padrao"])
+
+    def test_pagamento_ativo_impede_selecao_troca_e_remocao(self):
+        cliente_a = self.criar_cliente(retaguarda_id=123, documento="12345678901")
+        cliente_b = self.criar_cliente(retaguarda_id=124, documento="12345678902")
+        self.put_cliente(cliente_a)
+        venda = VendaHub.objects.get()
+        self.criar_pagamento_ativo(venda)
+
+        mesma = self.put_cliente(cliente_a)
+        troca = self.put_cliente(cliente_b)
+        remocao = self.delete_cliente()
+
+        self.assertEqual(mesma.status_code, 409)
+        self.assertEqual(troca.status_code, 409)
+        self.assertEqual(remocao.status_code, 409)
+        self.assertEqual(troca.data["detail"], "Remova os pagamentos antes de alterar a venda.")
+
+    def test_troca_operador_mantem_cliente_e_auditoria_usa_operador_atual_sem_pii(self):
+        cliente_a = self.criar_cliente(retaguarda_id=123, documento="12345678901", nome_cliente="Cliente A")
+        cliente_b = self.criar_cliente(retaguarda_id=124, documento="12345678902", nome_cliente="Cliente B")
+        self.put_cliente(cliente_a)
+        operador_b = self.criar_operador("operador.b", 91, "Operador B")
+        encerrar_sessao(self.sessao_operador)
+        self.sessao_operador, self.token_operador = self.criar_sessao_operador(self.terminal, operador_b)
+        self.autenticar()
+
+        resposta = self.put_cliente(cliente_b)
+        evento = VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_CLIENTE_SELECIONADO).order_by("id").last()
+        conteudo_evento = f"{evento.dados}"
+
+        self.assertEqual(resposta.data["venda"]["cliente"]["cliente_uuid"], str(cliente_b.cliente_uuid))
+        self.assertEqual(evento.operador, operador_b)
+        self.assertNotIn("Cliente A", conteudo_evento)
+        self.assertNotIn("12345678901", conteudo_evento)
+
+    def test_cancelamento_e_finalizacao_preservam_snapshot_cliente(self):
+        cliente = self.criar_cliente()
+        resposta = self.post_item()
+        venda_uuid = resposta.data["venda"]["uuid"]
+        self.put_cliente(cliente)
+        self.client.post("/api/terminal/venda/cancelar/", {}, format="json")
+        cancelada = VendaHub.objects.get()
+
+        self.assertEqual(cancelada.cliente_uuid, cliente.cliente_uuid)
+
+        self.post_item()
+        venda = VendaHub.objects.get(status=VendaHub.STATUS_ABERTA)
+        self.put_cliente(cliente)
+        self.criar_pagamento_ativo(venda)
+        finalizada = self.client.post(
+            "/api/terminal/venda/finalizar/",
+            {"venda_uuid": str(venda.venda_uuid)},
+            format="json",
+        )
+
+        self.assertEqual(venda_uuid, str(cancelada.venda_uuid))
+        self.assertEqual(finalizada.status_code, 200)
+        venda.refresh_from_db()
+        self.assertEqual(venda.cliente_uuid, cliente.cliente_uuid)
 
 
 class VendaReservaTests(VendaHubTestMixin, TestCase):

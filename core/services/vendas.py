@@ -8,6 +8,7 @@ from django.utils import timezone
 
 from core.models import (
     CatalogoItemHub,
+    ClienteHub,
     EstoqueMovimentoHub,
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
@@ -95,7 +96,7 @@ def adicionar_item(terminal, operador, sessao_operador, *, sku_id, quantidade=1)
         sessao_caixa = obter_sessao_caixa_terminal(terminal_bloqueado)
         catalogo_item = obter_catalogo_item_bloqueado(terminal_bloqueado.hub, sku_id)
         validar_catalogo_vendavel(catalogo_item)
-        venda = obter_venda_aberta_terminal(terminal_bloqueado)
+        venda = obter_venda_aberta_terminal_bloqueada(terminal_bloqueado)
         validar_venda_sem_pagamento_ativo(venda)
         validar_disponibilidade(catalogo_item, quantidade)
         venda, criada = obter_ou_criar_venda_aberta(
@@ -139,7 +140,7 @@ def alterar_quantidade_item(terminal, operador, sessao_operador, *, item_uuid, q
     with transaction.atomic():
         terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
         obter_sessao_caixa_terminal(terminal_bloqueado)
-        venda = obter_venda_aberta_terminal(terminal_bloqueado)
+        venda = obter_venda_aberta_terminal_bloqueada(terminal_bloqueado)
         if not venda:
             raise VendaNotFoundError("Venda em andamento não encontrada.")
         validar_venda_sem_pagamento_ativo(venda)
@@ -194,6 +195,93 @@ def remover_item(terminal, operador, sessao_operador, *, item_uuid):
             operador,
             sessao_operador,
             evento_dados,
+        )
+
+    return venda
+
+
+def selecionar_cliente(terminal, operador, sessao_operador, *, cliente_uuid):
+    cliente_uuid = validar_uuid_obrigatorio(cliente_uuid, "Cliente inválido.")
+
+    with transaction.atomic():
+        terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
+        sessao_caixa = obter_sessao_caixa_terminal(terminal_bloqueado)
+        cliente = obter_cliente_bloqueado(terminal_bloqueado.hub, cliente_uuid)
+        validar_cliente_selecionavel(cliente)
+        venda = obter_venda_aberta_terminal(terminal_bloqueado)
+        validar_venda_sem_pagamento_ativo(venda)
+        venda, _criada = obter_ou_criar_venda_aberta(
+            terminal_bloqueado,
+            operador,
+            sessao_operador,
+            sessao_caixa,
+        )
+
+        anterior = dados_cliente_evento(venda)
+        if venda.cliente_uuid == cliente.cliente_uuid:
+            return venda
+
+        aplicar_snapshot_cliente(venda, cliente)
+        venda.save(
+            update_fields=[
+                "cliente_uuid",
+                "cliente_retaguarda_id",
+                "cliente_tipo_pessoa",
+                "cliente_documento",
+                "cliente_padrao",
+                "cliente_nome",
+                "atualizada_em",
+            ]
+        )
+        registrar_evento(
+            venda,
+            VendaEventoHub.TIPO_CLIENTE_SELECIONADO,
+            terminal_bloqueado,
+            operador,
+            sessao_operador,
+            {
+                "cliente_anterior": anterior,
+                "cliente_atual": dados_cliente_evento(venda),
+            },
+        )
+
+    return venda
+
+
+def remover_cliente(terminal, operador, sessao_operador):
+    with transaction.atomic():
+        terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
+        obter_sessao_caixa_terminal(terminal_bloqueado)
+        venda = obter_venda_aberta_terminal(terminal_bloqueado)
+        if not venda:
+            return None
+        validar_venda_sem_pagamento_ativo(venda)
+        if venda.cliente_uuid is None:
+            return venda
+
+        anterior = dados_cliente_evento(venda)
+        limpar_snapshot_cliente(venda)
+        venda.save(
+            update_fields=[
+                "cliente_uuid",
+                "cliente_retaguarda_id",
+                "cliente_tipo_pessoa",
+                "cliente_documento",
+                "cliente_padrao",
+                "cliente_nome",
+                "atualizada_em",
+            ]
+        )
+        registrar_evento(
+            venda,
+            VendaEventoHub.TIPO_CLIENTE_REMOVIDO,
+            terminal_bloqueado,
+            operador,
+            sessao_operador,
+            {
+                "cliente_anterior": anterior,
+                "cliente_atual": dados_cliente_evento(venda),
+            },
         )
 
     return venda
@@ -560,11 +648,70 @@ def obter_ou_criar_venda_aberta(terminal, operador, sessao_operador, sessao_caix
     return venda, True
 
 
+def obter_venda_aberta_terminal_bloqueada(terminal):
+    return (
+        VendaHub.objects.select_for_update()
+        .select_related(
+            "hub",
+            "sessao_caixa",
+            "terminal",
+            "operador_criacao",
+            "sessao_operador_criacao",
+        )
+        .filter(
+            hub=terminal.hub,
+            terminal=terminal,
+            status=VendaHub.STATUS_ABERTA,
+        )
+        .first()
+    )
+
+
 def obter_catalogo_item_bloqueado(hub, sku_id):
     try:
         return CatalogoItemHub.objects.select_for_update().get(hub=hub, retaguarda_sku_id=sku_id)
     except CatalogoItemHub.DoesNotExist as exc:
         raise VendaValidationError("Produto não encontrado no catálogo local.") from exc
+
+
+def obter_cliente_bloqueado(hub, cliente_uuid):
+    cliente = (
+        ClienteHub.objects.select_for_update()
+        .filter(hub=hub, cliente_uuid=cliente_uuid)
+        .first()
+    )
+    if not cliente:
+        raise VendaValidationError("Cliente não encontrado no cadastro local.")
+    return cliente
+
+
+def validar_cliente_selecionavel(cliente):
+    if not cliente.ativo:
+        raise VendaConflictError("Cliente inativo no cadastro local.")
+    if cliente.bloqueio:
+        raise VendaConflictError("Cliente bloqueado no cadastro local.")
+    if not cliente.presente_retaguarda and not (
+        cliente.origem == ClienteHub.ORIGEM_LOCAL and cliente.retaguarda_id is None
+    ):
+        raise VendaConflictError("Cliente indisponível no cadastro local.")
+
+
+def aplicar_snapshot_cliente(venda, cliente):
+    venda.cliente_uuid = cliente.cliente_uuid
+    venda.cliente_retaguarda_id = cliente.retaguarda_id
+    venda.cliente_tipo_pessoa = cliente.tipo_pessoa
+    venda.cliente_documento = cliente.documento
+    venda.cliente_padrao = cliente.cliente_padrao
+    venda.cliente_nome = cliente.nome_cliente
+
+
+def limpar_snapshot_cliente(venda):
+    venda.cliente_uuid = None
+    venda.cliente_retaguarda_id = None
+    venda.cliente_tipo_pessoa = ""
+    venda.cliente_documento = None
+    venda.cliente_padrao = False
+    venda.cliente_nome = ""
 
 
 def validar_catalogo_vendavel(item):
@@ -807,6 +954,18 @@ def dados_pagamento(pagamento):
     }
 
 
+def dados_cliente_evento(venda):
+    if venda.cliente_uuid is None:
+        return {
+            "cliente_uuid": None,
+            "retaguarda_id": None,
+        }
+    return {
+        "cliente_uuid": str(venda.cliente_uuid),
+        "retaguarda_id": venda.cliente_retaguarda_id,
+    }
+
+
 def serializar_venda(venda):
     if venda is None:
         return None
@@ -827,9 +986,23 @@ def serializar_venda(venda):
         "total_pago": f"{total_pago:.2f}",
         "pendente": f"{pendente:.2f}",
         "troco": f"{troco:.2f}",
+        "cliente": serializar_cliente_venda(venda),
         "operador_criacao": serializar_operador(venda.operador_criacao),
         "itens": [serializar_item(item) for item in itens],
         "pagamentos": [serializar_pagamento(pagamento) for pagamento in pagamentos],
+    }
+
+
+def serializar_cliente_venda(venda):
+    if venda.cliente_uuid is None:
+        return None
+    return {
+        "cliente_uuid": str(venda.cliente_uuid),
+        "retaguarda_id": venda.cliente_retaguarda_id,
+        "tipo_pessoa": venda.cliente_tipo_pessoa,
+        "documento": venda.cliente_documento,
+        "cliente_padrao": venda.cliente_padrao,
+        "nome_cliente": venda.cliente_nome,
     }
 
 

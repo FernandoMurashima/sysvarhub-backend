@@ -847,6 +847,10 @@ class VendaHub(models.Model):
     valor_recebido = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     troco = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     cliente_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    cliente_uuid = models.UUIDField(null=True, blank=True)
+    cliente_tipo_pessoa = models.CharField(max_length=2, blank=True, default="")
+    cliente_documento = models.CharField(max_length=20, null=True, blank=True)
+    cliente_padrao = models.BooleanField(default=False)
     cliente_nome = models.CharField(max_length=150, blank=True, default="")
     vendedor_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
     vendedor_nome = models.CharField(max_length=150, blank=True, default="")
@@ -933,6 +937,8 @@ class VendaEventoHub(models.Model):
     TIPO_PAGAMENTO_ADICIONADO = "PAGAMENTO_ADICIONADO"
     TIPO_PAGAMENTO_REMOVIDO = "PAGAMENTO_REMOVIDO"
     TIPO_VENDA_FINALIZADA = "VENDA_FINALIZADA"
+    TIPO_CLIENTE_SELECIONADO = "CLIENTE_SELECIONADO"
+    TIPO_CLIENTE_REMOVIDO = "CLIENTE_REMOVIDO"
     TIPO_CHOICES = [
         (TIPO_VENDA_CRIADA, "Venda criada"),
         (TIPO_ITEM_ADICIONADO, "Item adicionado"),
@@ -942,6 +948,8 @@ class VendaEventoHub(models.Model):
         (TIPO_PAGAMENTO_ADICIONADO, "Pagamento adicionado"),
         (TIPO_PAGAMENTO_REMOVIDO, "Pagamento removido"),
         (TIPO_VENDA_FINALIZADA, "Venda finalizada"),
+        (TIPO_CLIENTE_SELECIONADO, "Cliente selecionado"),
+        (TIPO_CLIENTE_REMOVIDO, "Cliente removido"),
     ]
 
     venda = models.ForeignKey(VendaHub, on_delete=models.PROTECT, related_name="eventos")
