@@ -3,13 +3,14 @@ import uuid
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from django.db import IntegrityError, transaction
-from django.db.models import Sum
+from django.db.models import Prefetch, Sum
 from django.utils import timezone
 
 from core.models import (
     CatalogoItemHub,
     EstoqueMovimentoHub,
     FormaPagamentoHub,
+    FormaPagamentoParcelaHub,
     SessaoCaixaHub,
     Terminal,
     VendaEventoHub,
@@ -25,8 +26,10 @@ from core.services.operadores import serializar_operador
 ZERO_2 = Decimal("0.00")
 QUANTIDADE_DECIMAL = Decimal("1")
 QUANTIDADE_ESTOQUE = Decimal("0.001")
+VALOR_PAGAMENTO_MAXIMO = Decimal("9999999999999999.99")
 DINHEIRO = "DINHEIRO"
 ERRO_PAGAMENTO_ALTERAR_VENDA = "Remova os pagamentos antes de alterar a venda."
+ERRO_OPERACAO_PAGAMENTO_DIVERGENTE = "Operação de pagamento já utilizada com dados diferentes."
 
 
 class VendaError(Exception):
@@ -234,9 +237,10 @@ def cancelar_venda(terminal, operador, sessao_operador):
 
 
 def listar_formas_pagamento(terminal):
+    parcelas_ordenadas = FormaPagamentoParcelaHub.objects.order_by("ordem", "id")
     formas = (
         FormaPagamentoHub.objects.filter(hub=terminal.hub, ativo=True)
-        .prefetch_related("parcelas")
+        .prefetch_related(Prefetch("parcelas", queryset=parcelas_ordenadas))
         .order_by("codigo", "retaguarda_id")
     )
     return {
@@ -280,11 +284,18 @@ def adicionar_pagamento(
             .first()
         )
         if pagamento_existente:
-            return venda
+            validar_retry_pagamento(
+                pagamento_existente,
+                forma_pagamento_id=forma_pagamento_id,
+                valor=valor,
+                autorizacao=autorizacao,
+            )
+            return venda, False
 
+        parcelas_ordenadas = FormaPagamentoParcelaHub.objects.order_by("ordem", "id")
         forma = (
             FormaPagamentoHub.objects.select_for_update()
-            .prefetch_related("parcelas")
+            .prefetch_related(Prefetch("parcelas", queryset=parcelas_ordenadas))
             .filter(pk=forma_pagamento_id, hub=terminal_bloqueado.hub, ativo=True)
             .first()
         )
@@ -325,7 +336,7 @@ def adicionar_pagamento(
             operador_inclusao=operador,
             sessao_operador_inclusao=sessao_operador,
         )
-        for parcela in forma.parcelas.all().order_by("ordem", "id"):
+        for parcela in forma.parcelas.all():
             VendaPagamentoParcelaHub.objects.create(
                 pagamento=pagamento,
                 ordem=parcela.ordem,
@@ -342,7 +353,7 @@ def adicionar_pagamento(
             dados_pagamento(pagamento),
         )
 
-    return venda
+    return venda, True
 
 
 def remover_pagamento(terminal, operador, sessao_operador, *, pagamento_uuid):
@@ -693,7 +704,7 @@ def validar_valor_pagamento(valor):
         decimal = Decimal(valor)
     except InvalidOperation as exc:
         raise VendaValidationError("Valor do pagamento inválido.") from exc
-    if not decimal.is_finite() or decimal <= ZERO_2:
+    if not decimal.is_finite() or decimal <= ZERO_2 or decimal > VALOR_PAGAMENTO_MAXIMO:
         raise VendaValidationError("Valor do pagamento inválido.")
     return money(decimal)
 
@@ -707,6 +718,15 @@ def validar_autorizacao(valor):
     if len(texto) > 120:
         raise VendaValidationError("Autorização inválida.")
     return texto
+
+
+def validar_retry_pagamento(pagamento, *, forma_pagamento_id, valor, autorizacao):
+    if (
+        pagamento.forma_pagamento_id != forma_pagamento_id
+        or pagamento.valor != valor
+        or pagamento.autorizacao != autorizacao
+    ):
+        raise VendaConflictError(ERRO_OPERACAO_PAGAMENTO_DIVERGENTE)
 
 
 def obter_venda_terminal_por_uuid_bloqueada(terminal, venda_uuid):
@@ -850,7 +870,7 @@ def serializar_pagamento(pagamento):
 
 
 def serializar_forma_pagamento(forma):
-    parcelas = forma.parcelas.all().order_by("ordem", "id")
+    parcelas = forma.parcelas.all()
     return {
         "id": forma.id,
         "retaguarda_id": forma.retaguarda_id,

@@ -384,7 +384,7 @@ class VendaPagamentoView(APIView):
 
     def post(self, request):
         try:
-            venda = adicionar_pagamento(
+            venda, criado = adicionar_pagamento(
                 request.sysvar_terminal,
                 request.sysvar_operador,
                 request.sysvar_operador_sessao,
@@ -403,7 +403,10 @@ class VendaPagamentoView(APIView):
         except VendaError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response({"venda": serializar_venda(venda)}, status=status.HTTP_201_CREATED)
+        return Response(
+            {"venda": serializar_venda(venda)},
+            status=status.HTTP_201_CREATED if criado else status.HTTP_200_OK,
+        )
 
 
 class VendaPagamentoDetalheView(APIView):

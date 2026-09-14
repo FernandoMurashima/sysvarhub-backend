@@ -1,7 +1,9 @@
 import uuid
 from decimal import Decimal
 
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from core.models import (
@@ -18,7 +20,7 @@ from core.models import (
 )
 from core.services.caixa import fechar_caixa
 from core.services.terminais import configurar_terminal
-from core.services.vendas import calcular_disponivel_local
+from core.services.vendas import calcular_disponivel_local, listar_formas_pagamento
 from core.tests_caixa import criar_hub
 from core.tests_vendas import VendaHubTestMixin
 
@@ -109,6 +111,24 @@ class FormasPagamentoApiTests(PagamentoHubTestMixin, TestCase):
 
         self.assertNotIn("OUT", [forma["codigo"] for forma in resposta.data["formas"]])
 
+    def test_listagem_das_formas_nao_gera_n_mais_um_para_parcelas(self):
+        for indice in range(3):
+            forma = self.criar_forma(f"F{indice}", "PIX", retaguarda_id=8000 + indice)
+            FormaPagamentoParcelaHub.objects.create(
+                forma=forma,
+                ordem=2,
+                dias=30,
+                percentual=Decimal("0.500000"),
+                valor_fixo=None,
+                sincronizado_em=timezone.now(),
+            )
+
+        with CaptureQueriesContext(connection) as contexto:
+            payload = listar_formas_pagamento(self.terminal)
+
+        self.assertLessEqual(len(contexto), 2)
+        self.assertGreaterEqual(len(payload["formas"]), 3)
+
 
 class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
     def test_adicionar_dinheiro(self):
@@ -155,10 +175,54 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
     def test_retry_mesmo_operacao_uuid_nao_duplica(self):
         venda_uuid = self.criar_venda_com_item()
         operacao_uuid = uuid.uuid4()
-        self.pagar(venda_uuid, self.dinheiro, operacao_uuid=operacao_uuid)
-        self.pagar(venda_uuid, self.dinheiro, operacao_uuid=operacao_uuid)
+        primeira = self.pagar(venda_uuid, self.dinheiro, operacao_uuid=operacao_uuid)
+        segunda = self.pagar(venda_uuid, self.dinheiro, operacao_uuid=operacao_uuid)
 
+        self.assertEqual(primeira.status_code, 201)
+        self.assertEqual(segunda.status_code, 200)
         self.assertEqual(VendaPagamentoHub.objects.count(), 1)
+        self.assertEqual(
+            VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_PAGAMENTO_ADICIONADO).count(),
+            1,
+        )
+
+    def test_mesmo_operacao_uuid_forma_diferente_retorna_409_e_preserva_original(self):
+        venda_uuid = self.criar_venda_com_item()
+        operacao_uuid = uuid.uuid4()
+        self.pagar(venda_uuid, self.dinheiro, operacao_uuid=operacao_uuid)
+        resposta = self.pagar(venda_uuid, self.pix, operacao_uuid=operacao_uuid)
+
+        pagamento = VendaPagamentoHub.objects.get()
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(resposta.data["detail"], "Operação de pagamento já utilizada com dados diferentes.")
+        self.assertEqual(pagamento.forma_pagamento, self.dinheiro)
+        self.assertEqual(VendaPagamentoHub.objects.count(), 1)
+
+    def test_mesmo_operacao_uuid_valor_diferente_retorna_409(self):
+        venda_uuid = self.criar_venda_com_item()
+        operacao_uuid = uuid.uuid4()
+        self.pagar(venda_uuid, self.dinheiro, valor="199.90", operacao_uuid=operacao_uuid)
+        resposta = self.pagar(venda_uuid, self.dinheiro, valor="200.00", operacao_uuid=operacao_uuid)
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(VendaPagamentoHub.objects.get().valor, Decimal("199.90"))
+
+    def test_mesmo_operacao_uuid_autorizacao_diferente_retorna_409(self):
+        venda_uuid = self.criar_venda_com_item()
+        operacao_uuid = uuid.uuid4()
+        payload = {
+            "venda_uuid": venda_uuid,
+            "operacao_uuid": str(operacao_uuid),
+            "forma_pagamento_id": self.dinheiro.id,
+            "valor": "199.90",
+            "autorizacao": "A1",
+        }
+        self.client.post("/api/terminal/venda/pagamento/", payload, format="json")
+        payload["autorizacao"] = "A2"
+        resposta = self.client.post("/api/terminal/venda/pagamento/", payload, format="json")
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(VendaPagamentoHub.objects.get().autorizacao, "A1")
 
     def test_valor_float_rejeitado(self):
         venda_uuid = self.criar_venda_com_item()
@@ -182,6 +246,20 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
             with self.subTest(valor=valor):
                 resposta = self.pagar(venda_uuid, self.dinheiro, valor=valor)
                 self.assertEqual(resposta.status_code, 400)
+
+    def test_valor_maximo_monetario_e_aceito(self):
+        venda_uuid = self.criar_venda_com_item()
+        resposta = self.pagar(venda_uuid, self.dinheiro, valor="9999999999999999.99")
+
+        self.assertEqual(resposta.status_code, 201)
+        self.assertEqual(VendaPagamentoHub.objects.get().valor, Decimal("9999999999999999.99"))
+
+    def test_valor_acima_do_limite_monetario_retorna_400(self):
+        venda_uuid = self.criar_venda_com_item()
+        resposta = self.pagar(venda_uuid, self.dinheiro, valor="10000000000000000.00")
+
+        self.assertEqual(resposta.status_code, 400)
+        self.assertEqual(resposta.data["detail"], "Valor do pagamento inválido.")
 
     def test_pagamento_nao_dinheiro_maior_que_pendente_bloqueado(self):
         venda_uuid = self.criar_venda_com_item()
