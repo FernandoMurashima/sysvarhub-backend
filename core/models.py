@@ -104,6 +104,21 @@ class HubConfig(models.Model):
         blank=True,
     )
 
+    formas_pagamento_versao = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    formas_pagamento_gerado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    formas_pagamento_sincronizado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
     tabela_preco_retaguarda_id = models.PositiveBigIntegerField(
         null=True,
         blank=True,
@@ -327,6 +342,103 @@ class OperadorHub(models.Model):
 
     def __str__(self):
         return f"{self.codigo} - {self.nome}"
+
+
+class FormaPagamentoHub(models.Model):
+    hub = models.ForeignKey(
+        HubConfig,
+        on_delete=models.PROTECT,
+        related_name="formas_pagamento",
+    )
+
+    retaguarda_id = models.PositiveBigIntegerField()
+    codigo = models.CharField(max_length=10)
+    descricao = models.CharField(max_length=120)
+    tipo = models.CharField(max_length=24)
+    num_parcelas = models.PositiveIntegerField()
+    ativo = models.BooleanField(default=True)
+
+    prazo_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    prazo_codigo = models.CharField(max_length=12, blank=True, default="")
+    prazo_descricao = models.CharField(max_length=120, blank=True, default="")
+    prazo_num_parcelas = models.PositiveIntegerField(null=True, blank=True)
+    prazo_intervalo_dias = models.PositiveIntegerField(null=True, blank=True)
+
+    adquirente = models.CharField(max_length=80, null=True, blank=True)
+    conta_liquidacao_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    gera_recebivel_bancario = models.BooleanField(default=False)
+    prazo_credito_dias = models.PositiveIntegerField(default=0)
+    taxa_percentual = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    taxa_fixa = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+
+    tef_habilitado = models.BooleanField(default=False)
+    tef_modalidade = models.CharField(max_length=20, blank=True, default="")
+    tef_adquirente_codigo = models.CharField(max_length=40, blank=True, default="")
+    tef_terminal_logico = models.CharField(max_length=40, blank=True, default="")
+
+    sincronizado_em = models.DateTimeField()
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Forma de pagamento do Hub"
+        verbose_name_plural = "Formas de pagamento do Hub"
+        ordering = ("codigo", "retaguarda_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["hub", "retaguarda_id"],
+                name="uniq_fpg_hub_ret",
+            ),
+            models.UniqueConstraint(
+                fields=["hub", "codigo"],
+                name="uniq_fpg_hub_cod",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "ativo"], name="idx_fpg_hub_ativo"),
+        ]
+
+    def __str__(self):
+        return f"{self.codigo} - {self.descricao}"
+
+
+class FormaPagamentoParcelaHub(models.Model):
+    forma = models.ForeignKey(
+        FormaPagamentoHub,
+        on_delete=models.CASCADE,
+        related_name="parcelas",
+    )
+    ordem = models.PositiveIntegerField()
+    dias = models.IntegerField()
+    percentual = models.DecimalField(
+        max_digits=9,
+        decimal_places=6,
+        null=True,
+        blank=True,
+    )
+    valor_fixo = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    sincronizado_em = models.DateTimeField()
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Parcela de forma de pagamento do Hub"
+        verbose_name_plural = "Parcelas de formas de pagamento do Hub"
+        ordering = ("ordem", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["forma", "ordem"],
+                name="uniq_fpg_parc_ord",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.forma.codigo} - {self.ordem}"
 
 
 class Terminal(models.Model):

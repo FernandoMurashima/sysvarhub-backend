@@ -68,6 +68,15 @@ class RetaguardaClient:
             headers={"Authorization": f"Hub {token}"},
         )
 
+    def formas_pagamento(self, *, token):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._request_json(
+            "api/hub/formas-pagamento/",
+            method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
     def _post_json(self, path, payload, headers=None):
         return self._request_json(path, method="POST", payload=payload, headers=headers)
 

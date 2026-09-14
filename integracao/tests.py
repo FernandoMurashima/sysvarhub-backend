@@ -8,9 +8,19 @@ from django.core.management.base import CommandError
 from django.test import TestCase
 from django.utils import timezone
 
-from core.models import CaixaHub, CatalogoItemHub, HubConfig
+from core.models import (
+    CaixaHub,
+    CatalogoItemHub,
+    FormaPagamentoHub,
+    FormaPagamentoParcelaHub,
+    HubConfig,
+)
 from integracao.services.bootstrap import BootstrapValidationError, sincronizar_bootstrap
 from integracao.services.catalogo import CatalogoValidationError, sincronizar_catalogo
+from integracao.services.formas_pagamento import (
+    FormasPagamentoValidationError,
+    sincronizar_formas_pagamento,
+)
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 
 
@@ -126,6 +136,30 @@ class RetaguardaClientTests(TestCase):
     def test_catalogo_sem_token_nao_expoe_token_em_erro(self):
         with self.assertRaises(RetaguardaError) as ctx:
             RetaguardaClient("http://central.test").catalogo(token="")
+
+        self.assertNotIn("TOKEN-SECRETO", str(ctx.exception))
+
+    def test_formas_pagamento_chama_get_com_authorization_hub(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["data"] = req.data
+            captured["headers"] = dict(req.header_items())
+            return _JsonResponse({"formas_pagamento_versao": 1})
+
+        with patch("integracao.services.retaguarda.request.urlopen", fake_urlopen):
+            RetaguardaClient("http://central.test").formas_pagamento(token="TOKEN-SECRETO")
+
+        self.assertEqual(captured["url"], "http://central.test/api/hub/formas-pagamento/")
+        self.assertEqual(captured["method"], "GET")
+        self.assertIsNone(captured["data"])
+        self.assertEqual(captured["headers"]["Authorization"], "Hub TOKEN-SECRETO")
+
+    def test_formas_pagamento_exige_token(self):
+        with self.assertRaises(RetaguardaError) as ctx:
+            RetaguardaClient("http://central.test").formas_pagamento(token="")
 
         self.assertNotIn("TOKEN-SECRETO", str(ctx.exception))
 
@@ -838,3 +872,305 @@ class SincronizarCatalogoHubCommandTests(TestCase):
 
         with self.assertRaises(CommandError):
             call_command("sincronizar_catalogo_hub", stdout=io.StringIO())
+
+
+class FormasPagamentoHubServiceTests(TestCase):
+    def setUp(self):
+        self.hub = HubConfig.objects.create(
+            retaguarda_url="http://central.test",
+            ativo=True,
+            retaguarda_token="TOKEN-SECRETO",
+            retaguarda_hub_id=99,
+            empresa_id=11,
+            loja_id=41,
+            bootstrap_versao=1,
+        )
+
+    def parcela(self, **overrides):
+        payload = {
+            "ordem": 1,
+            "dias": 0,
+            "percentual": "1.000000",
+            "valor_fixo": None,
+        }
+        payload.update(overrides)
+        return payload
+
+    def prazo(self, **overrides):
+        payload = {
+            "id": 5,
+            "codigo": "30D",
+            "descricao": "30 dias",
+            "num_parcelas": 1,
+            "intervalo_dias": 30,
+        }
+        payload.update(overrides)
+        return payload
+
+    def forma(self, **overrides):
+        payload = {
+            "id": 10,
+            "codigo": "DIN",
+            "descricao": "Dinheiro",
+            "tipo": "DINHEIRO",
+            "num_parcelas": 1,
+            "ativo": True,
+            "prazo_pagamento": None,
+            "adquirente": None,
+            "conta_liquidacao_id": None,
+            "gera_recebivel_bancario": False,
+            "prazo_credito_dias": 0,
+            "taxa_percentual": "0.0000",
+            "taxa_fixa": "0.00",
+            "tef_habilitado": False,
+            "tef_modalidade": "",
+            "tef_adquirente_codigo": "",
+            "tef_terminal_logico": "",
+            "parcelas": [self.parcela()],
+        }
+        payload.update(overrides)
+        return payload
+
+    def resposta(self, formas=None, **overrides):
+        if formas is None:
+            formas = [self.forma()]
+        payload = {
+            "formas_pagamento_versao": 1,
+            "gerado_em": "2026-09-14T10:00:00-03:00",
+            "hub": {"id": 99, "hub_uuid": str(self.hub.hub_uuid)},
+            "empresa": {"id": 11},
+            "loja": {"id": 41},
+            "formas_pagamento": formas,
+        }
+        payload.update(overrides)
+        return payload
+
+    def assert_rejeita(self, resposta):
+        with self.assertRaises(FormasPagamentoValidationError):
+            sincronizar_formas_pagamento(self.hub, resposta)
+
+    def test_snapshot_v1_valido_atualiza_hubconfig(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta())
+
+        self.hub.refresh_from_db()
+        self.assertEqual(self.hub.formas_pagamento_versao, 1)
+        self.assertIsNotNone(self.hub.formas_pagamento_gerado_em)
+        self.assertIsNotNone(self.hub.formas_pagamento_sincronizado_em)
+
+    def test_identidade_hub_correta_e_aceita(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta())
+
+        self.assertEqual(FormaPagamentoHub.objects.count(), 1)
+
+    def test_hub_id_divergente_rejeita(self):
+        resposta = self.resposta()
+        resposta["hub"]["id"] = 100
+        self.assert_rejeita(resposta)
+
+    def test_hub_uuid_divergente_rejeita(self):
+        resposta = self.resposta()
+        resposta["hub"]["hub_uuid"] = str(uuid.uuid4())
+        self.assert_rejeita(resposta)
+
+    def test_empresa_divergente_rejeita(self):
+        resposta = self.resposta()
+        resposta["empresa"]["id"] = 12
+        self.assert_rejeita(resposta)
+
+    def test_loja_divergente_rejeita(self):
+        resposta = self.resposta()
+        resposta["loja"]["id"] = 42
+        self.assert_rejeita(resposta)
+
+    def test_forma_valida_e_criada(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta())
+
+        forma = FormaPagamentoHub.objects.get()
+        self.assertEqual(forma.codigo, "DIN")
+        self.assertEqual(forma.tipo, "DINHEIRO")
+
+    def test_segunda_sincronizacao_atualiza_sem_duplicar(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta())
+        sincronizar_formas_pagamento(self.hub, self.resposta([self.forma(descricao="Dinheiro novo")]))
+
+        self.assertEqual(FormaPagamentoHub.objects.count(), 1)
+        self.assertEqual(FormaPagamentoHub.objects.get().descricao, "Dinheiro novo")
+
+    def test_forma_inativa_permanece_com_ativo_false(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta([self.forma(ativo=False)]))
+
+        self.assertFalse(FormaPagamentoHub.objects.get().ativo)
+
+    def test_forma_ausente_e_inativada_sem_deletar(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta([self.forma(id=10, codigo="DIN")]))
+        sincronizar_formas_pagamento(self.hub, self.resposta([self.forma(id=11, codigo="CAR")]))
+
+        self.assertEqual(FormaPagamentoHub.objects.count(), 2)
+        self.assertFalse(FormaPagamentoHub.objects.get(retaguarda_id=10).ativo)
+
+    def test_codigo_duplicado_rejeita(self):
+        self.assert_rejeita(
+            self.resposta([self.forma(id=10, codigo="DIN"), self.forma(id=11, codigo="DIN")])
+        )
+
+    def test_id_duplicado_rejeita(self):
+        self.assert_rejeita(
+            self.resposta([self.forma(id=10, codigo="DIN"), self.forma(id=10, codigo="CAR")])
+        )
+
+    def test_prazo_null(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta([self.forma(prazo_pagamento=None)]))
+
+        forma = FormaPagamentoHub.objects.get()
+        self.assertIsNone(forma.prazo_retaguarda_id)
+        self.assertEqual(forma.prazo_codigo, "")
+
+    def test_prazo_preenchido(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta([self.forma(prazo_pagamento=self.prazo())]))
+
+        forma = FormaPagamentoHub.objects.get()
+        self.assertEqual(forma.prazo_retaguarda_id, 5)
+        self.assertEqual(forma.prazo_codigo, "30D")
+
+    def test_troca_prazo_preenchido_para_null_limpa_snapshot(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta([self.forma(prazo_pagamento=self.prazo())]))
+        sincronizar_formas_pagamento(self.hub, self.resposta([self.forma(prazo_pagamento=None)]))
+
+        forma = FormaPagamentoHub.objects.get()
+        self.assertIsNone(forma.prazo_retaguarda_id)
+        self.assertEqual(forma.prazo_descricao, "")
+
+    def test_parcelas_criadas(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta())
+
+        self.assertEqual(FormaPagamentoParcelaHub.objects.count(), 1)
+
+    def test_parcelas_atualizadas(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta())
+        sincronizar_formas_pagamento(self.hub, self.resposta([self.forma(parcelas=[self.parcela(dias=30)])]))
+
+        self.assertEqual(FormaPagamentoParcelaHub.objects.get().dias, 30)
+
+    def test_parcela_ausente_e_removida(self):
+        sincronizar_formas_pagamento(
+            self.hub,
+            self.resposta([self.forma(parcelas=[self.parcela(ordem=1), self.parcela(ordem=2)])]),
+        )
+        sincronizar_formas_pagamento(self.hub, self.resposta([self.forma(parcelas=[self.parcela(ordem=1)])]))
+
+        self.assertEqual(FormaPagamentoParcelaHub.objects.count(), 1)
+
+    def test_ordem_duplicada_rejeita(self):
+        self.assert_rejeita(
+            self.resposta([self.forma(parcelas=[self.parcela(ordem=1), self.parcela(ordem=1)])])
+        )
+
+    def test_taxa_percentual_exige_string_4_casas(self):
+        self.assert_rejeita(self.resposta([self.forma(taxa_percentual="2.500")]))
+
+    def test_taxa_fixa_exige_string_2_casas(self):
+        self.assert_rejeita(self.resposta([self.forma(taxa_fixa="1.200")]))
+
+    def test_percentual_parcela_exige_6_casas(self):
+        self.assert_rejeita(self.resposta([self.forma(parcelas=[self.parcela(percentual="0.5")])]))
+
+    def test_valor_fixo_exige_2_casas(self):
+        self.assert_rejeita(self.resposta([self.forma(parcelas=[self.parcela(valor_fixo="100.0")])]))
+
+    def test_float_e_rejeitado(self):
+        self.assert_rejeita(self.resposta([self.forma(taxa_percentual=2.5)]))
+
+    def test_bool_nao_e_aceito_como_inteiro(self):
+        self.assert_rejeita(self.resposta([self.forma(id=True)]))
+
+    def test_tef_e_persistido(self):
+        sincronizar_formas_pagamento(
+            self.hub,
+            self.resposta(
+                [
+                    self.forma(
+                        tef_habilitado=True,
+                        tef_modalidade="CREDITO",
+                        tef_adquirente_codigo="001",
+                        tef_terminal_logico="PDV01",
+                    )
+                ]
+            ),
+        )
+
+        forma = FormaPagamentoHub.objects.get()
+        self.assertTrue(forma.tef_habilitado)
+        self.assertEqual(forma.tef_modalidade, "CREDITO")
+
+    def test_conta_liquidacao_id_e_persistida_apenas_como_id(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta([self.forma(conta_liquidacao_id=77)]))
+
+        self.assertEqual(FormaPagamentoHub.objects.get().conta_liquidacao_retaguarda_id, 77)
+
+    def test_erro_de_validacao_nao_deixa_alteracao_parcial(self):
+        sincronizar_formas_pagamento(self.hub, self.resposta())
+
+        with self.assertRaises(FormasPagamentoValidationError):
+            sincronizar_formas_pagamento(
+                self.hub,
+                self.resposta([self.forma(descricao="Alterado"), self.forma(id=11, codigo="DIN")]),
+            )
+
+        self.assertEqual(FormaPagamentoHub.objects.get().descricao, "Dinheiro")
+
+    def test_hubconfig_so_atualiza_apos_sucesso(self):
+        with self.assertRaises(FormasPagamentoValidationError):
+            sincronizar_formas_pagamento(self.hub, self.resposta(formas_pagamento_versao=2))
+
+        self.hub.refresh_from_db()
+        self.assertIsNone(self.hub.formas_pagamento_versao)
+
+
+class SincronizarFormasPagamentoHubCommandTests(TestCase):
+    def hub_pronto(self, **overrides):
+        payload = {
+            "retaguarda_url": "http://central.test",
+            "ativo": True,
+            "retaguarda_token": "TOKEN-SECRETO",
+            "retaguarda_hub_id": 99,
+            "empresa_id": 11,
+            "loja_id": 41,
+            "bootstrap_versao": 1,
+        }
+        payload.update(overrides)
+        return HubConfig.objects.create(**payload)
+
+    def resposta(self, hub):
+        return {
+            "formas_pagamento_versao": 1,
+            "gerado_em": "2026-09-14T10:00:00-03:00",
+            "hub": {"id": 99, "hub_uuid": str(hub.hub_uuid)},
+            "empresa": {"id": 11},
+            "loja": {"id": 41},
+            "formas_pagamento": [],
+        }
+
+    def test_comando_sincroniza_sem_expor_token(self):
+        hub = self.hub_pronto()
+        out = io.StringIO()
+
+        with patch(
+            "integracao.management.commands.sincronizar_formas_pagamento_hub.RetaguardaClient.formas_pagamento",
+            return_value=self.resposta(hub),
+        ):
+            call_command("sincronizar_formas_pagamento_hub", stdout=out)
+
+        self.assertIn("Formas de pagamento sincronizadas com sucesso.", out.getvalue())
+        self.assertNotIn("TOKEN-SECRETO", out.getvalue())
+
+    def test_comando_exige_hub_ativo(self):
+        self.hub_pronto(ativo=False)
+
+        with self.assertRaises(CommandError):
+            call_command("sincronizar_formas_pagamento_hub", stdout=io.StringIO())
+
+    def test_comando_exige_configuracao_completa(self):
+        self.hub_pronto(retaguarda_token="")
+
+        with self.assertRaises(CommandError):
+            call_command("sincronizar_formas_pagamento_hub", stdout=io.StringIO())
