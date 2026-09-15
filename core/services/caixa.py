@@ -113,6 +113,9 @@ def fechar_caixa(terminal, operador, sessao_operador):
 
         if existe_venda_aberta_sessao_caixa(sessao):
             raise CaixaConflictError("Existe venda em andamento neste caixa.")
+        from core.services.vendas import limpar_contexto_venda_terminal
+
+        limpar_contexto_venda_terminal(terminal)
 
         sessao.status = SessaoCaixaHub.STATUS_FECHADO
         sessao.fechado_em = timezone.now()

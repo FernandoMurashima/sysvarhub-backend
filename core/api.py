@@ -43,6 +43,7 @@ from core.services.vendas import (
     remover_pagamento,
     remover_item,
     remover_cliente,
+    serializar_cliente_preselecionado,
     serializar_venda,
     selecionar_cliente,
     venda_atual,
@@ -261,13 +262,18 @@ class VendaAtualView(APIView):
 
     def get(self, request):
         try:
-            venda = venda_atual(request.sysvar_terminal)
+            venda, cliente_preselecionado = venda_atual(request.sysvar_terminal)
         except VendaConflictError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         except VendaError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response({"venda": serializar_venda(venda)})
+        return Response(
+            {
+                "venda": serializar_venda(venda),
+                "cliente_preselecionado": serializar_cliente_preselecionado(cliente_preselecionado),
+            }
+        )
 
 
 class VendaClienteView(APIView):

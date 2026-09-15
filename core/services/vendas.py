@@ -9,6 +9,7 @@ from django.utils import timezone
 from core.models import (
     CatalogoItemHub,
     ClienteHub,
+    ContextoVendaTerminalHub,
     EstoqueMovimentoHub,
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
@@ -84,7 +85,11 @@ def obter_venda_aberta_terminal(terminal):
 
 def venda_atual(terminal):
     obter_sessao_caixa_terminal(terminal)
-    return obter_venda_aberta_terminal(terminal)
+    venda = obter_venda_aberta_terminal(terminal)
+    if venda:
+        return venda, None
+    contexto = obter_contexto_venda_terminal(terminal)
+    return None, contexto.cliente_preselecionado if contexto else None
 
 
 def adicionar_item(terminal, operador, sessao_operador, *, sku_id, quantidade=1):
@@ -93,7 +98,7 @@ def adicionar_item(terminal, operador, sessao_operador, *, sku_id, quantidade=1)
 
     with transaction.atomic():
         terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
-        sessao_caixa = obter_sessao_caixa_terminal(terminal_bloqueado)
+        obter_sessao_caixa_terminal(terminal_bloqueado)
         catalogo_item = obter_catalogo_item_bloqueado(terminal_bloqueado.hub, sku_id)
         validar_catalogo_vendavel(catalogo_item)
         venda = obter_venda_aberta_terminal_bloqueada(terminal_bloqueado)
@@ -105,6 +110,8 @@ def adicionar_item(terminal, operador, sessao_operador, *, sku_id, quantidade=1)
             sessao_operador,
             sessao_caixa,
         )
+        if criada:
+            materializar_cliente_preselecionado(venda, terminal_bloqueado)
         item = VendaItemHub.objects.select_for_update().filter(
             venda=venda,
             retaguarda_sku_id=sku_id,
@@ -208,14 +215,16 @@ def selecionar_cliente(terminal, operador, sessao_operador, *, cliente_uuid):
         sessao_caixa = obter_sessao_caixa_terminal(terminal_bloqueado)
         cliente = obter_cliente_bloqueado(terminal_bloqueado.hub, cliente_uuid)
         validar_cliente_selecionavel(cliente)
-        venda = obter_venda_aberta_terminal(terminal_bloqueado)
+        venda = obter_venda_aberta_terminal_bloqueada(terminal_bloqueado)
         validar_venda_sem_pagamento_ativo(venda)
-        venda, _criada = obter_ou_criar_venda_aberta(
-            terminal_bloqueado,
-            operador,
-            sessao_operador,
-            sessao_caixa,
-        )
+        if not venda:
+            contexto, _created = ContextoVendaTerminalHub.objects.select_for_update().get_or_create(
+                terminal=terminal_bloqueado,
+            )
+            if contexto.cliente_preselecionado_id != cliente.id:
+                contexto.cliente_preselecionado = cliente
+                contexto.save(update_fields=["cliente_preselecionado", "atualizado_em"])
+            return None
 
         anterior = dados_cliente_evento(venda)
         if venda.cliente_uuid == cliente.cliente_uuid:
@@ -252,8 +261,9 @@ def remover_cliente(terminal, operador, sessao_operador):
     with transaction.atomic():
         terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
         obter_sessao_caixa_terminal(terminal_bloqueado)
-        venda = obter_venda_aberta_terminal(terminal_bloqueado)
+        venda = obter_venda_aberta_terminal_bloqueada(terminal_bloqueado)
         if not venda:
+            limpar_contexto_venda_terminal(terminal_bloqueado)
             return None
         validar_venda_sem_pagamento_ativo(venda)
         if venda.cliente_uuid is None:
@@ -648,6 +658,47 @@ def obter_ou_criar_venda_aberta(terminal, operador, sessao_operador, sessao_caix
     return venda, True
 
 
+def obter_contexto_venda_terminal(terminal):
+    return (
+        ContextoVendaTerminalHub.objects.select_related("cliente_preselecionado")
+        .filter(terminal=terminal)
+        .first()
+    )
+
+
+def materializar_cliente_preselecionado(venda, terminal):
+    contexto = (
+        ContextoVendaTerminalHub.objects.select_for_update()
+        .select_related("cliente_preselecionado")
+        .filter(terminal=terminal)
+        .first()
+    )
+    if not contexto:
+        return
+
+    cliente = contexto.cliente_preselecionado
+    if cliente is not None:
+        cliente = obter_cliente_bloqueado(terminal.hub, cliente.cliente_uuid)
+        validar_cliente_selecionavel(cliente)
+        aplicar_snapshot_cliente(venda, cliente)
+        venda.save(
+            update_fields=[
+                "cliente_uuid",
+                "cliente_retaguarda_id",
+                "cliente_tipo_pessoa",
+                "cliente_documento",
+                "cliente_padrao",
+                "cliente_nome",
+                "atualizada_em",
+            ]
+        )
+    contexto.delete()
+
+
+def limpar_contexto_venda_terminal(terminal):
+    ContextoVendaTerminalHub.objects.filter(terminal=terminal).delete()
+
+
 def obter_venda_aberta_terminal_bloqueada(terminal):
     return (
         VendaHub.objects.select_for_update()
@@ -1003,6 +1054,19 @@ def serializar_cliente_venda(venda):
         "documento": venda.cliente_documento,
         "cliente_padrao": venda.cliente_padrao,
         "nome_cliente": venda.cliente_nome,
+    }
+
+
+def serializar_cliente_preselecionado(cliente):
+    if cliente is None:
+        return None
+    return {
+        "cliente_uuid": str(cliente.cliente_uuid),
+        "retaguarda_id": cliente.retaguarda_id,
+        "tipo_pessoa": cliente.tipo_pessoa,
+        "documento": cliente.documento,
+        "cliente_padrao": cliente.cliente_padrao,
+        "nome_cliente": cliente.nome_cliente,
     }
 
 

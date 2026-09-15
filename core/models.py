@@ -635,6 +635,30 @@ class Terminal(models.Model):
         return token
 
 
+class ContextoVendaTerminalHub(models.Model):
+    terminal = models.OneToOneField(
+        Terminal,
+        on_delete=models.CASCADE,
+        related_name="contexto_venda",
+    )
+    cliente_preselecionado = models.ForeignKey(
+        ClienteHub,
+        on_delete=models.SET_NULL,
+        related_name="contextos_pre_venda",
+        null=True,
+        blank=True,
+    )
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Contexto de venda do terminal Hub"
+        verbose_name_plural = "Contextos de venda dos terminais Hub"
+
+    def __str__(self):
+        return f"{self.terminal.codigo} - contexto de venda"
+
+
 class SessaoOperadorHub(models.Model):
     TOKEN_BYTES = 32
 

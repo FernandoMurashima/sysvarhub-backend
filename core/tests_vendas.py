@@ -8,6 +8,7 @@ from django.utils import timezone
 from core.models import (
     CatalogoItemHub,
     ClienteHub,
+    ContextoVendaTerminalHub,
     FormaPagamentoHub,
     SessaoCaixaHub,
     VendaEventoHub,
@@ -109,6 +110,7 @@ class VendaAtualApiTests(VendaHubTestMixin, TestCase):
 
         self.assertEqual(resposta.status_code, 200)
         self.assertIsNone(resposta.data["venda"])
+        self.assertIsNone(resposta.data["cliente_preselecionado"])
 
     def test_primeira_inclusao_cria_venda_hub(self):
         resposta = self.post_item()
@@ -250,26 +252,48 @@ class VendaClienteApiTests(VendaHubTestMixin, TestCase):
         self.assertEqual(venda.cliente_nome, "Cliente Teste")
         self.assertEqual(atual.data["venda"]["cliente"], resposta.data["venda"]["cliente"])
 
-    def test_selecao_antes_do_primeiro_item_cria_venda_aberta_com_zero_itens(self):
+    def test_seleciona_cliente_sem_venda_persiste_contexto_sem_criar_venda(self):
         cliente = self.criar_cliente()
 
         resposta = self.put_cliente(cliente)
 
-        venda = VendaHub.objects.get()
         self.assertEqual(resposta.status_code, 200)
-        self.assertEqual(venda.status, VendaHub.STATUS_ABERTA)
-        self.assertEqual(venda.itens.count(), 0)
-        self.assertEqual(resposta.data["venda"]["itens"], [])
+        self.assertIsNone(resposta.data["venda"])
+        self.assertEqual(VendaHub.objects.count(), 0)
+        contexto = ContextoVendaTerminalHub.objects.get(terminal=self.terminal)
+        self.assertEqual(contexto.cliente_preselecionado, cliente)
 
-    def test_troca_mantem_mesma_venda_uuid(self):
+    def test_get_venda_atual_restaura_cliente_preselecionado(self):
+        cliente = self.criar_cliente()
+        self.put_cliente(cliente)
+
+        resposta = self.client.get("/api/terminal/venda/atual/")
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertIsNone(resposta.data["venda"])
+        self.assertEqual(
+            resposta.data["cliente_preselecionado"],
+            {
+                "cliente_uuid": str(cliente.cliente_uuid),
+                "retaguarda_id": cliente.retaguarda_id,
+                "tipo_pessoa": "PF",
+                "documento": "12345678901",
+                "cliente_padrao": False,
+                "nome_cliente": "Cliente Teste",
+            },
+        )
+
+    def test_troca_cliente_substitui_contexto_sem_criar_venda(self):
         cliente_a = self.criar_cliente(retaguarda_id=123, documento="12345678901")
         cliente_b = self.criar_cliente(retaguarda_id=124, documento="12345678902", nome_cliente="Cliente B")
-        primeira = self.put_cliente(cliente_a)
+        self.put_cliente(cliente_a)
 
         segunda = self.put_cliente(cliente_b)
 
-        self.assertEqual(segunda.data["venda"]["uuid"], primeira.data["venda"]["uuid"])
-        self.assertEqual(segunda.data["venda"]["cliente"]["cliente_uuid"], str(cliente_b.cliente_uuid))
+        self.assertEqual(segunda.status_code, 200)
+        self.assertIsNone(segunda.data["venda"])
+        self.assertEqual(VendaHub.objects.count(), 0)
+        self.assertEqual(ContextoVendaTerminalHub.objects.get(terminal=self.terminal).cliente_preselecionado, cliente_b)
 
     def test_selecionar_mesmo_cliente_e_idempotente(self):
         cliente = self.criar_cliente()
@@ -277,26 +301,22 @@ class VendaClienteApiTests(VendaHubTestMixin, TestCase):
 
         self.put_cliente(cliente)
 
-        self.assertEqual(VendaHub.objects.count(), 1)
-        self.assertEqual(
-            VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_CLIENTE_SELECIONADO).count(),
-            1,
-        )
+        self.assertEqual(VendaHub.objects.count(), 0)
+        self.assertEqual(ContextoVendaTerminalHub.objects.count(), 1)
+        self.assertEqual(VendaEventoHub.objects.count(), 0)
 
-    def test_remover_cliente_e_idempotente(self):
+    def test_remover_preselecao_sem_venda_e_idempotente(self):
         cliente = self.criar_cliente()
         self.put_cliente(cliente)
 
         removida = self.delete_cliente()
         segunda = self.delete_cliente()
 
-        self.assertIsNone(removida.data["venda"]["cliente"])
-        self.assertIsNone(VendaHub.objects.get().cliente_uuid)
+        self.assertIsNone(removida.data["venda"])
+        self.assertEqual(VendaHub.objects.count(), 0)
+        self.assertEqual(ContextoVendaTerminalHub.objects.count(), 0)
         self.assertEqual(segunda.status_code, 200)
-        self.assertEqual(
-            VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_CLIENTE_REMOVIDO).count(),
-            1,
-        )
+        self.assertEqual(VendaEventoHub.objects.count(), 0)
 
     def test_delete_sem_venda_nao_cria_venda(self):
         resposta = self.delete_cliente()
@@ -348,11 +368,13 @@ class VendaClienteApiTests(VendaHubTestMixin, TestCase):
 
         self.assertEqual(primeira.status_code, 200)
         self.assertEqual(segunda.status_code, 200)
-        self.assertTrue(segunda.data["venda"]["cliente"]["cliente_padrao"])
+        self.assertIsNone(segunda.data["venda"])
+        self.assertEqual(ContextoVendaTerminalHub.objects.get().cliente_preselecionado, padrao)
 
     def test_pagamento_ativo_impede_selecao_troca_e_remocao(self):
         cliente_a = self.criar_cliente(retaguarda_id=123, documento="12345678901")
         cliente_b = self.criar_cliente(retaguarda_id=124, documento="12345678902")
+        self.post_item()
         self.put_cliente(cliente_a)
         venda = VendaHub.objects.get()
         self.criar_pagamento_ativo(venda)
@@ -366,10 +388,65 @@ class VendaClienteApiTests(VendaHubTestMixin, TestCase):
         self.assertEqual(remocao.status_code, 409)
         self.assertEqual(troca.data["detail"], "Remova os pagamentos antes de alterar a venda.")
 
+    def test_primeiro_item_cria_venda_transfere_cliente_e_limpa_contexto(self):
+        cliente = self.criar_cliente()
+        self.put_cliente(cliente)
+
+        resposta = self.post_item()
+        venda = VendaHub.objects.get()
+
+        self.assertEqual(resposta.status_code, 201)
+        self.assertEqual(VendaHub.objects.count(), 1)
+        self.assertEqual(venda.cliente_uuid, cliente.cliente_uuid)
+        self.assertEqual(venda.cliente_retaguarda_id, cliente.retaguarda_id)
+        self.assertEqual(venda.cliente_tipo_pessoa, cliente.tipo_pessoa)
+        self.assertEqual(venda.cliente_documento, cliente.documento)
+        self.assertEqual(venda.cliente_padrao, cliente.cliente_padrao)
+        self.assertEqual(venda.cliente_nome, cliente.nome_cliente)
+        self.assertEqual(venda.operador_criacao, self.operador)
+        self.assertEqual(ContextoVendaTerminalHub.objects.count(), 0)
+        self.assertEqual(
+            VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_CLIENTE_SELECIONADO).count(),
+            0,
+        )
+
+    def test_selecao_com_venda_existente_mantem_eventos(self):
+        self.post_item()
+        cliente = self.criar_cliente()
+
+        self.put_cliente(cliente)
+
+        self.assertEqual(
+            VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_CLIENTE_SELECIONADO).count(),
+            1,
+        )
+
+    def test_contexto_isolado_por_terminal(self):
+        cliente_a = self.criar_cliente(retaguarda_id=123, documento="12345678901")
+        cliente_b = self.criar_cliente(retaguarda_id=124, documento="12345678902")
+        outro_terminal = configurar_terminal(self.hub, "PDV-02", "PDV 02", self.caixa.retaguarda_id)
+        outro_token_terminal = outro_terminal.gerar_token()
+        outro_terminal.save()
+        _sessao, outro_token_operador = self.criar_sessao_operador(outro_terminal, self.operador)
+
+        self.put_cliente(cliente_a)
+        self.autenticar(outro_token_terminal, outro_token_operador)
+        self.put_cliente(cliente_b)
+
+        self.assertEqual(
+            ContextoVendaTerminalHub.objects.get(terminal=self.terminal).cliente_preselecionado,
+            cliente_a,
+        )
+        self.assertEqual(
+            ContextoVendaTerminalHub.objects.get(terminal=outro_terminal).cliente_preselecionado,
+            cliente_b,
+        )
+
     def test_troca_operador_mantem_cliente_e_auditoria_usa_operador_atual_sem_pii(self):
         cliente_a = self.criar_cliente(retaguarda_id=123, documento="12345678901", nome_cliente="Cliente A")
         cliente_b = self.criar_cliente(retaguarda_id=124, documento="12345678902", nome_cliente="Cliente B")
         self.put_cliente(cliente_a)
+        self.post_item()
         operador_b = self.criar_operador("operador.b", 91, "Operador B")
         encerrar_sessao(self.sessao_operador)
         self.sessao_operador, self.token_operador = self.criar_sessao_operador(self.terminal, operador_b)
@@ -586,6 +663,16 @@ class VendaCaixaConcorrenciaTests(VendaHubTestMixin, TestCase):
         resposta = self.client.post("/api/terminal/caixa/fechar/", {}, format="json")
 
         self.assertEqual(resposta.status_code, 200)
+
+    def test_contexto_pre_venda_nao_bloqueia_fechamento_e_e_limpo(self):
+        cliente = self.criar_cliente()
+        self.put_cliente(cliente)
+
+        resposta = self.client.post("/api/terminal/caixa/fechar/", {}, format="json")
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(VendaHub.objects.count(), 0)
+        self.assertEqual(ContextoVendaTerminalHub.objects.count(), 0)
 
     def test_unique_tecnico_impede_duas_vendas_abertas_no_terminal(self):
         self.post_item()
