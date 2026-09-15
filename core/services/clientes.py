@@ -126,9 +126,14 @@ def cadastrar_cliente_local(
             **dados,
         )
         try:
-            cliente.save()
+            with transaction.atomic():
+                cliente.save()
         except IntegrityError as exc:
-            existente = ClienteHub.objects.filter(hub=terminal.hub, documento=documento).first()
+            existente = (
+                ClienteHub.objects.select_for_update()
+                .filter(hub=terminal.hub, documento=documento)
+                .first()
+            )
             if existente:
                 raise ClienteConflictError(mensagem_documento_duplicado(tipo_pessoa), existente) from exc
             raise

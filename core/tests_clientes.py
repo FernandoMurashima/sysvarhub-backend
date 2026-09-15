@@ -1,4 +1,4 @@
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from django.db import IntegrityError
 from django.test import TestCase
@@ -182,13 +182,42 @@ class ClienteLocalApiTests(TestCase):
         existente = self.criar_cliente()
 
         with patch("core.services.clientes.ClienteHub.objects") as manager:
-            manager.select_for_update.return_value.filter.return_value.first.return_value = None
-            manager.filter.return_value.first.return_value = existente
+            manager.select_for_update.return_value.filter.return_value.first.side_effect = [None, existente]
             with patch.object(ClienteHub, "save", side_effect=IntegrityError("duplicado")):
                 resposta = self.post_cliente()
 
         self.assertEqual(resposta.status_code, 409)
         self.assertEqual(resposta.data["cliente_uuid"], str(existente.cliente_uuid))
+
+    def test_save_com_integrity_error_usa_savepoint_interno_antes_da_reconsulta(self):
+        existente = self.criar_cliente()
+
+        class AtomicProbe:
+            def __enter__(self):
+                eventos.append("enter")
+
+            def __exit__(self, exc_type, exc, traceback):
+                eventos.append("exit")
+                return False
+
+        def save_com_concorrencia(self):
+            eventos.append("save")
+            raise IntegrityError("duplicado")
+
+        def first_probe():
+            eventos.append("first")
+            return None if eventos.count("first") == 1 else existente
+
+        eventos = []
+        with patch("core.services.clientes.transaction.atomic", side_effect=lambda: AtomicProbe()) as atomic:
+            with patch("core.services.clientes.ClienteHub.objects") as manager:
+                manager.select_for_update.return_value.filter.return_value.first.side_effect = first_probe
+                with patch.object(ClienteHub, "save", save_com_concorrencia):
+                    resposta = self.post_cliente()
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(atomic.call_args_list, [call(), call()])
+        self.assertEqual(eventos, ["enter", "first", "enter", "save", "exit", "first", "exit"])
 
     def test_duplicidade_respeita_hub_do_terminal_e_payload_nao_escolhe_hub(self):
         outro_hub = HubConfig.objects.create(retaguarda_url="http://central-b.test", empresa_id=22, loja_id=55, retaguarda_hub_id=8)
