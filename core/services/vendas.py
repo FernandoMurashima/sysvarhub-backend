@@ -92,18 +92,10 @@ def venda_atual(terminal):
     return None, contexto.cliente_preselecionado if contexto else None
 
 
-def adicionar_item(terminal, operador, sessao_operador, *, sku_id, quantidade=1):
-    quantidade = validar_quantidade(quantidade)
-    sku_id = validar_sku_id(sku_id)
-
+def iniciar_venda(terminal, operador, sessao_operador):
     with transaction.atomic():
         terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
         sessao_caixa = obter_sessao_caixa_terminal(terminal_bloqueado)
-        catalogo_item = obter_catalogo_item_bloqueado(terminal_bloqueado.hub, sku_id)
-        validar_catalogo_vendavel(catalogo_item)
-        venda = obter_venda_aberta_terminal_bloqueada(terminal_bloqueado)
-        validar_venda_sem_pagamento_ativo(venda)
-        validar_disponibilidade(catalogo_item, quantidade)
         venda, criada = obter_ou_criar_venda_aberta(
             terminal_bloqueado,
             operador,
@@ -112,6 +104,24 @@ def adicionar_item(terminal, operador, sessao_operador, *, sku_id, quantidade=1)
         )
         if criada:
             materializar_cliente_preselecionado(venda, terminal_bloqueado)
+
+    return venda, criada
+
+
+def adicionar_item(terminal, operador, sessao_operador, *, sku_id, quantidade=1):
+    with transaction.atomic():
+        terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
+        obter_sessao_caixa_terminal(terminal_bloqueado)
+        venda = obter_venda_aberta_terminal_bloqueada(terminal_bloqueado)
+        if not venda:
+            raise VendaConflictError("Inicie a venda antes de incluir produtos.")
+        validar_venda_sem_pagamento_ativo(venda)
+
+        quantidade = validar_quantidade(quantidade)
+        sku_id = validar_sku_id(sku_id)
+        catalogo_item = obter_catalogo_item_bloqueado(terminal_bloqueado.hub, sku_id)
+        validar_catalogo_vendavel(catalogo_item)
+        validar_disponibilidade(catalogo_item, quantidade)
         item = VendaItemHub.objects.select_for_update().filter(
             venda=venda,
             retaguarda_sku_id=sku_id,
@@ -138,7 +148,7 @@ def adicionar_item(terminal, operador, sessao_operador, *, sku_id, quantidade=1)
             dados_item(item, quantidade_anterior, item.quantidade),
         )
 
-    return venda, criada and quantidade_anterior == 0
+    return venda
 
 
 def alterar_quantidade_item(terminal, operador, sessao_operador, *, item_uuid, quantidade):

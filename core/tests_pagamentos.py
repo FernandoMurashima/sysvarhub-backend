@@ -456,7 +456,7 @@ class VendaFinalizacaoTests(PagamentoHubTestMixin, TestCase):
         self.pagar(venda_uuid, self.dinheiro)
         self.finalizar(venda_uuid)
         atual = self.client.get("/api/terminal/venda/atual/")
-        nova = self.post_item()
+        nova = self.post_iniciar()
 
         self.assertIsNone(atual.data["venda"])
         self.assertEqual(nova.status_code, 201)

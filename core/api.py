@@ -39,6 +39,7 @@ from core.services.vendas import (
     alterar_quantidade_item,
     cancelar_venda,
     finalizar_venda,
+    iniciar_venda,
     listar_formas_pagamento,
     remover_pagamento,
     remover_item,
@@ -276,6 +277,28 @@ class VendaAtualView(APIView):
         )
 
 
+class VendaIniciarView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request):
+        try:
+            venda, criada = iniciar_venda(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+            )
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {"venda": serializar_venda(venda)},
+            status=status.HTTP_201_CREATED if criada else status.HTTP_200_OK,
+        )
+
+
 class VendaClienteView(APIView):
     authentication_classes = [TerminalOperadorAuthentication]
     permission_classes = [IsOperadorAuthenticated]
@@ -361,7 +384,7 @@ class VendaItemView(APIView):
 
     def post(self, request):
         try:
-            venda, criou_primeira_linha = adicionar_item(
+            venda = adicionar_item(
                 request.sysvar_terminal,
                 request.sysvar_operador,
                 request.sysvar_operador_sessao,
@@ -383,10 +406,7 @@ class VendaItemView(APIView):
         except VendaError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response(
-            {"venda": serializar_venda(venda)},
-            status=status.HTTP_201_CREATED if criou_primeira_linha else status.HTTP_200_OK,
-        )
+        return Response({"venda": serializar_venda(venda)})
 
 
 class VendaItemDetalheView(APIView):

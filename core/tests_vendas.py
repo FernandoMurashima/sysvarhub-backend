@@ -70,11 +70,19 @@ class VendaHubTestMixin(CaixaHubTestMixin):
         dados.update(overrides)
         return CatalogoItemHub.objects.create(**dados)
 
-    def post_item(self, body=None):
+    def post_item(self, body=None, *, iniciar=True):
+        if iniciar and not VendaHub.objects.filter(terminal=self.terminal, status=VendaHub.STATUS_ABERTA).exists():
+            self.post_iniciar()
         payload = {"sku_id": self.catalogo_item.retaguarda_sku_id, "quantidade": 1}
         if body:
             payload.update(body)
         return self.client.post("/api/terminal/venda/item/", payload, format="json")
+
+    def post_iniciar(self):
+        return self.client.post("/api/terminal/venda/iniciar/", {}, format="json")
+
+    def post_item_em_venda(self, body=None):
+        return self.post_item(body)
 
     def criar_cliente(self, **overrides):
         dados = {
@@ -112,8 +120,8 @@ class VendaAtualApiTests(VendaHubTestMixin, TestCase):
         self.assertIsNone(resposta.data["venda"])
         self.assertIsNone(resposta.data["cliente_preselecionado"])
 
-    def test_primeira_inclusao_cria_venda_hub(self):
-        resposta = self.post_item()
+    def test_iniciar_cria_venda_hub_sem_itens(self):
+        resposta = self.post_iniciar()
 
         self.assertEqual(resposta.status_code, 201)
         venda = VendaHub.objects.get()
@@ -122,6 +130,30 @@ class VendaAtualApiTests(VendaHubTestMixin, TestCase):
         self.assertEqual(venda.terminal, self.terminal)
         self.assertEqual(venda.operador_criacao, self.operador)
         self.assertIsNone(venda.cliente_uuid)
+        self.assertEqual(venda.itens.count(), 0)
+
+    def test_iniciar_idempotente_retorna_venda_aberta_sem_duplicar_evento(self):
+        primeira = self.post_iniciar()
+        segunda = self.post_iniciar()
+
+        self.assertEqual(primeira.status_code, 201)
+        self.assertEqual(segunda.status_code, 200)
+        self.assertEqual(primeira.data["venda"]["uuid"], segunda.data["venda"]["uuid"])
+        self.assertEqual(VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_VENDA_CRIADA).count(), 1)
+
+    def test_item_sem_venda_retorna_409_e_nao_cria_venda(self):
+        resposta = self.post_item(iniciar=False)
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(resposta.data["detail"], "Inicie a venda antes de incluir produtos.")
+        self.assertEqual(VendaHub.objects.count(), 0)
+
+    def test_item_sem_venda_prioriza_inicio_mesmo_com_sku_invalido(self):
+        resposta = self.post_item({"sku_id": "abc"}, iniciar=False)
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(resposta.data["detail"], "Inicie a venda antes de incluir produtos.")
+        self.assertEqual(VendaHub.objects.count(), 0)
 
     def test_uma_venda_aberta_por_terminal_e_refresh_recupera(self):
         primeira = self.post_item()
@@ -151,11 +183,7 @@ class VendaAtualApiTests(VendaHubTestMixin, TestCase):
         outra_sessao_operador, outro_token_operador = self.criar_sessao_operador(outro_terminal, self.operador)
         self.autenticar(outro_token_terminal, outro_token_operador)
 
-        resposta = self.client.post(
-            "/api/terminal/venda/item/",
-            {"sku_id": self.catalogo_item.retaguarda_sku_id, "quantidade": 1},
-            format="json",
-        )
+        resposta = self.client.post("/api/terminal/venda/iniciar/", {}, format="json")
 
         self.assertEqual(resposta.status_code, 201)
         self.assertEqual(VendaHub.objects.filter(status=VendaHub.STATUS_ABERTA).count(), 2)
@@ -167,7 +195,7 @@ class VendaItemApiTests(VendaHubTestMixin, TestCase):
         resposta = self.post_item(body={"preco": "1.00", "terminal_id": 999, "operador_id": 999})
         item = VendaItemHub.objects.get()
 
-        self.assertEqual(resposta.status_code, 201)
+        self.assertEqual(resposta.status_code, 200)
         self.assertEqual(item.retaguarda_produto_id, self.catalogo_item.retaguarda_produto_id)
         self.assertEqual(item.retaguarda_sku_id, self.catalogo_item.retaguarda_sku_id)
         self.assertEqual(item.descricao, self.catalogo_item.descricao)
@@ -389,11 +417,11 @@ class VendaClienteApiTests(VendaHubTestMixin, TestCase):
         self.assertEqual(remocao.status_code, 409)
         self.assertEqual(troca.data["detail"], "Remova os pagamentos antes de alterar a venda.")
 
-    def test_primeiro_item_cria_venda_transfere_cliente_e_limpa_contexto(self):
+    def test_iniciar_venda_transfere_cliente_e_limpa_contexto(self):
         cliente = self.criar_cliente()
         self.put_cliente(cliente)
 
-        resposta = self.post_item()
+        resposta = self.post_iniciar()
         venda = VendaHub.objects.get()
 
         self.assertEqual(resposta.status_code, 201)
@@ -609,7 +637,8 @@ class VendaSegurancaAuditoriaTests(VendaHubTestMixin, TestCase):
                 item = self.criar_catalogo_item(sku_id, **overrides)
                 resposta = self.post_item({"sku_id": item.retaguarda_sku_id})
                 self.assertEqual(resposta.status_code, 409)
-                self.assertEqual(VendaHub.objects.count(), 0)
+                self.assertEqual(VendaHub.objects.count(), 1)
+                self.assertEqual(VendaItemHub.objects.count(), 0)
 
     def test_resposta_nao_contem_tokens_hashes_ou_chaves(self):
         resposta = self.post_item()
@@ -623,7 +652,7 @@ class VendaSegurancaAuditoriaTests(VendaHubTestMixin, TestCase):
         with patch("integracao.services.retaguarda.RetaguardaClient.catalogo") as catalogo:
             resposta = self.post_item()
 
-        self.assertEqual(resposta.status_code, 201)
+        self.assertEqual(resposta.status_code, 200)
         catalogo.assert_not_called()
 
     def test_auditoria_eventos_e_operador_atual(self):
@@ -648,7 +677,7 @@ class VendaSegurancaAuditoriaTests(VendaHubTestMixin, TestCase):
 
 class VendaCaixaConcorrenciaTests(VendaHubTestMixin, TestCase):
     def test_fechar_caixa_com_venda_aberta_retorna_409(self):
-        self.post_item()
+        self.post_iniciar()
 
         resposta = self.client.post("/api/terminal/caixa/fechar/", {}, format="json")
 
@@ -734,6 +763,8 @@ class VendaCaixaConcorrenciaTests(VendaHubTestMixin, TestCase):
                     )
 
     def test_lock_catalogo_item_usado_na_inclusao(self):
+        self.post_iniciar()
+
         with patch("core.services.vendas.CatalogoItemHub.objects") as manager:
             manager.select_for_update.side_effect = RuntimeError("lock chamado")
             with self.assertRaises(RuntimeError):
