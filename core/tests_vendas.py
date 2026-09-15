@@ -121,6 +121,7 @@ class VendaAtualApiTests(VendaHubTestMixin, TestCase):
         self.assertEqual(venda.sessao_caixa, self.sessao_caixa)
         self.assertEqual(venda.terminal, self.terminal)
         self.assertEqual(venda.operador_criacao, self.operador)
+        self.assertIsNone(venda.cliente_uuid)
 
     def test_uma_venda_aberta_por_terminal_e_refresh_recupera(self):
         primeira = self.post_item()
@@ -673,6 +674,12 @@ class VendaCaixaConcorrenciaTests(VendaHubTestMixin, TestCase):
         self.assertEqual(resposta.status_code, 200)
         self.assertEqual(VendaHub.objects.count(), 0)
         self.assertEqual(ContextoVendaTerminalHub.objects.count(), 0)
+
+    def test_fechar_caixa_bloqueia_terminal_antes_de_fechar(self):
+        with patch("core.services.caixa.Terminal.objects") as manager:
+            manager.select_for_update.side_effect = RuntimeError("lock terminal chamado")
+            with self.assertRaises(RuntimeError):
+                fechar_caixa(self.terminal, self.operador, self.sessao_operador)
 
     def test_unique_tecnico_impede_duas_vendas_abertas_no_terminal(self):
         self.post_item()

@@ -3,7 +3,7 @@ from decimal import Decimal, InvalidOperation
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from core.models import CaixaHub, SessaoCaixaHub
+from core.models import CaixaHub, SessaoCaixaHub, Terminal
 from core.services.operadores import serializar_operador
 
 
@@ -98,9 +98,9 @@ def abrir_caixa(terminal, operador, sessao_operador, *, valor_abertura):
 
 
 def fechar_caixa(terminal, operador, sessao_operador):
-    caixa = obter_caixa_terminal(terminal, exigir_ativo=False)
-
     with transaction.atomic():
+        terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
+        caixa = obter_caixa_terminal(terminal_bloqueado, exigir_ativo=False)
         caixa_bloqueado = CaixaHub.objects.select_for_update().get(pk=caixa.pk)
         sessao = (
             SessaoCaixaHub.objects.select_for_update()
@@ -115,11 +115,11 @@ def fechar_caixa(terminal, operador, sessao_operador):
             raise CaixaConflictError("Existe venda em andamento neste caixa.")
         from core.services.vendas import limpar_contexto_venda_terminal
 
-        limpar_contexto_venda_terminal(terminal)
+        limpar_contexto_venda_terminal(terminal_bloqueado)
 
         sessao.status = SessaoCaixaHub.STATUS_FECHADO
         sessao.fechado_em = timezone.now()
-        sessao.terminal_fechamento = terminal
+        sessao.terminal_fechamento = terminal_bloqueado
         sessao.operador_fechamento = operador
         sessao.sessao_operador_fechamento = sessao_operador
         sessao.chave_caixa_aberto = None

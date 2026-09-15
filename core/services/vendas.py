@@ -98,7 +98,7 @@ def adicionar_item(terminal, operador, sessao_operador, *, sku_id, quantidade=1)
 
     with transaction.atomic():
         terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
-        obter_sessao_caixa_terminal(terminal_bloqueado)
+        sessao_caixa = obter_sessao_caixa_terminal(terminal_bloqueado)
         catalogo_item = obter_catalogo_item_bloqueado(terminal_bloqueado.hub, sku_id)
         validar_catalogo_vendavel(catalogo_item)
         venda = obter_venda_aberta_terminal_bloqueada(terminal_bloqueado)
