@@ -17,6 +17,13 @@ from core.services.caixa import (
     fechar_caixa,
     serializar_sessao_caixa,
 )
+from core.services.clientes import (
+    ClienteConflictError,
+    ClienteError,
+    ClienteValidationError,
+    cadastrar_cliente_local,
+    validar_payload_cadastro_cliente,
+)
 from core.services.operadores import (
     OperadorAuthenticationError,
     autenticar_operador_terminal,
@@ -377,6 +384,27 @@ class TerminalClientesView(APIView):
             }
         )
 
+    def post(self, request):
+        try:
+            dados = validar_payload_cadastro_cliente(request.data)
+            cliente = cadastrar_cliente_local(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                **dados,
+            )
+        except ClienteConflictError as exc:
+            payload = {"detail": str(exc)}
+            if exc.cliente is not None:
+                payload["cliente_uuid"] = str(exc.cliente.cliente_uuid)
+            return Response(payload, status=status.HTTP_409_CONFLICT)
+        except ClienteValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ClienteError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"cliente": _serializar_cliente(cliente)}, status=status.HTTP_201_CREATED)
+
 
 class VendaItemView(APIView):
     authentication_classes = [TerminalOperadorAuthentication]
@@ -609,7 +637,7 @@ def _aplicar_busca_clientes(queryset, termo):
         | Q(email__icontains=termo)
     )
     if digitos:
-        busca |= Q(documento__icontains=digitos) | Q(telefone1__icontains=digitos)
+        busca |= Q(documento__icontains=digitos) | Q(telefone1__icontains=digitos) | Q(telefone2__icontains=digitos)
     prioridade = Case(
         When(documento=digitos, then=Value(1)) if digitos else When(pk__isnull=True, then=Value(9)),
         When(nome_cliente__istartswith=termo, then=Value(2)),
@@ -672,13 +700,24 @@ def _serializar_cliente(cliente):
         "nome_cliente": cliente.nome_cliente,
         "apelido": cliente.apelido,
         "telefone1": cliente.telefone1,
+        "telefone2": cliente.telefone2,
         "email": cliente.email,
+        "aniversario": cliente.aniversario.isoformat() if cliente.aniversario else None,
+        "endereco": cliente.endereco,
+        "numero": cliente.numero,
+        "complemento": cliente.complemento,
+        "cep": cliente.cep,
+        "bairro": cliente.bairro,
         "cidade": cliente.cidade,
         "estado": cliente.estado,
         "bloqueio": cliente.bloqueio,
         "motivo_bloqueio": cliente.motivo_bloqueio,
         "ativo": cliente.ativo,
         "presente_retaguarda": cliente.presente_retaguarda,
+        "pendente_sincronizacao": (
+            cliente.origem == ClienteHub.ORIGEM_LOCAL
+            and cliente.retaguarda_id is None
+        ),
     }
 
 
