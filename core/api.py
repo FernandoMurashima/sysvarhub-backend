@@ -6,7 +6,7 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from core.authentication import TerminalOperadorAuthentication, TerminalTokenAuthentication
-from core.models import CaixaHub, CatalogoItemHub, ClienteHub
+from core.models import CaixaHub, CatalogoItemHub, ClienteHub, VendedorHub
 from core.permissions import IsOperadorAuthenticated, IsTerminalAuthenticated
 from core.services.caixa import (
     CaixaConflictError,
@@ -61,6 +61,7 @@ from core.services.vendas import (
 CATALOGO_TERMINAL_LIMIT_DEFAULT = 40
 CATALOGO_TERMINAL_LIMIT_MAX = 100
 CLIENTES_TERMINAL_LIMIT = 50
+VENDEDORES_TERMINAL_LIMIT = 50
 
 
 class ParearTerminalView(APIView):
@@ -406,6 +407,44 @@ class TerminalClientesView(APIView):
         return Response({"cliente": _serializar_cliente(cliente)}, status=status.HTTP_201_CREATED)
 
 
+class TerminalVendedoresView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        hub = request.sysvar_terminal.hub
+        termo = " ".join((request.query_params.get("q") or "").split())
+        vendedores = VendedorHub.objects.filter(
+            hub=hub,
+            presente_retaguarda=True,
+            ativo=True,
+            situacao="ATIVO",
+            participa_vendas=True,
+        )
+        if termo:
+            vendedores = _aplicar_busca_vendedores(vendedores, termo)
+        else:
+            vendedores = vendedores.order_by("nome", "retaguarda_id")
+
+        total = vendedores.count()
+        vendedores = vendedores[:VENDEDORES_TERMINAL_LIMIT]
+
+        return Response(
+            {
+                "vendedores_versao": hub.vendedores_versao,
+                "vendedores_sincronizado_em": (
+                    hub.vendedores_sincronizado_em.isoformat()
+                    if hub.vendedores_sincronizado_em
+                    else None
+                ),
+                "q": termo,
+                "total": total,
+                "limit": VENDEDORES_TERMINAL_LIMIT,
+                "vendedores": [_serializar_vendedor(vendedor) for vendedor in vendedores],
+            }
+        )
+
+
 class VendaItemView(APIView):
     authentication_classes = [TerminalOperadorAuthentication]
     permission_classes = [IsOperadorAuthenticated]
@@ -654,6 +693,27 @@ def _aplicar_busca_clientes(queryset, termo):
     )
 
 
+def _aplicar_busca_vendedores(queryset, termo):
+    busca = (
+        Q(matricula__icontains=termo)
+        | Q(nome__icontains=termo)
+        | Q(apelido__icontains=termo)
+    )
+    prioridade = Case(
+        When(matricula__iexact=termo, then=Value(1)),
+        When(nome__istartswith=termo, then=Value(2)),
+        When(apelido__istartswith=termo, then=Value(3)),
+        When(nome__icontains=termo, then=Value(4)),
+        default=Value(5),
+        output_field=IntegerField(),
+    )
+    return queryset.filter(busca).annotate(prioridade_busca=prioridade).order_by(
+        "prioridade_busca",
+        "nome",
+        "retaguarda_id",
+    )
+
+
 def _serializar_catalogo_item(item):
     return {
         "produto_id": item.retaguarda_produto_id,
@@ -718,6 +778,25 @@ def _serializar_cliente(cliente):
             cliente.origem == ClienteHub.ORIGEM_LOCAL
             and cliente.retaguarda_id is None
         ),
+    }
+
+
+def _serializar_vendedor(vendedor):
+    cargo = None
+    if vendedor.cargo_retaguarda_id:
+        cargo = {
+            "id": vendedor.cargo_retaguarda_id,
+            "codigo": vendedor.cargo_codigo,
+            "descricao": vendedor.cargo_descricao,
+        }
+    return {
+        "id": vendedor.retaguarda_id,
+        "matricula": vendedor.matricula,
+        "nome": vendedor.nome,
+        "apelido": vendedor.apelido,
+        "cargo": cargo,
+        "comissionado": vendedor.comissionado,
+        "comissao_percentual": _decimal_para_string(vendedor.comissao_percentual),
     }
 
 

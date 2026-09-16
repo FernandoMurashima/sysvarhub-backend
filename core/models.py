@@ -134,6 +134,21 @@ class HubConfig(models.Model):
         blank=True,
     )
 
+    vendedores_versao = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    vendedores_gerado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    vendedores_sincronizado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
     tabela_preco_retaguarda_id = models.PositiveBigIntegerField(
         null=True,
         blank=True,
@@ -534,6 +549,53 @@ class ClienteHub(models.Model):
 
     def __str__(self):
         return f"{self.retaguarda_id or self.cliente_uuid} - {self.nome_cliente}"
+
+
+class VendedorHub(models.Model):
+    hub = models.ForeignKey(
+        HubConfig,
+        on_delete=models.PROTECT,
+        related_name="vendedores",
+    )
+    retaguarda_id = models.PositiveBigIntegerField()
+    matricula = models.CharField(max_length=6, blank=True, default="")
+    nome = models.CharField(max_length=50)
+    apelido = models.CharField(max_length=20, blank=True, default="")
+
+    cargo_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    cargo_codigo = models.CharField(max_length=20, blank=True, default="")
+    cargo_descricao = models.CharField(max_length=80, blank=True, default="")
+
+    comissionado = models.BooleanField(default=False)
+    comissao_percentual = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+
+    ativo = models.BooleanField(default=True)
+    situacao = models.CharField(max_length=12)
+    participa_vendas = models.BooleanField(default=False)
+    presente_retaguarda = models.BooleanField(default=False)
+
+    sincronizado_em = models.DateTimeField()
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Vendedor do Hub"
+        verbose_name_plural = "Vendedores do Hub"
+        ordering = ("nome", "retaguarda_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["hub", "retaguarda_id"],
+                name="uniq_vendedor_hub_ret",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "presente_retaguarda"], name="idx_vend_hub_pres"),
+            models.Index(fields=["hub", "nome"], name="idx_vend_hub_nome"),
+            models.Index(fields=["hub", "matricula"], name="idx_vend_hub_mat"),
+        ]
+
+    def __str__(self):
+        return f"{self.retaguarda_id} - {self.nome}"
 
 
 class Terminal(models.Model):
