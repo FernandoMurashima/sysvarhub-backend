@@ -919,6 +919,76 @@ class SessaoCaixaHub(models.Model):
         return f"{self.caixa.codigo} - {self.status}"
 
 
+class MovimentacaoCaixaHub(models.Model):
+    TIPO_DESPESA = "DESPESA"
+    TIPO_SANGRIA = "SANGRIA"
+    TIPO_SUPRIMENTO = "SUPRIMENTO"
+    TIPO_CHOICES = [
+        (TIPO_DESPESA, "Despesa"),
+        (TIPO_SANGRIA, "Sangria"),
+        (TIPO_SUPRIMENTO, "Suprimento"),
+    ]
+
+    STATUS_EFETIVA = "EFETIVA"
+    STATUS_CHOICES = [
+        (STATUS_EFETIVA, "Efetiva"),
+    ]
+
+    movimento_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="movimentacoes_caixa")
+    caixa = models.ForeignKey(CaixaHub, on_delete=models.PROTECT, related_name="movimentacoes")
+    sessao_caixa = models.ForeignKey(SessaoCaixaHub, on_delete=models.PROTECT, related_name="movimentacoes")
+    terminal = models.ForeignKey(Terminal, on_delete=models.PROTECT, related_name="movimentacoes_caixa")
+    operador = models.ForeignKey(OperadorHub, on_delete=models.PROTECT, related_name="movimentacoes_caixa")
+    sessao_operador = models.ForeignKey(
+        SessaoOperadorHub,
+        on_delete=models.PROTECT,
+        related_name="movimentacoes_caixa",
+    )
+
+    tipo = models.CharField(max_length=12, choices=TIPO_CHOICES)
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default=STATUS_EFETIVA)
+    valor = models.DecimalField(max_digits=12, decimal_places=2)
+    documento = models.CharField(max_length=80, blank=True, default="")
+    historico = models.CharField(max_length=200, blank=True, default="")
+    ocorrido_em = models.DateTimeField()
+
+    tipo_despesa_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    tipo_despesa_codigo = models.CharField(max_length=20, blank=True, default="")
+    tipo_despesa_descricao = models.CharField(max_length=120, blank=True, default="")
+    tipo_despesa_exige_documento = models.BooleanField(null=True, blank=True)
+
+    natureza_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    natureza_codigo = models.CharField(max_length=10, blank=True, default="")
+    natureza_descricao = models.CharField(max_length=255, blank=True, default="")
+    natureza_categoria_principal = models.CharField(max_length=50, blank=True, default="")
+    natureza_subcategoria = models.CharField(max_length=50, blank=True, default="")
+    natureza_tipo = models.CharField(max_length=20, blank=True, default="")
+    natureza_status = models.CharField(max_length=10, blank=True, default="")
+    natureza_tipo_natureza = models.CharField(max_length=10, blank=True, default="")
+    natureza_operacao = models.CharField(max_length=20, blank=True, default="")
+    natureza_categoria_gerencial = models.CharField(max_length=50, blank=True, default="")
+    natureza_movimenta_financeiro = models.BooleanField(null=True, blank=True)
+    natureza_entra_dre = models.BooleanField(null=True, blank=True)
+
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Movimentação de caixa do Hub"
+        verbose_name_plural = "Movimentações de caixa do Hub"
+        ordering = ("ocorrido_em", "id")
+        indexes = [
+            models.Index(fields=["hub", "tipo"], name="idx_mov_cx_hub_tipo"),
+            models.Index(fields=["sessao_caixa", "ocorrido_em", "id"], name="idx_mov_cx_sessao_ord"),
+            models.Index(fields=["caixa", "status"], name="idx_mov_cx_caixa_status"),
+            models.Index(fields=["movimento_uuid"], name="idx_mov_cx_uuid"),
+        ]
+
+    def __str__(self):
+        return f"{self.tipo} - {self.valor:.2f}"
+
+
 class VendaHub(models.Model):
     STATUS_ABERTA = "ABERTA"
     STATUS_FINALIZADA = "FINALIZADA"

@@ -24,6 +24,14 @@ from core.services.clientes import (
     cadastrar_cliente_local,
     validar_payload_cadastro_cliente,
 )
+from core.services.movimentacoes_caixa import (
+    MovimentacaoCaixaConflictError,
+    MovimentacaoCaixaError,
+    MovimentacaoCaixaValidationError,
+    listar_movimentacoes_sessao_aberta,
+    registrar_movimentacao_caixa,
+    serializar_movimentacao_caixa,
+)
 from core.services.operadores import (
     OperadorAuthenticationError,
     autenticar_operador_terminal,
@@ -266,6 +274,54 @@ class CaixaFecharView(APIView):
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({"status": "ok", "sessao": serializar_sessao_caixa(sessao)})
+
+
+class CaixaMovimentacoesView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        try:
+            sessao_caixa, movimentacoes = listar_movimentacoes_sessao_aberta(request.sysvar_terminal)
+        except MovimentacaoCaixaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except MovimentacaoCaixaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {
+                "sessao_caixa_uuid": str(sessao_caixa.sessao_uuid),
+                "total": movimentacoes.count(),
+                "movimentacoes": [
+                    serializar_movimentacao_caixa(movimentacao)
+                    for movimentacao in movimentacoes
+                ],
+            }
+        )
+
+    def post(self, request):
+        try:
+            movimentacao = registrar_movimentacao_caixa(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                tipo=request.data.get("tipo"),
+                valor=request.data.get("valor"),
+                tipo_despesa_id=request.data.get("tipo_despesa_id"),
+                documento=request.data.get("documento") or "",
+                historico=request.data.get("historico") or "",
+            )
+        except MovimentacaoCaixaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except MovimentacaoCaixaValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except MovimentacaoCaixaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {"movimentacao": serializar_movimentacao_caixa(movimentacao)},
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class VendaAtualView(APIView):

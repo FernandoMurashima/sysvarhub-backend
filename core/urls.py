@@ -3,6 +3,7 @@ from django.urls import path
 from core.api import (
     CaixaAbrirView,
     CaixaFecharView,
+    CaixaMovimentacoesView,
     CaixaStatusView,
     FormasPagamentoView,
     OperadorContextoView,
@@ -42,6 +43,7 @@ urlpatterns = [
     path("caixa/status/", CaixaStatusView.as_view(), name="terminal-caixa-status"),
     path("caixa/abrir/", CaixaAbrirView.as_view(), name="terminal-caixa-abrir"),
     path("caixa/fechar/", CaixaFecharView.as_view(), name="terminal-caixa-fechar"),
+    path("caixa/movimentacoes/", CaixaMovimentacoesView.as_view(), name="terminal-caixa-movimentacoes"),
     path("formas-pagamento/", FormasPagamentoView.as_view(), name="terminal-formas-pagamento"),
     path("venda/atual/", VendaAtualView.as_view(), name="terminal-venda-atual"),
     path("venda/iniciar/", VendaIniciarView.as_view(), name="terminal-venda-iniciar"),
