@@ -23,6 +23,7 @@ from core.api import (
     VendaItemView,
     VendaPagamentoDetalheView,
     VendaPagamentoView,
+    VendaVendedorView,
 )
 
 
@@ -43,6 +44,7 @@ urlpatterns = [
     path("venda/atual/", VendaAtualView.as_view(), name="terminal-venda-atual"),
     path("venda/iniciar/", VendaIniciarView.as_view(), name="terminal-venda-iniciar"),
     path("venda/cliente/", VendaClienteView.as_view(), name="terminal-venda-cliente"),
+    path("venda/vendedor/", VendaVendedorView.as_view(), name="terminal-venda-vendedor"),
     path("venda/item/", VendaItemView.as_view(), name="terminal-venda-item"),
     path("venda/item/<uuid:item_uuid>/", VendaItemDetalheView.as_view(), name="terminal-venda-item-detalhe"),
     path("venda/pagamento/", VendaPagamentoView.as_view(), name="terminal-venda-pagamento"),

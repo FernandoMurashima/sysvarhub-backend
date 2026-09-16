@@ -710,6 +710,13 @@ class ContextoVendaTerminalHub(models.Model):
         null=True,
         blank=True,
     )
+    vendedor_preselecionado = models.ForeignKey(
+        VendedorHub,
+        on_delete=models.SET_NULL,
+        related_name="contextos_pre_venda",
+        null=True,
+        blank=True,
+    )
     criado_em = models.DateTimeField(auto_now_add=True)
     atualizado_em = models.DateTimeField(auto_now=True)
 
@@ -939,7 +946,14 @@ class VendaHub(models.Model):
     cliente_padrao = models.BooleanField(default=False)
     cliente_nome = models.CharField(max_length=150, blank=True, default="")
     vendedor_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
-    vendedor_nome = models.CharField(max_length=150, blank=True, default="")
+    vendedor_matricula = models.CharField(max_length=6, blank=True, default="")
+    vendedor_nome = models.CharField(max_length=50, blank=True, default="")
+    vendedor_apelido = models.CharField(max_length=20, blank=True, default="")
+    vendedor_cargo_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    vendedor_cargo_codigo = models.CharField(max_length=20, blank=True, default="")
+    vendedor_cargo_descricao = models.CharField(max_length=80, blank=True, default="")
+    vendedor_comissionado = models.BooleanField(default=False)
+    vendedor_comissao_percentual = models.DecimalField(max_digits=5, decimal_places=2, default=0)
 
     class Meta:
         verbose_name = "Venda do Hub"
@@ -1025,6 +1039,8 @@ class VendaEventoHub(models.Model):
     TIPO_VENDA_FINALIZADA = "VENDA_FINALIZADA"
     TIPO_CLIENTE_SELECIONADO = "CLIENTE_SELECIONADO"
     TIPO_CLIENTE_REMOVIDO = "CLIENTE_REMOVIDO"
+    TIPO_VENDEDOR_SELECIONADO = "VENDEDOR_SELECIONADO"
+    TIPO_VENDEDOR_REMOVIDO = "VENDEDOR_REMOVIDO"
     TIPO_CHOICES = [
         (TIPO_VENDA_CRIADA, "Venda criada"),
         (TIPO_ITEM_ADICIONADO, "Item adicionado"),
@@ -1036,6 +1052,8 @@ class VendaEventoHub(models.Model):
         (TIPO_VENDA_FINALIZADA, "Venda finalizada"),
         (TIPO_CLIENTE_SELECIONADO, "Cliente selecionado"),
         (TIPO_CLIENTE_REMOVIDO, "Cliente removido"),
+        (TIPO_VENDEDOR_SELECIONADO, "Vendedor selecionado"),
+        (TIPO_VENDEDOR_REMOVIDO, "Vendedor removido"),
     ]
 
     venda = models.ForeignKey(VendaHub, on_delete=models.PROTECT, related_name="eventos")

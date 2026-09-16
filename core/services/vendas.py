@@ -20,6 +20,7 @@ from core.models import (
     VendaItemHub,
     VendaPagamentoHub,
     VendaPagamentoParcelaHub,
+    VendedorHub,
 )
 from core.services.caixa import obter_caixa_terminal, obter_sessao_caixa_aberta
 from core.services.operadores import serializar_operador
@@ -87,9 +88,13 @@ def venda_atual(terminal):
     obter_sessao_caixa_terminal(terminal)
     venda = obter_venda_aberta_terminal(terminal)
     if venda:
-        return venda, None
+        return venda, None, None
     contexto = obter_contexto_venda_terminal(terminal)
-    return None, contexto.cliente_preselecionado if contexto else None
+    return (
+        None,
+        contexto.cliente_preselecionado if contexto else None,
+        contexto.vendedor_preselecionado if contexto else None,
+    )
 
 
 def iniciar_venda(terminal, operador, sessao_operador):
@@ -104,6 +109,7 @@ def iniciar_venda(terminal, operador, sessao_operador):
         )
         if criada:
             materializar_cliente_preselecionado(venda, terminal_bloqueado)
+            materializar_vendedor_preselecionado(venda, terminal_bloqueado)
 
     return venda, criada
 
@@ -273,7 +279,7 @@ def remover_cliente(terminal, operador, sessao_operador):
         obter_sessao_caixa_terminal(terminal_bloqueado)
         venda = obter_venda_aberta_terminal_bloqueada(terminal_bloqueado)
         if not venda:
-            limpar_contexto_venda_terminal(terminal_bloqueado)
+            limpar_cliente_preselecionado(terminal_bloqueado)
             return None
         validar_venda_sem_pagamento_ativo(venda)
         if venda.cliente_uuid is None:
@@ -301,6 +307,76 @@ def remover_cliente(terminal, operador, sessao_operador):
             {
                 "cliente_anterior": anterior,
                 "cliente_atual": dados_cliente_evento(venda),
+            },
+        )
+
+    return venda
+
+
+def selecionar_vendedor(terminal, operador, sessao_operador, *, vendedor_id):
+    vendedor_id = validar_inteiro_positivo(vendedor_id, "Vendedor inválido.")
+
+    with transaction.atomic():
+        terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
+        obter_sessao_caixa_terminal(terminal_bloqueado)
+        vendedor = obter_vendedor_bloqueado(terminal_bloqueado.hub, vendedor_id)
+        validar_vendedor_selecionavel(vendedor)
+        venda = obter_venda_aberta_terminal_bloqueada(terminal_bloqueado)
+        validar_venda_sem_pagamento_ativo(venda)
+        if not venda:
+            contexto, _created = ContextoVendaTerminalHub.objects.select_for_update().get_or_create(
+                terminal=terminal_bloqueado,
+            )
+            if contexto.vendedor_preselecionado_id != vendedor.id:
+                contexto.vendedor_preselecionado = vendedor
+                contexto.save(update_fields=["vendedor_preselecionado", "atualizado_em"])
+            return None
+
+        if venda.vendedor_retaguarda_id == vendedor.retaguarda_id:
+            return venda
+
+        anterior = dados_vendedor_evento(venda)
+        aplicar_snapshot_vendedor(venda, vendedor)
+        salvar_snapshot_vendedor(venda)
+        registrar_evento(
+            venda,
+            VendaEventoHub.TIPO_VENDEDOR_SELECIONADO,
+            terminal_bloqueado,
+            operador,
+            sessao_operador,
+            {
+                "vendedor_anterior": anterior,
+                "vendedor_atual": dados_vendedor_evento(venda),
+            },
+        )
+
+    return venda
+
+
+def remover_vendedor(terminal, operador, sessao_operador):
+    with transaction.atomic():
+        terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
+        obter_sessao_caixa_terminal(terminal_bloqueado)
+        venda = obter_venda_aberta_terminal_bloqueada(terminal_bloqueado)
+        if not venda:
+            limpar_vendedor_preselecionado(terminal_bloqueado)
+            return None
+        validar_venda_sem_pagamento_ativo(venda)
+        if venda.vendedor_retaguarda_id is None:
+            return venda
+
+        anterior = dados_vendedor_evento(venda)
+        limpar_snapshot_vendedor(venda)
+        salvar_snapshot_vendedor(venda)
+        registrar_evento(
+            venda,
+            VendaEventoHub.TIPO_VENDEDOR_REMOVIDO,
+            terminal_bloqueado,
+            operador,
+            sessao_operador,
+            {
+                "vendedor_anterior": anterior,
+                "vendedor_atual": dados_vendedor_evento(venda),
             },
         )
 
@@ -399,6 +475,9 @@ def adicionar_pagamento(
                 autorizacao=autorizacao,
             )
             return venda, False
+
+        if venda.vendedor_retaguarda_id is None:
+            raise VendaConflictError("Selecione um vendedor antes de registrar pagamentos.")
 
         parcelas_ordenadas = FormaPagamentoParcelaHub.objects.order_by("ordem", "id")
         forma = (
@@ -522,6 +601,8 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
         sessao_caixa = obter_sessao_caixa_terminal(terminal_bloqueado)
         if venda.sessao_caixa_id != sessao_caixa.id:
             raise VendaConflictError("Venda não pertence ao Caixa aberto.")
+        if venda.vendedor_retaguarda_id is None:
+            raise VendaConflictError("Selecione um vendedor antes de finalizar a venda.")
 
         itens = list(
             VendaItemHub.objects.select_for_update()
@@ -670,7 +751,10 @@ def obter_ou_criar_venda_aberta(terminal, operador, sessao_operador, sessao_caix
 
 def obter_contexto_venda_terminal(terminal):
     return (
-        ContextoVendaTerminalHub.objects.select_related("cliente_preselecionado")
+        ContextoVendaTerminalHub.objects.select_related(
+            "cliente_preselecionado",
+            "vendedor_preselecionado",
+        )
         .filter(terminal=terminal)
         .first()
     )
@@ -702,11 +786,59 @@ def materializar_cliente_preselecionado(venda, terminal):
                 "atualizada_em",
             ]
         )
-    contexto.delete()
+    contexto.cliente_preselecionado = None
+    contexto.save(update_fields=["cliente_preselecionado", "atualizado_em"])
+    remover_contexto_vazio(contexto)
+
+
+def materializar_vendedor_preselecionado(venda, terminal):
+    contexto = (
+        ContextoVendaTerminalHub.objects.select_for_update()
+        .select_related("vendedor_preselecionado")
+        .filter(terminal=terminal)
+        .first()
+    )
+    if not contexto:
+        return
+
+    vendedor = contexto.vendedor_preselecionado
+    if vendedor is not None:
+        vendedor = obter_vendedor_bloqueado(terminal.hub, vendedor.retaguarda_id)
+        validar_vendedor_selecionavel(vendedor)
+        aplicar_snapshot_vendedor(venda, vendedor)
+        salvar_snapshot_vendedor(venda)
+    contexto.vendedor_preselecionado = None
+    contexto.save(update_fields=["vendedor_preselecionado", "atualizado_em"])
+    remover_contexto_vazio(contexto)
 
 
 def limpar_contexto_venda_terminal(terminal):
     ContextoVendaTerminalHub.objects.filter(terminal=terminal).delete()
+
+
+def limpar_cliente_preselecionado(terminal):
+    contexto = ContextoVendaTerminalHub.objects.select_for_update().filter(terminal=terminal).first()
+    if not contexto:
+        return
+    if contexto.cliente_preselecionado_id is not None:
+        contexto.cliente_preselecionado = None
+        contexto.save(update_fields=["cliente_preselecionado", "atualizado_em"])
+    remover_contexto_vazio(contexto)
+
+
+def limpar_vendedor_preselecionado(terminal):
+    contexto = ContextoVendaTerminalHub.objects.select_for_update().filter(terminal=terminal).first()
+    if not contexto:
+        return
+    if contexto.vendedor_preselecionado_id is not None:
+        contexto.vendedor_preselecionado = None
+        contexto.save(update_fields=["vendedor_preselecionado", "atualizado_em"])
+    remover_contexto_vazio(contexto)
+
+
+def remover_contexto_vazio(contexto):
+    if contexto.cliente_preselecionado_id is None and contexto.vendedor_preselecionado_id is None:
+        contexto.delete()
 
 
 def obter_venda_aberta_terminal_bloqueada(terminal):
@@ -746,6 +878,17 @@ def obter_cliente_bloqueado(hub, cliente_uuid):
     return cliente
 
 
+def obter_vendedor_bloqueado(hub, vendedor_id):
+    vendedor = (
+        VendedorHub.objects.select_for_update()
+        .filter(hub=hub, retaguarda_id=vendedor_id)
+        .first()
+    )
+    if not vendedor:
+        raise VendaValidationError("Vendedor não está disponível para venda.")
+    return vendedor
+
+
 def validar_cliente_selecionavel(cliente):
     if not cliente.ativo:
         raise VendaConflictError("Cliente inativo no cadastro local.")
@@ -755,6 +898,16 @@ def validar_cliente_selecionavel(cliente):
         cliente.origem == ClienteHub.ORIGEM_LOCAL and cliente.retaguarda_id is None
     ):
         raise VendaConflictError("Cliente indisponível no cadastro local.")
+
+
+def validar_vendedor_selecionavel(vendedor):
+    if not (
+        vendedor.presente_retaguarda
+        and vendedor.ativo
+        and vendedor.situacao == "ATIVO"
+        and vendedor.participa_vendas
+    ):
+        raise VendaValidationError("Vendedor não está disponível para venda.")
 
 
 def aplicar_snapshot_cliente(venda, cliente):
@@ -773,6 +926,47 @@ def limpar_snapshot_cliente(venda):
     venda.cliente_documento = None
     venda.cliente_padrao = False
     venda.cliente_nome = ""
+
+
+def aplicar_snapshot_vendedor(venda, vendedor):
+    venda.vendedor_retaguarda_id = vendedor.retaguarda_id
+    venda.vendedor_matricula = vendedor.matricula
+    venda.vendedor_nome = vendedor.nome
+    venda.vendedor_apelido = vendedor.apelido
+    venda.vendedor_cargo_retaguarda_id = vendedor.cargo_retaguarda_id
+    venda.vendedor_cargo_codigo = vendedor.cargo_codigo
+    venda.vendedor_cargo_descricao = vendedor.cargo_descricao
+    venda.vendedor_comissionado = vendedor.comissionado
+    venda.vendedor_comissao_percentual = vendedor.comissao_percentual
+
+
+def limpar_snapshot_vendedor(venda):
+    venda.vendedor_retaguarda_id = None
+    venda.vendedor_matricula = ""
+    venda.vendedor_nome = ""
+    venda.vendedor_apelido = ""
+    venda.vendedor_cargo_retaguarda_id = None
+    venda.vendedor_cargo_codigo = ""
+    venda.vendedor_cargo_descricao = ""
+    venda.vendedor_comissionado = False
+    venda.vendedor_comissao_percentual = ZERO_2
+
+
+def salvar_snapshot_vendedor(venda):
+    venda.save(
+        update_fields=[
+            "vendedor_retaguarda_id",
+            "vendedor_matricula",
+            "vendedor_nome",
+            "vendedor_apelido",
+            "vendedor_cargo_retaguarda_id",
+            "vendedor_cargo_codigo",
+            "vendedor_cargo_descricao",
+            "vendedor_comissionado",
+            "vendedor_comissao_percentual",
+            "atualizada_em",
+        ]
+    )
 
 
 def validar_catalogo_vendavel(item):
@@ -1027,6 +1221,10 @@ def dados_cliente_evento(venda):
     }
 
 
+def dados_vendedor_evento(venda):
+    return serializar_vendedor_venda(venda)
+
+
 def serializar_venda(venda):
     if venda is None:
         return None
@@ -1048,6 +1246,7 @@ def serializar_venda(venda):
         "pendente": f"{pendente:.2f}",
         "troco": f"{troco:.2f}",
         "cliente": serializar_cliente_venda(venda),
+        "vendedor": serializar_vendedor_venda(venda),
         "operador_criacao": serializar_operador(venda.operador_criacao),
         "itens": [serializar_item(item) for item in itens],
         "pagamentos": [serializar_pagamento(pagamento) for pagamento in pagamentos],
@@ -1077,6 +1276,52 @@ def serializar_cliente_preselecionado(cliente):
         "documento": cliente.documento,
         "cliente_padrao": cliente.cliente_padrao,
         "nome_cliente": cliente.nome_cliente,
+    }
+
+
+def serializar_vendedor_venda(venda):
+    if venda is None or venda.vendedor_retaguarda_id is None:
+        return None
+    return {
+        "id": venda.vendedor_retaguarda_id,
+        "matricula": venda.vendedor_matricula,
+        "nome": venda.vendedor_nome,
+        "apelido": venda.vendedor_apelido,
+        "cargo": serializar_cargo_vendedor(
+            venda.vendedor_cargo_retaguarda_id,
+            venda.vendedor_cargo_codigo,
+            venda.vendedor_cargo_descricao,
+        ),
+        "comissionado": venda.vendedor_comissionado,
+        "comissao_percentual": f"{venda.vendedor_comissao_percentual:.2f}",
+    }
+
+
+def serializar_vendedor_preselecionado(vendedor):
+    if vendedor is None:
+        return None
+    return {
+        "id": vendedor.retaguarda_id,
+        "matricula": vendedor.matricula,
+        "nome": vendedor.nome,
+        "apelido": vendedor.apelido,
+        "cargo": serializar_cargo_vendedor(
+            vendedor.cargo_retaguarda_id,
+            vendedor.cargo_codigo,
+            vendedor.cargo_descricao,
+        ),
+        "comissionado": vendedor.comissionado,
+        "comissao_percentual": f"{vendedor.comissao_percentual:.2f}",
+    }
+
+
+def serializar_cargo_vendedor(cargo_id, codigo, descricao):
+    if not cargo_id:
+        return None
+    return {
+        "id": cargo_id,
+        "codigo": codigo,
+        "descricao": descricao,
     }
 
 

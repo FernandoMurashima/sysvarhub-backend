@@ -17,6 +17,7 @@ from core.models import (
     VendaItemHub,
     VendaPagamentoHub,
     VendaPagamentoParcelaHub,
+    VendedorHub,
 )
 from core.services.caixa import fechar_caixa
 from core.services.terminais import configurar_terminal
@@ -63,7 +64,35 @@ class PagamentoHubTestMixin(VendaHubTestMixin):
 
     def criar_venda_com_item(self, quantidade=1):
         resposta = self.post_item({"quantidade": quantidade})
+        vendedor = self.criar_vendedor_pagamento()
+        self.client.put(
+            "/api/terminal/venda/vendedor/",
+            {"vendedor_id": vendedor.retaguarda_id},
+            format="json",
+        )
         return resposta.data["venda"]["uuid"]
+
+    def criar_vendedor_pagamento(self, retaguarda_id=9901):
+        vendedor, _created = VendedorHub.objects.get_or_create(
+            hub=self.hub,
+            retaguarda_id=retaguarda_id,
+            defaults={
+                "matricula": "009901",
+                "nome": "Vendedor Pagamento",
+                "apelido": "Vend Pag",
+                "cargo_retaguarda_id": 5,
+                "cargo_codigo": "VENDEDOR",
+                "cargo_descricao": "Vendedor",
+                "comissionado": True,
+                "comissao_percentual": Decimal("3.00"),
+                "ativo": True,
+                "situacao": "ATIVO",
+                "participa_vendas": True,
+                "presente_retaguarda": True,
+                "sincronizado_em": timezone.now(),
+            },
+        )
+        return vendedor
 
     def pagar(self, venda_uuid, forma=None, valor="199.90", operacao_uuid=None):
         return self.client.post(
