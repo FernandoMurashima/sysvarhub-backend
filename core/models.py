@@ -149,6 +149,21 @@ class HubConfig(models.Model):
         blank=True,
     )
 
+    tipos_despesa_pdv_versao = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    tipos_despesa_pdv_gerado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    tipos_despesa_pdv_sincronizado_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
     tabela_preco_retaguarda_id = models.PositiveBigIntegerField(
         null=True,
         blank=True,
@@ -596,6 +611,57 @@ class VendedorHub(models.Model):
 
     def __str__(self):
         return f"{self.retaguarda_id} - {self.nome}"
+
+
+class TipoDespesaPdvHub(models.Model):
+    hub = models.ForeignKey(
+        HubConfig,
+        on_delete=models.PROTECT,
+        related_name="tipos_despesa_pdv",
+    )
+    retaguarda_id = models.PositiveBigIntegerField()
+
+    codigo = models.CharField(max_length=20)
+    descricao = models.CharField(max_length=120)
+    exige_documento = models.BooleanField(default=False)
+    ativo = models.BooleanField(default=True)
+    presente_retaguarda = models.BooleanField(default=False)
+
+    natureza_retaguarda_id = models.PositiveBigIntegerField()
+    natureza_codigo = models.CharField(max_length=10)
+    natureza_descricao = models.CharField(max_length=255)
+    natureza_categoria_principal = models.CharField(max_length=50, blank=True, default="")
+    natureza_subcategoria = models.CharField(max_length=50, blank=True, default="")
+    natureza_tipo = models.CharField(max_length=20)
+    natureza_status = models.CharField(max_length=10)
+    natureza_tipo_natureza = models.CharField(max_length=10)
+    natureza_operacao = models.CharField(max_length=20)
+    natureza_categoria_gerencial = models.CharField(max_length=50, blank=True, default="")
+    natureza_movimenta_financeiro = models.BooleanField(default=True)
+    natureza_entra_dre = models.BooleanField(default=True)
+
+    sincronizado_em = models.DateTimeField()
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Tipo de despesa PDV do Hub"
+        verbose_name_plural = "Tipos de despesa PDV do Hub"
+        ordering = ("descricao", "codigo", "retaguarda_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["hub", "retaguarda_id"],
+                name="uniq_tipo_desp_pdv_hub_ret",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "presente_retaguarda"], name="idx_tipo_desp_pdv_pres"),
+            models.Index(fields=["hub", "ativo"], name="idx_tipo_desp_pdv_ativo"),
+            models.Index(fields=["hub", "codigo"], name="idx_tipo_desp_pdv_cod"),
+        ]
+
+    def __str__(self):
+        return f"{self.codigo} - {self.descricao}"
 
 
 class Terminal(models.Model):

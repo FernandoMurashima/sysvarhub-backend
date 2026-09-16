@@ -6,7 +6,7 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from core.authentication import TerminalOperadorAuthentication, TerminalTokenAuthentication
-from core.models import CaixaHub, CatalogoItemHub, ClienteHub, VendedorHub
+from core.models import CaixaHub, CatalogoItemHub, ClienteHub, TipoDespesaPdvHub, VendedorHub
 from core.permissions import IsOperadorAuthenticated, IsTerminalAuthenticated
 from core.services.caixa import (
     CaixaConflictError,
@@ -402,6 +402,32 @@ class FormasPagamentoView(APIView):
 
     def get(self, request):
         return Response(listar_formas_pagamento(request.sysvar_terminal))
+
+
+class TiposDespesaPdvView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        hub = request.sysvar_terminal.hub
+        tipos = TipoDespesaPdvHub.objects.filter(
+            hub=hub,
+            presente_retaguarda=True,
+            ativo=True,
+        ).order_by("descricao", "codigo", "retaguarda_id")
+
+        return Response(
+            {
+                "tipos_despesa_pdv_versao": hub.tipos_despesa_pdv_versao,
+                "tipos_despesa_pdv_sincronizado_em": (
+                    hub.tipos_despesa_pdv_sincronizado_em.isoformat()
+                    if hub.tipos_despesa_pdv_sincronizado_em
+                    else None
+                ),
+                "total": tipos.count(),
+                "tipos_despesa_pdv": [_serializar_tipo_despesa_pdv(tipo) for tipo in tipos],
+            }
+        )
 
 
 class TerminalClientesView(APIView):
@@ -850,6 +876,29 @@ def _serializar_vendedor(vendedor):
         "cargo": cargo,
         "comissionado": vendedor.comissionado,
         "comissao_percentual": _decimal_para_string(vendedor.comissao_percentual),
+    }
+
+
+def _serializar_tipo_despesa_pdv(tipo):
+    return {
+        "id": tipo.retaguarda_id,
+        "codigo": tipo.codigo,
+        "descricao": tipo.descricao,
+        "exige_documento": tipo.exige_documento,
+        "natureza": {
+            "id": tipo.natureza_retaguarda_id,
+            "codigo": tipo.natureza_codigo,
+            "descricao": tipo.natureza_descricao,
+            "categoria_principal": tipo.natureza_categoria_principal,
+            "subcategoria": tipo.natureza_subcategoria,
+            "tipo": tipo.natureza_tipo,
+            "status": tipo.natureza_status,
+            "tipo_natureza": tipo.natureza_tipo_natureza,
+            "natureza_operacao": tipo.natureza_operacao,
+            "categoria_gerencial": tipo.natureza_categoria_gerencial,
+            "movimenta_financeiro": tipo.natureza_movimenta_financeiro,
+            "entra_dre": tipo.natureza_entra_dre,
+        },
     }
 
 

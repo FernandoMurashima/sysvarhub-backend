@@ -86,6 +86,15 @@ class RetaguardaClient:
             headers={"Authorization": f"Hub {token}"},
         )
 
+    def tipos_despesa_pdv(self, *, token):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._request_json(
+            "api/hub/tipos-despesa-pdv/",
+            method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
     def clientes(self, *, token):
         if not token:
             raise RetaguardaError("Token da retaguarda não informado.")
