@@ -84,7 +84,7 @@ def write_locked_file(path, content):
         import subprocess
 
         subprocess.run(["icacls", str(path), "/inheritance:r"], check=False, capture_output=True)
-        subprocess.run(["icacls", str(path), "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F"], check=False, capture_output=True)
+        subprocess.run(["icacls", str(path), "/grant:r", "SYSTEM:F", "Administrators:F"], check=False, capture_output=True)
 
 
 def create_default_env(install_root=PROGRAM_FILES_ROOT, program_data=PROGRAM_DATA_ROOT):
