@@ -1,11 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from pathlib import Path
-
 from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
-PROJECT_ROOT = str(Path(SPECPATH).parent)
 
 hiddenimports = [
     "django",
@@ -23,7 +20,7 @@ hiddenimports += collect_submodules("sysvarhub")
 
 a = Analysis(
     ["windows_service.py"],
-    pathex=[PROJECT_ROOT],
+    pathex=["."],
     binaries=[],
     datas=[],
     hiddenimports=hiddenimports,
