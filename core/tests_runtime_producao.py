@@ -9,10 +9,13 @@ from django.urls import resolve
 
 from sysvarhub.urls import angular_spa
 from runtime.windows_runtime import (
+    ACL_ADMINISTRATORS,
+    ACL_SYSTEM,
     create_default_env,
     generate_secret,
     local_hostnames_and_ips,
     merge_csv,
+    write_locked_file,
 )
 from runtime.windows_service import HubWaitressRuntime, stop_runtime
 
@@ -27,7 +30,7 @@ class HealthCheckTests(SimpleTestCase):
 
 class AngularSpaFallbackTests(SimpleTestCase):
     def test_rota_spa_retorna_index(self):
-        with TemporaryDirectory() as temp_dir:
+        with TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             Path(temp_dir, "index.html").write_text("<app-root></app-root>", encoding="utf-8")
 
             with override_settings(FRONTEND_DIST_DIR=Path(temp_dir)):
@@ -42,7 +45,7 @@ class AngularSpaFallbackTests(SimpleTestCase):
         self.assertIsNot(resolver_match.func, angular_spa)
 
     def test_asset_existente_e_servido(self):
-        with TemporaryDirectory() as temp_dir:
+        with TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             Path(temp_dir, "main.js").write_text("console.log('ok')", encoding="utf-8")
             Path(temp_dir, "index.html").write_text("<app-root></app-root>", encoding="utf-8")
 
@@ -98,10 +101,11 @@ class WindowsRuntimeTests(SimpleTestCase):
             original_env = windows_runtime.ENV_FILE
             windows_runtime.ENV_FILE = Path(temp_dir) / "sysvarhub.env"
             try:
-                create_default_env(
-                    install_root=Path(r"C:\Program Files\Sysvar Hub"),
-                    program_data=Path(r"C:\ProgramData\SysvarHub"),
-                )
+                with patch("subprocess.run"):
+                    create_default_env(
+                        install_root=Path(r"C:\Program Files\Sysvar Hub"),
+                        program_data=Path(r"C:\ProgramData\SysvarHub"),
+                    )
                 content = windows_runtime.ENV_FILE.read_text(encoding="utf-8")
             finally:
                 windows_runtime.ENV_FILE = original_env
@@ -109,6 +113,40 @@ class WindowsRuntimeTests(SimpleTestCase):
         self.assertIn("DB_PORT=3307", content)
         self.assertIn("SYSVARHUB_FRONTEND_DIST_DIR=", content)
         self.assertNotIn("dev-insecure-sysvarhub-change-me", content)
+
+    def test_arquivos_sensiveis_usam_sids_estaveis_no_runtime(self):
+        self.assertEqual(ACL_SYSTEM, "*S-1-5-18:F")
+        self.assertEqual(ACL_ADMINISTRATORS, "*S-1-5-32-544:F")
+
+        with TemporaryDirectory() as temp_dir, patch("os.name", "nt"), patch("subprocess.run") as run:
+            write_locked_file(Path(temp_dir) / "sysvarhub.env", "SECRET=1\n")
+
+        run.assert_any_call(["icacls", str(Path(temp_dir) / "sysvarhub.env"), "/inheritance:r"], check=False, capture_output=True)
+        run.assert_any_call(
+            ["icacls", str(Path(temp_dir) / "sysvarhub.env"), "/grant:r", "*S-1-5-18:F", "*S-1-5-32-544:F"],
+            check=False,
+            capture_output=True,
+        )
+
+    def test_install_hub_script_nao_depende_de_administrators_localizado(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("*S-1-5-18:F", script)
+        self.assertIn("*S-1-5-32-544:F", script)
+        self.assertIn("/inheritance:r", script)
+        self.assertNotIn("Administrators:F", script)
+        self.assertNotIn("SYSTEM:F", script)
+
+    def test_pyinstaller_spec_resolve_backend_root_para_collect_e_pathex(self):
+        spec = Path(settings.BASE_DIR, "runtime", "SysvarHubService.spec").read_text(encoding="utf-8")
+        backend_pos = spec.index("backend_root = spec_root.parent")
+        collect_pos = spec.index('collect_submodules("core"')
+
+        self.assertLess(backend_pos, collect_pos)
+        self.assertIn("sys.path.insert(0, candidate)", spec)
+        self.assertIn("pathex=[str(spec_root), str(backend_root)]", spec)
+        self.assertIn('collect_submodules("integracao"', spec)
+        self.assertIn('collect_submodules("sysvarhub"', spec)
 
 
 class WindowsServiceLifecycleTests(SimpleTestCase):

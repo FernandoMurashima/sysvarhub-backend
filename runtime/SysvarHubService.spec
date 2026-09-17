@@ -1,8 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from PyInstaller.utils.hooks import collect_submodules
+from pathlib import Path
+import sys
 
 block_cipher = None
+spec_file = Path(globals().get("__file__", Path(SPECPATH) / "SysvarHubService.spec")).resolve()
+spec_root = spec_file.parent
+backend_root = spec_root.parent
+for candidate in (str(backend_root), str(spec_root)):
+    if candidate not in sys.path:
+        sys.path.insert(0, candidate)
 
 hiddenimports = [
     "django",
@@ -20,7 +28,7 @@ hiddenimports += collect_submodules("sysvarhub")
 
 a = Analysis(
     ["windows_service.py"],
-    pathex=["."],
+    pathex=[str(spec_root), str(backend_root)],
     binaries=[],
     datas=[],
     hiddenimports=hiddenimports,

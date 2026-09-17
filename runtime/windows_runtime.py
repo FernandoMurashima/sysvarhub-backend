@@ -14,6 +14,8 @@ BACKUP_DIR = PROGRAM_DATA_ROOT / "backup"
 MYSQL_DATA_DIR = PROGRAM_DATA_ROOT / "mysql" / "data"
 ENV_FILE = CONFIG_DIR / "sysvarhub.env"
 MYSQL_ADMIN_FILE = CONFIG_DIR / "mysql-admin.env"
+ACL_SYSTEM = "*S-1-5-18:F"
+ACL_ADMINISTRATORS = "*S-1-5-32-544:F"
 
 
 def load_env_file(path=ENV_FILE):
@@ -84,7 +86,7 @@ def write_locked_file(path, content):
         import subprocess
 
         subprocess.run(["icacls", str(path), "/inheritance:r"], check=False, capture_output=True)
-        subprocess.run(["icacls", str(path), "/grant:r", "SYSTEM:F", "Administrators:F"], check=False, capture_output=True)
+        subprocess.run(["icacls", str(path), "/grant:r", ACL_SYSTEM, ACL_ADMINISTRATORS], check=False, capture_output=True)
 
 
 def create_default_env(install_root=PROGRAM_FILES_ROOT, program_data=PROGRAM_DATA_ROOT):

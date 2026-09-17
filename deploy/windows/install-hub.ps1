@@ -14,6 +14,8 @@ $MyIni = Join-Path $ConfigRoot "my.ini"
 $ServiceExe = Join-Path $InstallRoot "runtime\SysvarHubService.exe"
 $Mysqld = Join-Path $InstallRoot "mysql\bin\mysqld.exe"
 $Mysql = Join-Path $InstallRoot "mysql\bin\mysql.exe"
+$AclSystem = "*S-1-5-18:F"
+$AclAdministrators = "*S-1-5-32-544:F"
 
 New-Item -ItemType Directory -Force -Path $ConfigRoot, $LogRoot, (Join-Path $ProgramDataRoot "backup"), (Join-Path $ProgramDataRoot "data"), $MysqlData | Out-Null
 
@@ -43,7 +45,7 @@ if (-not (Test-Path $EnvFile)) {
         "SYSVARHUB_FRONTEND_DIST_DIR=$(Join-Path $InstallRoot 'frontend')"
     ) | Set-Content -LiteralPath $EnvFile -Encoding UTF8
     icacls $EnvFile /inheritance:r | Out-Null
-    icacls $EnvFile /grant:r "SYSTEM:F" "Administrators:F" | Out-Null
+    icacls $EnvFile /grant:r $AclSystem $AclAdministrators | Out-Null
 }
 
 if (-not (Test-Path $MyIni)) {
@@ -89,7 +91,7 @@ if ($FirstRun) {
     if ($LASTEXITCODE -ne 0) { throw "Protecao do usuario administrativo MySQL falhou." }
     @("[client]", "user=root", "password=$AdminPassword", "host=127.0.0.1", "port=3307") | Set-Content -LiteralPath $MysqlAdminFile -Encoding ASCII
     icacls $MysqlAdminFile /inheritance:r | Out-Null
-    icacls $MysqlAdminFile /grant:r "SYSTEM:F" "Administrators:F" | Out-Null
+    icacls $MysqlAdminFile /grant:r $AclSystem $AclAdministrators | Out-Null
 }
 if (-not (Test-Path $MysqlAdminFile)) {
     throw "Credencial administrativa local do MySQL nao encontrada em $MysqlAdminFile."
