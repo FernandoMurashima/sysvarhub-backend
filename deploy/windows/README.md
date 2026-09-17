@@ -32,6 +32,16 @@ Use `sysvarhub.env.example` como modelo e preencha segredo, banco, hosts permiti
 - `check-hub.ps1`: consulta `/api/health/` e retorna exit code `0` quando saudavel.
 - `build-frontend.ps1`: compila o Angular e copia o resultado para `frontend_dist`.
 - `prepare-package.ps1`: monta `deploy\windows\staging\` com app, frontend, template e scripts.
+- `build-installer.ps1`: gera o runtime PyInstaller, monta staging com frontend e MySQL e chama o Inno Setup.
+- `install-hub.ps1`: cria configuracao segura, registra os servicos `SysvarHubMySQL` e `SysvarHub`, aplica migrations e libera firewall apenas para TCP 8000.
+- `configurar-hub.ps1`: executa `ativar_hub` e a carga inicial usando os comandos oficiais.
+- `diagnostico.ps1`: mostra estado dos servicos e portas sem exibir segredos.
+- `uninstall-hub.ps1`: remove servicos e binarios preservando `C:\ProgramData\SysvarHub`.
+- `purge-data.ps1`: remove dados preservados somente quando executado explicitamente.
+
+## MySQL
+
+O instalador usa MySQL Community Server 8.x x64 em ZIP extraido, informado no build por `-MySqlRoot`. Ele sera instalado em `C:\Program Files\Sysvar Hub\mysql` e configurado para escutar somente `127.0.0.1:3307`.
 
 ## Build e instalador
 

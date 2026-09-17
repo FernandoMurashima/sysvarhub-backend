@@ -33,3 +33,12 @@ htmlcov/
 .env
 .env.*
 *.env
+
+deploy/windows/staging/
+deploy/windows/dist/
+deploy/windows/build/
+deploy/windows/vendor/mysql/*
+!deploy/windows/vendor/mysql/.gitkeep
+!deploy/windows/vendor/mysql/README.md
+frontend_dist/*
+!frontend_dist/.gitkeep

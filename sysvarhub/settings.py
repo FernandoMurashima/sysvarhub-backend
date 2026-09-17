@@ -8,8 +8,12 @@ sincronização com a retaguarda Sysvar.
 from pathlib import Path
 from decouple import Csv, config
 
+from runtime.windows_runtime import ENV_FILE, load_env_file, local_hostnames_and_ips, merge_csv
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+load_env_file(ENV_FILE)
 
 
 # -----------------------------------------------------------------------------
@@ -32,10 +36,13 @@ if not DEBUG and SECRET_KEY == "dev-insecure-sysvarhub-change-me":
         "DJANGO_SECRET_KEY deve ser configurado para executar com DJANGO_DEBUG=False."
     )
 
-ALLOWED_HOSTS = config(
+ALLOWED_HOSTS = merge_csv(
+    config(
     "DJANGO_ALLOWED_HOSTS",
     cast=Csv(),
     default="127.0.0.1,localhost"
+    ),
+    local_hostnames_and_ips(),
 )
 
 CSRF_TRUSTED_ORIGINS = config(
