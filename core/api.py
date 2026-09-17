@@ -19,6 +19,15 @@ from core.services.caixa import (
     fechar_caixa,
     serializar_sessao_caixa,
 )
+from core.services.fechamento_dia import (
+    FechamentoDiaConflictError,
+    FechamentoDiaConsistencyError,
+    FechamentoDiaError,
+    FechamentoDiaValidationError,
+    fechar_dia,
+    obter_previa_fechamento_dia,
+    serializar_fechamento_dia,
+)
 from core.services.clientes import (
     ClienteConflictError,
     ClienteError,
@@ -342,6 +351,47 @@ class CaixaResumoView(APIView):
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         except CaixaError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class FechamentoDiaView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        try:
+            return Response(
+                obter_previa_fechamento_dia(
+                    request.sysvar_terminal,
+                    request.query_params.get("data"),
+                )
+            )
+        except FechamentoDiaValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    def post(self, request):
+        try:
+            fechamento = fechar_dia(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.data.get("data_operacional"),
+                request.data.get("formas_pagamento", []),
+                observacao=request.data.get("observacao", ""),
+            )
+        except FechamentoDiaValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except FechamentoDiaConsistencyError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except FechamentoDiaConflictError as exc:
+            payload = {"detail": str(exc)}
+            if exc.preview is not None:
+                payload["preview"] = exc.preview
+            if exc.fechamento is not None:
+                payload["fechamento"] = serializar_fechamento_dia(exc.fechamento)
+            return Response(payload, status=status.HTTP_409_CONFLICT)
+        except FechamentoDiaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({"status": "ok", "fechamento": serializar_fechamento_dia(fechamento)})
 
 
 class VendaAtualView(APIView):

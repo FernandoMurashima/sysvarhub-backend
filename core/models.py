@@ -1344,6 +1344,99 @@ class VendaPagamentoParcelaHub(models.Model):
         return f"{self.pagamento_id} - {self.ordem}"
 
 
+class FechamentoDiaHub(models.Model):
+    SITUACAO_OK = "OK"
+    SITUACAO_DIVERGENTE = "DIVERGENTE"
+    SITUACAO_CHOICES = [
+        (SITUACAO_OK, "Ok"),
+        (SITUACAO_DIVERGENTE, "Divergente"),
+    ]
+
+    fechamento_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="fechamentos_dia")
+    data_operacional = models.DateField()
+    quantidade_vendas = models.PositiveIntegerField(default=0)
+    total_vendas = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total_sistema = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total_conferido = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    diferenca_total = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    situacao = models.CharField(max_length=12, choices=SITUACAO_CHOICES)
+    operador_fechamento = models.ForeignKey(
+        OperadorHub,
+        on_delete=models.PROTECT,
+        related_name="fechamentos_dia",
+    )
+    terminal_fechamento = models.ForeignKey(
+        Terminal,
+        on_delete=models.PROTECT,
+        related_name="fechamentos_dia",
+    )
+    fechado_em = models.DateTimeField()
+    observacao = models.TextField(blank=True, default="")
+    resumo_snapshot = models.JSONField(default=dict, blank=True)
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Fechamento diário do Hub"
+        verbose_name_plural = "Fechamentos diários do Hub"
+        ordering = ("-data_operacional", "-fechado_em")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["hub", "data_operacional"],
+                name="uniq_fech_dia_hub_data",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "data_operacional"], name="idx_fech_dia_hub_data"),
+            models.Index(fields=["fechado_em"], name="idx_fech_dia_fechado"),
+        ]
+
+    def __str__(self):
+        return f"{self.hub_id} - {self.data_operacional} - {self.situacao}"
+
+
+class FechamentoDiaFormaHub(models.Model):
+    SITUACAO_OK = "OK"
+    SITUACAO_SOBRA = "SOBRA"
+    SITUACAO_FALTA = "FALTA"
+    SITUACAO_CHOICES = [
+        (SITUACAO_OK, "Ok"),
+        (SITUACAO_SOBRA, "Sobra"),
+        (SITUACAO_FALTA, "Falta"),
+    ]
+
+    fechamento = models.ForeignKey(
+        FechamentoDiaHub,
+        on_delete=models.CASCADE,
+        related_name="formas",
+    )
+    tipo = models.CharField(max_length=24)
+    descricao = models.CharField(max_length=120)
+    quantidade = models.PositiveIntegerField(default=0)
+    valor_sistema = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    valor_conferido = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    diferenca = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    situacao = models.CharField(max_length=5, choices=SITUACAO_CHOICES)
+    detalhes_snapshot = models.JSONField(default=list, blank=True)
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Forma do fechamento diário do Hub"
+        verbose_name_plural = "Formas do fechamento diário do Hub"
+        ordering = ("tipo",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["fechamento", "tipo"],
+                name="uniq_fech_dia_forma_tipo",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.fechamento_id} - {self.tipo} - {self.situacao}"
+
+
 class EstoqueMovimentoHub(models.Model):
     TIPO_SAIDA_VENDA = "SAIDA_VENDA"
     TIPO_CHOICES = [
