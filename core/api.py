@@ -38,6 +38,7 @@ from core.services.operadores import (
     encerrar_sessao,
     serializar_operador,
 )
+from core.services.resumo_caixa import obter_resumo_caixa
 from core.services.terminais import (
     PareamentoTerminalError,
     parear_terminal,
@@ -322,6 +323,19 @@ class CaixaMovimentacoesView(APIView):
             {"movimentacao": serializar_movimentacao_caixa(movimentacao)},
             status=status.HTTP_201_CREATED,
         )
+
+
+class CaixaResumoView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        try:
+            return Response(obter_resumo_caixa(request.sysvar_terminal))
+        except CaixaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except CaixaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class VendaAtualView(APIView):
