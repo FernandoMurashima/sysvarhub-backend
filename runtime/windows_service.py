@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import threading
 
 from runtime.windows_runtime import ENV_FILE, load_env_file
 
@@ -13,16 +14,51 @@ def bootstrap():
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "sysvarhub.settings")
 
 
-def run_console():
-    bootstrap()
-    import django
-    from django.core.wsgi import get_wsgi_application
-    from waitress import serve
+class HubWaitressRuntime:
+    def __init__(self, application_factory=None, server_factory=None):
+        self.application_factory = application_factory
+        self.server_factory = server_factory
+        self.server = None
+        self._lock = threading.RLock()
 
-    django.setup()
-    host = os.environ.get("HUB_BIND_HOST", "0.0.0.0")
-    port = int(os.environ.get("HUB_PORT", "8000"))
-    serve(get_wsgi_application(), host=host, port=port)
+    def run(self):
+        bootstrap()
+        import django
+        from django.core.wsgi import get_wsgi_application
+        from waitress.server import create_server
+
+        django.setup()
+        host = os.environ.get("HUB_BIND_HOST", "0.0.0.0")
+        port = int(os.environ.get("HUB_PORT", "8000"))
+        application_factory = self.application_factory or get_wsgi_application
+        server_factory = self.server_factory or create_server
+        server = server_factory(application_factory(), host=host, port=port)
+        with self._lock:
+            self.server = server
+        try:
+            server.run()
+        finally:
+            self.stop()
+
+    def stop(self):
+        with self._lock:
+            server = self.server
+            self.server = None
+        if server is None:
+            return
+        dispatcher = getattr(server, "task_dispatcher", None)
+        if dispatcher is not None:
+            dispatcher.shutdown()
+        server.close()
+
+
+def run_console(runtime=None):
+    (runtime or HubWaitressRuntime()).run()
+
+
+def stop_runtime(runtime):
+    if runtime is not None:
+        runtime.stop()
 
 
 def run_manage(argv):
@@ -50,18 +86,23 @@ if win32serviceutil is not None:
         def __init__(self, args):
             super().__init__(args)
             self.stop_event = win32event.CreateEvent(None, 0, 0, None)
+            self.runtime = HubWaitressRuntime()
 
         def SvcStop(self):
             self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+            stop_runtime(self.runtime)
             win32event.SetEvent(self.stop_event)
 
         def SvcDoRun(self):
+            self.ReportServiceStatus(win32service.SERVICE_RUNNING)
             servicemanager.LogInfoMsg("Sysvar Hub iniciando.")
             try:
-                run_console()
+                run_console(self.runtime)
             except Exception as exc:
                 servicemanager.LogErrorMsg(f"Sysvar Hub falhou: {exc}")
                 raise
+            finally:
+                self.ReportServiceStatus(win32service.SERVICE_STOPPED)
 
 
 def main():

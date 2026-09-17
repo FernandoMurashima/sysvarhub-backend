@@ -112,4 +112,4 @@ sc.exe config SysvarHub depend= SysvarHubMySQL start= delayed-auto | Out-Null
 New-NetFirewallRule -DisplayName "Sysvar Hub" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8000 -Profile Private,Domain -RemoteAddress LocalSubnet -ErrorAction SilentlyContinue | Out-Null
 
 Start-Service SysvarHub
-& (Join-Path $PSScriptRoot "check-hub.ps1")
+& (Join-Path $PSScriptRoot "check-hub.ps1") -WaitSeconds 60 -IntervalSeconds 2

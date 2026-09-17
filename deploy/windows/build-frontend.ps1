@@ -58,6 +58,7 @@ try {
     New-Item -ItemType Directory -Force -Path $target | Out-Null
     Get-ChildItem -LiteralPath $target -Force | Remove-Item -Recurse -Force
     Copy-Item -Path (Join-Path $source "*") -Destination $target -Recurse -Force
+    New-Item -ItemType File -Force -Path (Join-Path $target ".gitkeep") | Out-Null
 
     Write-Host "Frontend copiado para $target."
 } finally {

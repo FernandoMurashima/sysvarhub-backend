@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import Mock, patch
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
@@ -13,6 +14,7 @@ from runtime.windows_runtime import (
     local_hostnames_and_ips,
     merge_csv,
 )
+from runtime.windows_service import HubWaitressRuntime, stop_runtime
 
 
 class HealthCheckTests(SimpleTestCase):
@@ -107,3 +109,38 @@ class WindowsRuntimeTests(SimpleTestCase):
         self.assertIn("DB_PORT=3307", content)
         self.assertIn("SYSVARHUB_FRONTEND_DIST_DIR=", content)
         self.assertNotIn("dev-insecure-sysvarhub-change-me", content)
+
+
+class WindowsServiceLifecycleTests(SimpleTestCase):
+    def test_runtime_armazena_servidor_controlavel(self):
+        server = Mock()
+        runtime = HubWaitressRuntime(application_factory=Mock(return_value=object()), server_factory=Mock(return_value=server))
+
+        with patch("runtime.windows_service.bootstrap"), patch("django.setup"):
+            runtime.run()
+
+        server.run.assert_called_once()
+        server.close.assert_called_once()
+        self.assertIsNone(runtime.server)
+
+    def test_stop_encerra_dispatcher_e_waitress(self):
+        server = Mock()
+        runtime = HubWaitressRuntime()
+        runtime.server = server
+
+        runtime.stop()
+
+        server.task_dispatcher.shutdown.assert_called_once()
+        server.close.assert_called_once()
+        self.assertIsNone(runtime.server)
+
+    def test_stop_runtime_ignora_runtime_ausente(self):
+        stop_runtime(None)
+
+    def test_check_hub_script_tem_retry_e_timeout(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "check-hub.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("WaitSeconds", script)
+        self.assertIn("IntervalSeconds", script)
+        self.assertIn("Start-Sleep", script)
+        self.assertIn("status -eq \"ok\"", script)
