@@ -27,6 +27,11 @@ DEBUG = config(
     default=True
 )
 
+if not DEBUG and SECRET_KEY == "dev-insecure-sysvarhub-change-me":
+    raise RuntimeError(
+        "DJANGO_SECRET_KEY deve ser configurado para executar com DJANGO_DEBUG=False."
+    )
+
 ALLOWED_HOSTS = config(
     "DJANGO_ALLOWED_HOSTS",
     cast=Csv(),
@@ -73,6 +78,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -171,6 +177,10 @@ STATIC_URL = "static/"
 
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+
+FRONTEND_DIST_DIR = Path(config("SYSVARHUB_FRONTEND_DIST_DIR", default=str(BASE_DIR / "frontend_dist")))
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 
@@ -220,6 +230,28 @@ REST_FRAMEWORK = {
 # Logging
 # -----------------------------------------------------------------------------
 
+SYSVARHUB_LOG_DIR = config("SYSVARHUB_LOG_DIR", default="")
+
+LOG_HANDLERS = ["console"]
+LOGGING_HANDLERS = {
+    "console": {
+        "class": "logging.StreamHandler",
+        "formatter": "simple",
+    },
+}
+
+if SYSVARHUB_LOG_DIR:
+    Path(SYSVARHUB_LOG_DIR).mkdir(parents=True, exist_ok=True)
+    LOGGING_HANDLERS["hub_file"] = {
+        "class": "logging.handlers.RotatingFileHandler",
+        "formatter": "simple",
+        "filename": str(Path(SYSVARHUB_LOG_DIR) / "hub.log"),
+        "maxBytes": 5 * 1024 * 1024,
+        "backupCount": 5,
+        "encoding": "utf-8",
+    }
+    LOG_HANDLERS.append("hub_file")
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -229,14 +261,9 @@ LOGGING = {
             "style": "{",
         },
     },
-    "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-            "formatter": "simple",
-        },
-    },
+    "handlers": LOGGING_HANDLERS,
     "root": {
-        "handlers": ["console"],
+        "handlers": LOG_HANDLERS,
         "level": "INFO",
     },
 }

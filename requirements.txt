@@ -3,6 +3,8 @@
 # =========================
 Django==4.2.11
 djangorestframework==3.14.0
+waitress==3.0.2
+whitenoise==6.8.2
 
 # =========================
 # Extensões úteis
