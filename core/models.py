@@ -853,6 +853,14 @@ class SessaoCaixaHub(models.Model):
         (STATUS_ABERTO, "Aberto"),
         (STATUS_FECHADO, "Fechado"),
     ]
+    SITUACAO_OK = "OK"
+    SITUACAO_SOBRA = "SOBRA"
+    SITUACAO_FALTA = "FALTA"
+    SITUACAO_FECHAMENTO_CHOICES = [
+        (SITUACAO_OK, "Ok"),
+        (SITUACAO_SOBRA, "Sobra"),
+        (SITUACAO_FALTA, "Falta"),
+    ]
 
     sessao_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     caixa = models.ForeignKey(
@@ -901,6 +909,17 @@ class SessaoCaixaHub(models.Model):
         null=True,
         blank=True,
     )
+    valor_esperado_fechamento = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    valor_contado_fechamento = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    diferenca_fechamento = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    situacao_fechamento = models.CharField(
+        max_length=5,
+        choices=SITUACAO_FECHAMENTO_CHOICES,
+        blank=True,
+        default="",
+    )
+    observacao_fechamento = models.TextField(blank=True, default="")
+    resumo_fechamento = models.JSONField(default=dict, blank=True)
     criado_em = models.DateTimeField(auto_now_add=True)
     atualizado_em = models.DateTimeField(auto_now=True)
 

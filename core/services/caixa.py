@@ -21,6 +21,14 @@ class ValorAberturaError(CaixaError):
     pass
 
 
+class ValorContadoError(CaixaError):
+    pass
+
+
+class ObservacaoFechamentoError(CaixaError):
+    pass
+
+
 def obter_caixa_terminal(terminal, *, exigir_ativo=True):
     if terminal.caixa_retaguarda_id is None:
         raise CaixaError("Terminal sem Caixa configurado.")
@@ -97,7 +105,10 @@ def abrir_caixa(terminal, operador, sessao_operador, *, valor_abertura):
     return sessao
 
 
-def fechar_caixa(terminal, operador, sessao_operador):
+def fechar_caixa(terminal, operador, sessao_operador, *, valor_contado, observacao=""):
+    valor_contado = validar_valor_contado(valor_contado)
+    observacao = validar_observacao_fechamento(observacao)
+
     with transaction.atomic():
         terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
         caixa = obter_caixa_terminal(terminal_bloqueado, exigir_ativo=False)
@@ -113,7 +124,14 @@ def fechar_caixa(terminal, operador, sessao_operador):
 
         if existe_venda_aberta_sessao_caixa(sessao):
             raise CaixaConflictError("Existe venda em andamento neste caixa.")
+        from core.services.resumo_caixa import calcular_resumo_sessao
         from core.services.vendas import limpar_contexto_venda_terminal
+
+        resumo = calcular_resumo_sessao(terminal_bloqueado, sessao)
+        valor_esperado = Decimal(resumo["dinheiro"]["esperado"])
+        diferenca = (valor_contado - valor_esperado).quantize(Decimal("0.01"))
+        situacao = _situacao_fechamento(diferenca)
+        snapshot = _snapshot_resumo_fechamento(resumo)
 
         limpar_contexto_venda_terminal(terminal_bloqueado)
 
@@ -122,6 +140,12 @@ def fechar_caixa(terminal, operador, sessao_operador):
         sessao.terminal_fechamento = terminal_bloqueado
         sessao.operador_fechamento = operador
         sessao.sessao_operador_fechamento = sessao_operador
+        sessao.valor_esperado_fechamento = valor_esperado
+        sessao.valor_contado_fechamento = valor_contado
+        sessao.diferenca_fechamento = diferenca
+        sessao.situacao_fechamento = situacao
+        sessao.observacao_fechamento = observacao
+        sessao.resumo_fechamento = snapshot
         sessao.chave_caixa_aberto = None
         sessao.save(
             update_fields=[
@@ -130,12 +154,24 @@ def fechar_caixa(terminal, operador, sessao_operador):
                 "terminal_fechamento",
                 "operador_fechamento",
                 "sessao_operador_fechamento",
+                "valor_esperado_fechamento",
+                "valor_contado_fechamento",
+                "diferenca_fechamento",
+                "situacao_fechamento",
+                "observacao_fechamento",
+                "resumo_fechamento",
                 "chave_caixa_aberto",
                 "atualizado_em",
             ]
         )
 
-    return sessao
+    return sessao, {
+        "valor_esperado": f"{valor_esperado:.2f}",
+        "valor_contado": f"{valor_contado:.2f}",
+        "diferenca": f"{diferenca:.2f}",
+        "situacao": situacao,
+        "resumo": snapshot,
+    }
 
 
 def validar_valor_abertura(valor):
@@ -168,6 +204,79 @@ def validar_valor_abertura(valor):
     return decimal.quantize(Decimal("0.01"))
 
 
+def validar_valor_contado(valor):
+    try:
+        return _validar_valor_monetario_nao_negativo(valor)
+    except ValorAberturaError as exc:
+        raise ValorContadoError("Valor contado inválido.") from exc
+
+
+def validar_observacao_fechamento(valor):
+    if valor is None:
+        return ""
+    if not isinstance(valor, str):
+        raise ObservacaoFechamentoError("Observação de fechamento inválida.")
+    texto = valor.strip()
+    if len(texto) > 500:
+        raise ObservacaoFechamentoError("Observação de fechamento inválida.")
+    return texto
+
+
+def _validar_valor_monetario_nao_negativo(valor):
+    if valor is None or isinstance(valor, bool):
+        raise ValorAberturaError("Valor de abertura inválido.")
+    if not isinstance(valor, str):
+        raise ValorAberturaError("Valor de abertura inválido.")
+
+    texto = valor.strip()
+    if not texto:
+        raise ValorAberturaError("Valor de abertura inválido.")
+    if "e" in texto.lower():
+        raise ValorAberturaError("Valor de abertura inválido.")
+
+    try:
+        decimal = Decimal(texto)
+    except InvalidOperation as exc:
+        raise ValorAberturaError("Valor de abertura inválido.") from exc
+
+    if not decimal.is_finite() or decimal < 0:
+        raise ValorAberturaError("Valor de abertura inválido.")
+    casas_decimais = max(-decimal.as_tuple().exponent, 0)
+    digitos_inteiros = max(decimal.adjusted() + 1, 1)
+
+    if casas_decimais > 2:
+        raise ValorAberturaError("Valor de abertura inválido.")
+    if digitos_inteiros > 10:
+        raise ValorAberturaError("Valor de abertura inválido.")
+
+    return decimal.quantize(Decimal("0.01"))
+
+
+def _situacao_fechamento(diferenca):
+    if diferenca == 0:
+        return SessaoCaixaHub.SITUACAO_OK
+    if diferenca > 0:
+        return SessaoCaixaHub.SITUACAO_SOBRA
+    return SessaoCaixaHub.SITUACAO_FALTA
+
+
+def _snapshot_resumo_fechamento(resumo):
+    return {
+        "valor_abertura": resumo["dinheiro"]["valor_abertura"],
+        "quantidade_vendas": resumo["vendas"]["quantidade"],
+        "total_vendas": resumo["vendas"]["total"],
+        "valor_recebido": resumo["vendas"]["valor_recebido"],
+        "troco": resumo["vendas"]["troco"],
+        "formas_pagamento": resumo["pagamentos"]["formas"],
+        "dinheiro_bruto": resumo["pagamentos"]["dinheiro_bruto"],
+        "dinheiro_liquido": resumo["pagamentos"]["dinheiro_liquido"],
+        "despesas": resumo["dinheiro"]["despesas"],
+        "sangrias": resumo["dinheiro"]["sangrias"],
+        "suprimentos": resumo["dinheiro"]["suprimentos"],
+        "dinheiro_esperado": resumo["dinheiro"]["esperado"],
+    }
+
+
 def serializar_sessao_caixa(sessao):
     if sessao is None:
         return None
@@ -192,6 +301,16 @@ def serializar_sessao_caixa(sessao):
             else None
         ),
     }
+    if sessao.valor_esperado_fechamento is not None:
+        payload.update(
+            {
+                "valor_esperado_fechamento": f"{sessao.valor_esperado_fechamento:.2f}",
+                "valor_contado_fechamento": f"{sessao.valor_contado_fechamento:.2f}",
+                "diferenca_fechamento": f"{sessao.diferenca_fechamento:.2f}",
+                "situacao_fechamento": sessao.situacao_fechamento,
+                "observacao_fechamento": sessao.observacao_fechamento,
+            }
+        )
     return payload
 
 

@@ -297,7 +297,7 @@ class VendaVendedorSerializacaoTests(VendaVendedorTestMixin, TestCase):
 
     def test_fechamento_caixa_limpa_vendedor_preselecionado(self):
         self.selecionar_vendedor()
-        fechar_caixa(self.terminal, self.operador, self.sessao_operador)
+        fechar_caixa(self.terminal, self.operador, self.sessao_operador, valor_contado="100.00")
         self.assertFalse(ContextoVendaTerminalHub.objects.exists())
 
     def test_cliente_preselecionado_continua_preservado(self):

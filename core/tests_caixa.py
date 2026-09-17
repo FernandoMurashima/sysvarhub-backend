@@ -94,7 +94,7 @@ class CaixaHubTestMixin:
 class SessaoCaixaModelTests(CaixaHubTestMixin, TestCase):
     def test_uuid_unico(self):
         primeira = abrir_caixa(self.terminal, self.operador, self.sessao_operador, valor_abertura="10.00")
-        fechar_caixa(self.terminal, self.operador, self.sessao_operador)
+        fechar_caixa(self.terminal, self.operador, self.sessao_operador, valor_contado="100.00")
         segunda = abrir_caixa(self.terminal, self.operador, self.sessao_operador, valor_abertura="20.00")
 
         self.assertNotEqual(primeira.sessao_uuid, segunda.sessao_uuid)
@@ -108,7 +108,7 @@ class SessaoCaixaModelTests(CaixaHubTestMixin, TestCase):
         sessao = abrir_caixa(self.terminal, self.operador, self.sessao_operador, valor_abertura="100.00")
         self.assertEqual(sessao.status, SessaoCaixaHub.STATUS_ABERTO)
 
-        fechar_caixa(self.terminal, self.operador, self.sessao_operador)
+        fechar_caixa(self.terminal, self.operador, self.sessao_operador, valor_contado="100.00")
         sessao.refresh_from_db()
         self.assertEqual(sessao.status, SessaoCaixaHub.STATUS_FECHADO)
 
@@ -122,7 +122,7 @@ class SessaoCaixaModelTests(CaixaHubTestMixin, TestCase):
 
     def test_historico_de_fechamento(self):
         sessao = abrir_caixa(self.terminal, self.operador, self.sessao_operador, valor_abertura="100.00")
-        fechar_caixa(self.terminal, self.operador, self.sessao_operador)
+        fechar_caixa(self.terminal, self.operador, self.sessao_operador, valor_contado="100.00")
         sessao.refresh_from_db()
 
         self.assertEqual(sessao.terminal_fechamento, self.terminal)
@@ -280,7 +280,7 @@ class CaixaServiceTests(CaixaHubTestMixin, TestCase):
 
     def test_fechamento_libera_chave_e_permite_nova_abertura(self):
         primeira = abrir_caixa(self.terminal, self.operador, self.sessao_operador, valor_abertura="100.00")
-        fechar_caixa(self.terminal, self.operador, self.sessao_operador)
+        fechar_caixa(self.terminal, self.operador, self.sessao_operador, valor_contado="100.00")
         primeira.refresh_from_db()
 
         segunda = abrir_caixa(self.terminal, self.operador, self.sessao_operador, valor_abertura="20.00")
@@ -290,7 +290,7 @@ class CaixaServiceTests(CaixaHubTestMixin, TestCase):
 
     def test_fechar_sem_abertura_conflita(self):
         with self.assertRaises(CaixaConflictError):
-            fechar_caixa(self.terminal, self.operador, self.sessao_operador)
+            fechar_caixa(self.terminal, self.operador, self.sessao_operador, valor_contado="100.00")
 
 
 class CaixaApiTests(CaixaHubTestMixin, TestCase):
@@ -373,7 +373,7 @@ class CaixaApiTests(CaixaHubTestMixin, TestCase):
     def test_fechar_corretamente(self):
         self.abrir_api("100.00")
 
-        resposta = self.client.post("/api/terminal/caixa/fechar/", {}, format="json")
+        resposta = self.client.post("/api/terminal/caixa/fechar/", {"valor_contado": "100.00"}, format="json")
 
         self.assertEqual(resposta.status_code, 200)
         self.assertEqual(resposta.data["status"], "ok")
@@ -387,7 +387,7 @@ class CaixaApiTests(CaixaHubTestMixin, TestCase):
         self.sessao_operador, self.token_operador = self.criar_sessao_operador(self.terminal, operador_b)
         self.autenticar()
 
-        resposta = self.client.post("/api/terminal/caixa/fechar/", {}, format="json")
+        resposta = self.client.post("/api/terminal/caixa/fechar/", {"valor_contado": "100.00"}, format="json")
         sessao = SessaoCaixaHub.objects.get()
 
         self.assertEqual(resposta.data["sessao"]["operador_fechamento"]["codigo"], "operador.b")
@@ -396,7 +396,7 @@ class CaixaApiTests(CaixaHubTestMixin, TestCase):
         self.assertEqual(sessao.sessao_operador_fechamento, self.sessao_operador)
 
     def test_fechar_ja_fechado_retorna_409(self):
-        resposta = self.client.post("/api/terminal/caixa/fechar/", {}, format="json")
+        resposta = self.client.post("/api/terminal/caixa/fechar/", {"valor_contado": "100.00"}, format="json")
 
         self.assertEqual(resposta.status_code, 409)
         self.assertEqual(resposta.data["detail"], "Caixa não está aberto.")

@@ -11,7 +11,9 @@ from core.permissions import IsOperadorAuthenticated, IsTerminalAuthenticated
 from core.services.caixa import (
     CaixaConflictError,
     CaixaError,
+    ObservacaoFechamentoError,
     ValorAberturaError,
+    ValorContadoError,
     abrir_caixa,
     consultar_status_caixa,
     fechar_caixa,
@@ -264,17 +266,21 @@ class CaixaFecharView(APIView):
 
     def post(self, request):
         try:
-            sessao = fechar_caixa(
+            sessao, fechamento = fechar_caixa(
                 request.sysvar_terminal,
                 request.sysvar_operador,
                 request.sysvar_operador_sessao,
+                valor_contado=request.data.get("valor_contado"),
+                observacao=request.data.get("observacao", ""),
             )
+        except (ValorContadoError, ObservacaoFechamentoError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except CaixaConflictError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         except CaixaError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response({"status": "ok", "sessao": serializar_sessao_caixa(sessao)})
+        return Response({"status": "ok", "sessao": serializar_sessao_caixa(sessao), "fechamento": fechamento})
 
 
 class CaixaMovimentacoesView(APIView):

@@ -452,7 +452,7 @@ class VendaFinalizacaoTests(PagamentoHubTestMixin, TestCase):
     def test_caixa_fechado_nao_finaliza(self):
         venda_uuid = self.criar_venda_com_item()
         VendaHub.objects.update(status=VendaHub.STATUS_CANCELADA, chave_venda_aberta_terminal=None)
-        fechar_caixa(self.terminal, self.operador, self.sessao_operador)
+        fechar_caixa(self.terminal, self.operador, self.sessao_operador, valor_contado="100.00")
         VendaHub.objects.update(status=VendaHub.STATUS_ABERTA, chave_venda_aberta_terminal=self.terminal.pk)
         resposta = self.finalizar(venda_uuid)
 

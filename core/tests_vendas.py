@@ -612,7 +612,7 @@ class VendaReservaTests(VendaHubTestMixin, TestCase):
 
 class VendaSegurancaAuditoriaTests(VendaHubTestMixin, TestCase):
     def test_caixa_fechado_bloqueia(self):
-        fechar_caixa(self.terminal, self.operador, self.sessao_operador)
+        fechar_caixa(self.terminal, self.operador, self.sessao_operador, valor_contado="100.00")
 
         resposta = self.post_item()
 
@@ -679,7 +679,7 @@ class VendaCaixaConcorrenciaTests(VendaHubTestMixin, TestCase):
     def test_fechar_caixa_com_venda_aberta_retorna_409(self):
         self.post_iniciar()
 
-        resposta = self.client.post("/api/terminal/caixa/fechar/", {}, format="json")
+        resposta = self.client.post("/api/terminal/caixa/fechar/", {"valor_contado": "100.00"}, format="json")
 
         self.assertEqual(resposta.status_code, 409)
         self.assertEqual(resposta.data["detail"], "Existe venda em andamento neste caixa.")
@@ -690,7 +690,7 @@ class VendaCaixaConcorrenciaTests(VendaHubTestMixin, TestCase):
         self.post_item()
         self.client.post("/api/terminal/venda/cancelar/", {}, format="json")
 
-        resposta = self.client.post("/api/terminal/caixa/fechar/", {}, format="json")
+        resposta = self.client.post("/api/terminal/caixa/fechar/", {"valor_contado": "100.00"}, format="json")
 
         self.assertEqual(resposta.status_code, 200)
 
@@ -698,7 +698,7 @@ class VendaCaixaConcorrenciaTests(VendaHubTestMixin, TestCase):
         cliente = self.criar_cliente()
         self.put_cliente(cliente)
 
-        resposta = self.client.post("/api/terminal/caixa/fechar/", {}, format="json")
+        resposta = self.client.post("/api/terminal/caixa/fechar/", {"valor_contado": "100.00"}, format="json")
 
         self.assertEqual(resposta.status_code, 200)
         self.assertEqual(VendaHub.objects.count(), 0)
@@ -708,7 +708,7 @@ class VendaCaixaConcorrenciaTests(VendaHubTestMixin, TestCase):
         with patch("core.services.caixa.Terminal.objects") as manager:
             manager.select_for_update.side_effect = RuntimeError("lock terminal chamado")
             with self.assertRaises(RuntimeError):
-                fechar_caixa(self.terminal, self.operador, self.sessao_operador)
+                fechar_caixa(self.terminal, self.operador, self.sessao_operador, valor_contado="100.00")
 
     def test_unique_tecnico_impede_duas_vendas_abertas_no_terminal(self):
         self.post_item()
