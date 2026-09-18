@@ -309,6 +309,60 @@ class WindowsInstallScriptTests(SimpleTestCase):
         self.assertNotIn('[Run]\nFilename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\\scripts\\install-hub.ps1""', iss)
 
 
+class WindowsInstallerReinstallTests(SimpleTestCase):
+    def test_inno_setup_tem_hook_pre_instalacao_para_parar_servicos(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+
+        self.assertIn("function PrepareToInstall(var NeedsRestart: Boolean): String;", iss)
+        self.assertIn("function StopServiceForInstall(ServiceName: String): String;", iss)
+        self.assertIn("StopServiceForInstall('SysvarHub')", iss)
+        self.assertIn("StopServiceForInstall('SysvarHubMySQL')", iss)
+
+    def test_inno_setup_para_hub_antes_do_mysql(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+        hub_pos = iss.index("StopServiceForInstall('SysvarHub')")
+        mysql_pos = iss.index("StopServiceForInstall('SysvarHubMySQL')")
+        post_install_pos = iss.index("if CurStep = ssPostInstall then")
+
+        self.assertLess(hub_pos, mysql_pos)
+        self.assertLess(mysql_pos, post_install_pos)
+
+    def test_inno_setup_aceita_servico_inexistente_ou_ja_parado(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+
+        self.assertIn("Get-Service -Name $serviceName -ErrorAction SilentlyContinue", iss)
+        self.assertIn("if ($null -eq $service) { exit 0 }", iss)
+        self.assertIn("if ($service.Status -eq ''Stopped'') { exit 0 }", iss)
+
+    def test_inno_setup_para_servico_em_execucao_e_aguarda_com_timeout(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+
+        self.assertIn("Stop-Service -Name $serviceName -ErrorAction Stop", iss)
+        self.assertIn("$service.WaitForStatus(''Stopped'', ''00:00:30'')", iss)
+        self.assertIn("Nao foi possivel parar o servico", iss)
+        self.assertIn("dentro do timeout", iss)
+
+    def test_inno_setup_falha_ao_parar_aborta_instalacao_sem_forcar_kill_ou_delete(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+        prepare_block = iss[iss.index("function StopServiceForInstall"):iss.index("procedure CurStepChanged")]
+
+        self.assertIn("if ResultCode <> 0 then", prepare_block)
+        self.assertNotIn("taskkill", prepare_block.lower())
+        self.assertNotIn("/f", prepare_block.lower())
+        self.assertNotIn("sc.exe delete", prepare_block.lower())
+        self.assertNotIn("delete SysvarHub", prepare_block)
+        self.assertNotIn("Remove-Item", prepare_block)
+        self.assertNotIn("ProgramData", prepare_block)
+
+    def test_inno_setup_mantem_install_hub_no_sspostinstall(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+        post_install_pos = iss.index("if CurStep = ssPostInstall then")
+        install_script_pos = iss.index("install-hub.ps1", post_install_pos)
+
+        self.assertGreater(install_script_pos, post_install_pos)
+        self.assertIn("Exec(PowerShell, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)", iss[post_install_pos:])
+
+
 class WindowsServiceLifecycleTests(SimpleTestCase):
     def test_runtime_armazena_servidor_controlavel(self):
         server = Mock()

@@ -34,6 +34,52 @@ Name: "{group}\Abrir Logs"; Filename: "{commonappdata}\SysvarHub\logs"
 Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\uninstall-hub.ps1"" -InstallRoot ""{app}"""; Flags: runhidden waituntilterminated
 
 [Code]
+function StopServiceForInstall(ServiceName: String): String;
+var
+  ResultCode: Integer;
+  PowerShell: String;
+  Parameters: String;
+begin
+  PowerShell := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  Parameters :=
+    '-NoProfile -ExecutionPolicy Bypass -Command "' +
+    '$serviceName = ''' + ServiceName + '''; ' +
+    '$service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue; ' +
+    'if ($null -eq $service) { exit 0 }; ' +
+    'if ($service.Status -eq ''Stopped'') { exit 0 }; ' +
+    'try { ' +
+    '  Stop-Service -Name $serviceName -ErrorAction Stop; ' +
+    '  $service.WaitForStatus(''Stopped'', ''00:00:30''); ' +
+    '  if ((Get-Service -Name $serviceName).Status -ne ''Stopped'') { exit 2 }; ' +
+    '  exit 0; ' +
+    '} catch { exit 2 }"';
+
+  if not Exec(PowerShell, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Result := 'Falha ao iniciar a parada do servico ' + ServiceName + '.';
+    exit;
+  end;
+
+  if ResultCode <> 0 then
+  begin
+    Result := 'Nao foi possivel parar o servico ' + ServiceName + ' dentro do timeout. Feche o Sysvar Hub e tente novamente.';
+    exit;
+  end;
+
+  Result := '';
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := StopServiceForInstall('SysvarHub');
+  if Result <> '' then
+  begin
+    exit;
+  end;
+
+  Result := StopServiceForInstall('SysvarHubMySQL');
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
