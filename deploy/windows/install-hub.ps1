@@ -30,6 +30,74 @@ function New-Secret([int]$Length = 48) {
     return [Convert]::ToBase64String($bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
 }
 
+function Protect-SecretFile([string]$Path) {
+    icacls $Path /inheritance:r | Out-Null
+    icacls $Path /grant:r $AclSystem $AclAdministrators | Out-Null
+}
+
+function Write-MySqlAdminFile([string]$Password) {
+    @("[client]", "user=root", "password=$Password", "host=127.0.0.1", "port=3307") |
+        Set-Content -LiteralPath $MysqlAdminFile -Encoding ASCII
+    Protect-SecretFile $MysqlAdminFile
+}
+
+function Get-MySqlAdminPassword {
+    if (-not (Test-Path $MysqlAdminFile)) { return $null }
+    $line = Get-Content -LiteralPath $MysqlAdminFile |
+        Where-Object { $_ -match "^\s*password\s*=" } |
+        Select-Object -First 1
+    if (-not $line) { return $null }
+    return $line.Split("=", 2)[1]
+}
+
+function Test-MySqlTcpReady([int]$TimeoutSeconds = 60) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $client = New-Object System.Net.Sockets.TcpClient
+        try {
+            $async = $client.BeginConnect("127.0.0.1", 3307, $null, $null)
+            if ($async.AsyncWaitHandle.WaitOne(1000, $false)) {
+                $client.EndConnect($async)
+                return $true
+            }
+        } catch {
+        } finally {
+            $client.Close()
+        }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+function Wait-MySqlReady([int]$TimeoutSeconds = 60) {
+    if (-not (Test-MySqlTcpReady $TimeoutSeconds)) {
+        throw "MySQL local nao ficou disponivel em 127.0.0.1:3307 dentro do timeout."
+    }
+}
+
+function Test-MySqlAdminCredential {
+    if (-not (Test-Path $MysqlAdminFile)) { return $false }
+    & $Mysql --defaults-extra-file="$MysqlAdminFile" --connect-timeout=5 -e "SELECT 1;" *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Test-MySqlRootWithoutPassword {
+    & $Mysql -h127.0.0.1 -P3307 -uroot --connect-timeout=5 -e "SELECT 1;" *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Set-MySqlRootPasswordFromAdminFile {
+    $adminPassword = Get-MySqlAdminPassword
+    if (-not $adminPassword) {
+        throw "Credencial administrativa local do MySQL esta ausente ou invalida."
+    }
+    & $Mysql -h127.0.0.1 -P3307 -uroot --connect-timeout=5 -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$adminPassword'; FLUSH PRIVILEGES;"
+    if ($LASTEXITCODE -ne 0) { throw "Protecao do usuario administrativo MySQL falhou." }
+    if (-not (Test-MySqlAdminCredential)) {
+        throw "Validacao da credencial administrativa local do MySQL falhou apos bootstrap."
+    }
+}
+
 if (-not (Test-Path $EnvFile)) {
     $SecretKey = New-Secret 64
     $DbPassword = New-Secret 48
@@ -49,8 +117,7 @@ if (-not (Test-Path $EnvFile)) {
         "SYSVARHUB_LOG_DIR=$LogRoot",
         "SYSVARHUB_FRONTEND_DIST_DIR=$(Join-Path $InstallRoot 'frontend')"
     ) | Set-Content -LiteralPath $EnvFile -Encoding UTF8
-    icacls $EnvFile /inheritance:r | Out-Null
-    icacls $EnvFile /grant:r $AclSystem $AclAdministrators | Out-Null
+    Protect-SecretFile $EnvFile
 }
 
 if (-not (Test-Path $MyIni)) {
@@ -69,11 +136,14 @@ if (-not (Test-Path $MyIni)) {
     ) | Set-Content -LiteralPath $MyIni -Encoding ASCII
 }
 
-if (-not (Test-Path (Join-Path $MysqlData "mysql"))) {
-    $AdminPassword = New-Secret 48
+$MysqlSystemDir = Join-Path $MysqlData "mysql"
+$NeedsRootPasswordBootstrap = $false
+
+if (-not (Test-Path $MysqlSystemDir)) {
     & $Mysqld --defaults-file="$MyIni" --initialize-insecure
     if ($LASTEXITCODE -ne 0) { throw "Inicializacao do MySQL falhou." }
-    $FirstRun = $true
+    Write-MySqlAdminFile (New-Secret 48)
+    $NeedsRootPasswordBootstrap = $true
 }
 
 if (-not (Get-Service -Name "SysvarHubMySQL" -ErrorAction SilentlyContinue)) {
@@ -83,7 +153,7 @@ if (-not (Get-Service -Name "SysvarHubMySQL" -ErrorAction SilentlyContinue)) {
 }
 
 Start-Service SysvarHubMySQL
-Start-Sleep -Seconds 5
+Wait-MySqlReady 60
 
 $Env = Get-Content -LiteralPath $EnvFile | Where-Object { $_ -match "=" } | ForEach-Object {
     $parts = $_.Split("=", 2); @{ $parts[0] = $parts[1] }
@@ -91,15 +161,17 @@ $Env = Get-Content -LiteralPath $EnvFile | Where-Object { $_ -match "=" } | ForE
 $DbPasswordLine = Get-Content -LiteralPath $EnvFile | Where-Object { $_.StartsWith("DB_PASSWORD=") } | Select-Object -First 1
 $DbPassword = $DbPasswordLine.Split("=", 2)[1]
 
-if ($FirstRun) {
-    & $Mysql -h127.0.0.1 -P3307 -uroot -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$AdminPassword'; FLUSH PRIVILEGES;"
-    if ($LASTEXITCODE -ne 0) { throw "Protecao do usuario administrativo MySQL falhou." }
-    @("[client]", "user=root", "password=$AdminPassword", "host=127.0.0.1", "port=3307") | Set-Content -LiteralPath $MysqlAdminFile -Encoding ASCII
-    icacls $MysqlAdminFile /inheritance:r | Out-Null
-    icacls $MysqlAdminFile /grant:r $AclSystem $AclAdministrators | Out-Null
-}
-if (-not (Test-Path $MysqlAdminFile)) {
-    throw "Credencial administrativa local do MySQL nao encontrada em $MysqlAdminFile."
+if ($NeedsRootPasswordBootstrap) {
+    Set-MySqlRootPasswordFromAdminFile
+} elseif (Test-MySqlAdminCredential) {
+    # Credencial administrativa existente validada.
+} elseif (Test-MySqlRootWithoutPassword) {
+    if (-not (Test-Path $MysqlAdminFile)) {
+        Write-MySqlAdminFile (New-Secret 48)
+    }
+    Set-MySqlRootPasswordFromAdminFile
+} else {
+    throw "Estado administrativo do MySQL inconsistente: credencial local ausente ou invalida, e root sem senha nao esta acessivel. Execute recuperacao explicita antes de reinstalar."
 }
 
 & $Mysql --defaults-extra-file="$MysqlAdminFile" -e "CREATE DATABASE IF NOT EXISTS sysvarhub_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE USER IF NOT EXISTS 'sysvarhub'@'127.0.0.1' IDENTIFIED BY '$DbPassword'; GRANT ALL PRIVILEGES ON sysvarhub_db.* TO 'sysvarhub'@'127.0.0.1'; FLUSH PRIVILEGES;"

@@ -13,7 +13,7 @@ DATA_DIR = PROGRAM_DATA_ROOT / "data"
 BACKUP_DIR = PROGRAM_DATA_ROOT / "backup"
 MYSQL_DATA_DIR = PROGRAM_DATA_ROOT / "mysql" / "data"
 ENV_FILE = CONFIG_DIR / "sysvarhub.env"
-MYSQL_ADMIN_FILE = CONFIG_DIR / "mysql-admin.env"
+MYSQL_ADMIN_FILE = CONFIG_DIR / "mysql-admin.cnf"
 ACL_SYSTEM = "*S-1-5-18:F"
 ACL_ADMINISTRATORS = "*S-1-5-32-544:F"
 
@@ -117,5 +117,15 @@ def create_default_env(install_root=PROGRAM_FILES_ROOT, program_data=PROGRAM_DAT
 
 def create_mysql_admin_file():
     admin_password = generate_secret(48)
-    write_locked_file(MYSQL_ADMIN_FILE, f"MYSQL_ADMIN_PASSWORD={admin_password}\n")
+    content = "\n".join(
+        [
+            "[client]",
+            "user=root",
+            f"password={admin_password}",
+            "host=127.0.0.1",
+            "port=3307",
+            "",
+        ]
+    )
+    write_locked_file(MYSQL_ADMIN_FILE, content)
     return admin_password
