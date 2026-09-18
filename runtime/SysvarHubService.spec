@@ -32,6 +32,7 @@ hiddenimports += collect_submodules("rest_framework", filter=lambda name: ".test
 hiddenimports += collect_submodules("django_filters", filter=lambda name: ".tests" not in name)
 hiddenimports += collect_submodules("drf_yasg", filter=lambda name: ".tests" not in name)
 hiddenimports += collect_submodules("corsheaders", filter=lambda name: ".tests" not in name)
+hiddenimports += collect_submodules("whitenoise", filter=lambda name: ".tests" not in name)
 datas = collect_data_files("coreschema")
 
 a = Analysis(

@@ -222,6 +222,61 @@ class WindowsRuntimeTests(SimpleTestCase):
         self.assertIn('collect_submodules("integracao"', spec)
         self.assertIn('collect_submodules("sysvarhub"', spec)
 
+    def test_pyinstaller_spec_coleta_submodulos_whitenoise(self):
+        spec = Path(settings.BASE_DIR, "runtime", "SysvarHubService.spec").read_text(encoding="utf-8")
+
+        self.assertIn('"whitenoise"', spec)
+        self.assertIn('collect_submodules("whitenoise"', spec)
+        self.assertLess(spec.index('"whitenoise"'), spec.index('collect_submodules("whitenoise"'))
+
+    def test_build_installer_tem_gate_runtime_antes_do_inno(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "build-installer.ps1").read_text(encoding="utf-8")
+        gate_pos = script.index("Invoke-RuntimeGate -RuntimeRoot")
+        iscc_pos = script.index("& $Iscc")
+
+        self.assertLess(gate_pos, iscc_pos)
+        self.assertIn("function Invoke-RuntimeGate", script)
+        self.assertIn('throw "Gate runtime falhou em manage check empacotado."', script)
+
+    def test_build_installer_gate_valida_imports_dinamicos_empacotados(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "build-installer.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("& $RuntimeExe manage shell -c $ImportCheck", script)
+        self.assertIn("'whitenoise.middleware.WhiteNoiseMiddleware'", script)
+        self.assertIn("'whitenoise.storage.CompressedManifestStaticFilesStorage'", script)
+        self.assertIn("'corsheaders.middleware.CorsMiddleware'", script)
+        self.assertIn("'django_filters.rest_framework.DjangoFilterBackend'", script)
+        self.assertIn("'rest_framework.authentication.TokenAuthentication'", script)
+        self.assertIn("'rest_framework.authentication.SessionAuthentication'", script)
+        self.assertIn("'rest_framework.permissions.IsAuthenticated'", script)
+        self.assertIn("'rest_framework.pagination.PageNumberPagination'", script)
+        self.assertIn("importlib.import_module(settings.DATABASES['default']['ENGINE'] + '.base')", script)
+        self.assertIn("import_string(settings.STATICFILES_STORAGE)", script)
+
+    def test_build_installer_gate_sobe_console_e_testa_http(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "build-installer.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('$StartInfo.ArgumentList.Add("console")', script)
+        self.assertIn('Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health/"', script)
+        self.assertIn('$HealthResponse.status -ne "ok"', script)
+        self.assertIn('$HealthResponse.service -ne "sysvar-hub"', script)
+        self.assertIn('Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/"', script)
+        self.assertIn('GET / OK', script)
+
+    def test_build_installer_gate_usa_programdata_temporario_e_nao_servicos_reais(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "build-installer.ps1").read_text(encoding="utf-8")
+        gate_block = script[script.index("function Invoke-RuntimeGate"):script.index("$ResolvedBackend =")]
+
+        self.assertIn("sysvarhub-runtime-smoke-", gate_block)
+        self.assertIn('$StartInfo.Environment["SYSVARHUB_PROGRAMDATA"] = $SmokeRoot', gate_block)
+        self.assertIn("Remove-Item -LiteralPath $SmokeRoot -Recurse -Force", gate_block)
+        self.assertIn("finally", gate_block)
+        self.assertIn("$Process.Kill()", gate_block)
+        self.assertNotIn("Start-Service", gate_block)
+        self.assertNotIn("Stop-Service", gate_block)
+        self.assertNotIn("--startup auto install", gate_block)
+        self.assertNotIn("sc.exe", gate_block)
+
 
 class WindowsUninstallScriptTests(SimpleTestCase):
     def test_uninstall_hub_nao_remove_install_root(self):

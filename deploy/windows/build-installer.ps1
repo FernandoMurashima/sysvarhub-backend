@@ -36,6 +36,142 @@ function Assert-MySqlRoot {
     return (Resolve-Path $Root).Path
 }
 
+function Get-FreeTcpPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse("127.0.0.1"), 0)
+    try {
+        $listener.Start()
+        return $listener.LocalEndpoint.Port
+    } finally {
+        $listener.Stop()
+    }
+}
+
+function New-RuntimeSmokeProgramData {
+    param(
+        [string]$Root,
+        [string]$FrontendRoot,
+        [int]$Port
+    )
+
+    $ConfigRoot = Join-Path $Root "config"
+    New-Item -ItemType Directory -Force -Path $ConfigRoot, (Join-Path $Root "logs"), (Join-Path $Root "data") | Out-Null
+
+    $EnvFile = Join-Path $ConfigRoot "sysvarhub.env"
+    $EnvLines = @(
+        "DJANGO_SECRET_KEY=build-smoke-$([guid]::NewGuid().ToString('N'))",
+        "DJANGO_DEBUG=False",
+        "DJANGO_ALLOWED_HOSTS=127.0.0.1,localhost",
+        "DJANGO_CSRF_TRUSTED_ORIGINS=http://127.0.0.1:$Port,http://localhost:$Port",
+        "CORS_ALLOWED_ORIGINS=http://127.0.0.1:$Port,http://localhost:$Port",
+        "DB_NAME=sysvarhub_db",
+        "DB_USER=sysvarhub",
+        "DB_PASSWORD=build-smoke-password",
+        "DB_HOST=127.0.0.1",
+        "DB_PORT=3307",
+        "HUB_BIND_HOST=127.0.0.1",
+        "HUB_PORT=$Port",
+        "SYSVARHUB_LOG_DIR=$(Join-Path $Root 'logs')",
+        "SYSVARHUB_FRONTEND_DIST_DIR=$FrontendRoot"
+    )
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($EnvFile, $EnvLines, $Utf8NoBom)
+}
+
+function Invoke-RuntimeGate {
+    param(
+        [string]$RuntimeRoot,
+        [string]$FrontendRoot
+    )
+
+    $RuntimeExe = Join-Path $RuntimeRoot "SysvarHubService.exe"
+    if (-not (Test-Path $RuntimeExe)) { throw "SysvarHubService.exe ausente no staging." }
+
+    $SmokeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sysvarhub-runtime-smoke-" + [guid]::NewGuid().ToString("N"))
+    $Port = Get-FreeTcpPort
+    $PreviousProgramData = $env:SYSVARHUB_PROGRAMDATA
+    $Process = $null
+
+    try {
+        New-RuntimeSmokeProgramData -Root $SmokeRoot -FrontendRoot $FrontendRoot -Port $Port
+        $env:SYSVARHUB_PROGRAMDATA = $SmokeRoot
+
+        & $RuntimeExe manage check
+        if ($LASTEXITCODE -ne 0) { throw "Gate runtime falhou em manage check empacotado." }
+        Write-Host "Gate runtime: manage check empacotado OK."
+
+        $ImportCheck = @"
+from django.conf import settings
+from django.utils.module_loading import import_string
+import importlib
+
+imports = [
+    'whitenoise.middleware.WhiteNoiseMiddleware',
+    'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    'corsheaders.middleware.CorsMiddleware',
+    'django_filters.rest_framework.DjangoFilterBackend',
+    'rest_framework.authentication.TokenAuthentication',
+    'rest_framework.authentication.SessionAuthentication',
+    'rest_framework.permissions.IsAuthenticated',
+    'rest_framework.pagination.PageNumberPagination',
+]
+for dotted_path in imports:
+    import_string(dotted_path)
+import_string(settings.STATICFILES_STORAGE)
+importlib.import_module(settings.DATABASES['default']['ENGINE'] + '.base')
+print('dynamic imports ok')
+"@
+        & $RuntimeExe manage shell -c $ImportCheck
+        if ($LASTEXITCODE -ne 0) { throw "Gate runtime falhou na auditoria de imports dinamicos empacotados." }
+        Write-Host "Gate runtime: imports dinamicos empacotados OK."
+
+        $StartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $StartInfo.FileName = $RuntimeExe
+        $StartInfo.ArgumentList.Add("console")
+        $StartInfo.UseShellExecute = $false
+        $StartInfo.RedirectStandardOutput = $true
+        $StartInfo.RedirectStandardError = $true
+        $StartInfo.Environment["SYSVARHUB_PROGRAMDATA"] = $SmokeRoot
+        $Process = [System.Diagnostics.Process]::Start($StartInfo)
+
+        $Deadline = (Get-Date).AddSeconds(45)
+        $HealthResponse = $null
+        while ((Get-Date) -lt $Deadline) {
+            if ($Process.HasExited) {
+                $stdout = $Process.StandardOutput.ReadToEnd()
+                $stderr = $Process.StandardError.ReadToEnd()
+                throw "Gate runtime falhou: console encerrou antes do health check. stdout=$stdout stderr=$stderr"
+            }
+            try {
+                $HealthResponse = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health/" -TimeoutSec 2
+                break
+            } catch {
+                Start-Sleep -Milliseconds 500
+            }
+        }
+
+        if ($null -eq $HealthResponse) { throw "Gate runtime falhou: timeout aguardando /api/health/." }
+        if ($HealthResponse.status -ne "ok" -or $HealthResponse.service -ne "sysvar-hub") {
+            throw "Gate runtime falhou: payload invalido em /api/health/."
+        }
+        Write-Host "Gate runtime: /api/health/ OK."
+
+        $IndexResponse = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/" -TimeoutSec 5
+        if ($IndexResponse.StatusCode -ne 200) { throw "Gate runtime falhou: GET / retornou HTTP $($IndexResponse.StatusCode)." }
+        Write-Host "Gate runtime: GET / OK."
+    } finally {
+        if ($Process -and -not $Process.HasExited) {
+            $Process.Kill()
+            $Process.WaitForExit()
+        }
+        if ($null -eq $PreviousProgramData) {
+            Remove-Item Env:\SYSVARHUB_PROGRAMDATA -ErrorAction SilentlyContinue
+        } else {
+            $env:SYSVARHUB_PROGRAMDATA = $PreviousProgramData
+        }
+        Remove-Item -LiteralPath $SmokeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $ResolvedBackend = (Resolve-Path $BackendRoot).Path
 $ResolvedFrontend = (Resolve-Path $FrontendRoot).Path
 $ResolvedMySql = Assert-MySqlRoot $MySqlRoot
@@ -86,6 +222,8 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot "sysvarhub.env.example") -Destin
 if (-not (Test-Path (Join-Path $StagingRoot "mysql\bin\mysqld.exe"))) { throw "mysqld.exe ausente no staging." }
 if (-not (Test-Path (Join-Path $StagingRoot "mysql\bin\mysql.exe"))) { throw "mysql.exe ausente no staging." }
 if (-not (Test-Path (Join-Path $StagingRoot "frontend\index.html"))) { throw "Frontend ausente no staging." }
+
+Invoke-RuntimeGate -RuntimeRoot (Join-Path $StagingRoot "runtime") -FrontendRoot (Join-Path $StagingRoot "frontend")
 
 & $Iscc (Join-Path $PSScriptRoot "installer\SysvarHubSetup.iss")
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup falhou." }
