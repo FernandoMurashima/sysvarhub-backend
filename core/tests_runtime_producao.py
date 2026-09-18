@@ -184,6 +184,34 @@ class WindowsUninstallScriptTests(SimpleTestCase):
         self.assertIn('-InstallRoot ""{app}""', iss[uninstall_run_pos:])
 
 
+class WindowsInstallScriptTests(SimpleTestCase):
+    def test_install_hub_new_secret_usa_rng_compativel_com_windows_powershell(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+
+        self.assertNotIn("RandomNumberGenerator]::Fill", script)
+        self.assertIn("[System.Security.Cryptography.RandomNumberGenerator]::Create()", script)
+        self.assertIn("$rng.GetBytes($bytes)", script)
+        self.assertIn("$rng.Dispose()", script)
+        self.assertIn('[Convert]::ToBase64String($bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")', script)
+
+    def test_install_hub_nao_depende_de_powershell_7(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+
+        self.assertNotIn("pwsh", script.lower())
+        self.assertNotIn("pwsh", iss.lower())
+        self.assertIn(r"{sys}\WindowsPowerShell\v1.0\powershell.exe", iss)
+
+    def test_inno_setup_verifica_exit_code_do_install_hub(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+
+        self.assertIn("[Code]", iss)
+        self.assertIn("Exec(PowerShell, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)", iss)
+        self.assertIn("if ResultCode <> 0 then", iss)
+        self.assertIn("RaiseException('install-hub.ps1 retornou codigo de erro ' + IntToStr(ResultCode) + '.')", iss)
+        self.assertNotIn('[Run]\nFilename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\\scripts\\install-hub.ps1""', iss)
+
+
 class WindowsServiceLifecycleTests(SimpleTestCase):
     def test_runtime_armazena_servidor_controlavel(self):
         server = Mock()
