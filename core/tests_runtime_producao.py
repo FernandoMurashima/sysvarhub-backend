@@ -297,20 +297,57 @@ class WindowsUninstallScriptTests(SimpleTestCase):
     def test_uninstall_hub_remove_servicos_e_firewall(self):
         script = Path(settings.BASE_DIR, "deploy", "windows", "uninstall-hub.ps1").read_text(encoding="utf-8")
 
-        self.assertIn('@("SysvarHub", "SysvarHubMySQL")', script)
-        self.assertIn("Get-Service -Name $service -ErrorAction SilentlyContinue", script)
-        self.assertIn("Stop-Service -Name $service -Force -ErrorAction SilentlyContinue", script)
-        self.assertIn("sc.exe delete $service", script)
+        self.assertIn('Remove-ServiceAfterStop -Name "SysvarHub" -AllowServicePidKill', script)
+        self.assertIn('Remove-ServiceAfterStop -Name "SysvarHubMySQL"', script)
+        self.assertIn("Get-Service -Name $Name -ErrorAction SilentlyContinue", script)
+        self.assertIn("sc.exe delete $Name", script)
         self.assertIn('Get-NetFirewallRule -DisplayName "Sysvar Hub" -ErrorAction SilentlyContinue', script)
         self.assertIn("Remove-NetFirewallRule", script)
 
-    def test_inno_setup_chama_uninstall_hub_no_uninstall_run(self):
-        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
-        uninstall_run_pos = iss.index("[UninstallRun]")
-        uninstall_script_pos = iss.index("uninstall-hub.ps1", uninstall_run_pos)
+    def test_uninstall_hub_possui_parada_limitada_por_timeout(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "uninstall-hub.ps1").read_text(encoding="utf-8")
 
-        self.assertGreater(uninstall_script_pos, uninstall_run_pos)
-        self.assertIn('-InstallRoot ""{app}""', iss[uninstall_run_pos:])
+        self.assertIn("$ServiceStopTimeoutSeconds = 45", script)
+        self.assertIn("function Wait-ServiceStopped", script)
+        self.assertIn("$deadline = (Get-Date).AddSeconds($TimeoutSeconds)", script)
+        self.assertIn("while ((Get-Date) -lt $deadline)", script)
+        self.assertIn("throw \"Nao foi possivel parar o servico $Name dentro de $TimeoutSeconds segundos.", script)
+
+    def test_uninstall_hub_fallback_sysvarhub_usa_pid_associado_ao_servico(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "uninstall-hub.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('$Name -eq "SysvarHub"', script)
+        self.assertIn('$status -eq "StopPending"', script)
+        self.assertIn('Get-CimInstance Win32_Service -Filter "Name=\'$Name\'"', script)
+        self.assertIn("$pid = [int]$wmiService.ProcessId", script)
+        self.assertIn("if ($pid -gt 0)", script)
+        self.assertIn("Stop-Process -Id $pid -Force -ErrorAction Stop", script)
+
+    def test_uninstall_hub_nao_tem_kill_generico_de_hub_ou_mysql(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "uninstall-hub.ps1").read_text(encoding="utf-8")
+        lower_script = script.lower()
+
+        self.assertNotIn("taskkill", lower_script)
+        self.assertNotIn("sysvarhubservice.exe", lower_script)
+        self.assertNotIn("mysqld.exe", lower_script)
+        self.assertNotIn("get-process mysqld", lower_script)
+        self.assertNotIn("stop-process mysqld", lower_script)
+
+    def test_uninstall_hub_mysql_falha_de_forma_controlada_sem_forcar_processo(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "uninstall-hub.ps1").read_text(encoding="utf-8")
+        mysql_call_pos = script.index('Remove-ServiceAfterStop -Name "SysvarHubMySQL"')
+
+        self.assertNotIn("AllowServicePidKill", script[mysql_call_pos:mysql_call_pos + 80])
+        self.assertIn("throw \"Nao foi possivel parar o servico $Name", script)
+
+    def test_inno_setup_chama_uninstall_hub_com_exit_code_verificado(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+        uninstall_proc_pos = iss.index("procedure RunUninstallHubScript")
+        uninstall_script_pos = iss.index("uninstall-hub.ps1", uninstall_proc_pos)
+
+        self.assertGreater(uninstall_script_pos, uninstall_proc_pos)
+        self.assertIn('if ResultCode <> 0 then', iss[uninstall_proc_pos:])
+        self.assertIn("Abort;", iss[uninstall_proc_pos:])
 
 
 class WindowsInstallScriptTests(SimpleTestCase):
@@ -472,15 +509,18 @@ class WindowsInstallerReinstallTests(SimpleTestCase):
         self.assertIn("function StopServiceForInstall(ServiceName: String): String;", iss)
         self.assertIn("StopServiceForInstall('SysvarHub')", iss)
         self.assertIn("StopServiceForInstall('SysvarHubMySQL')", iss)
+        self.assertIn("StopSysvarLocalAgentIfNeeded", iss)
 
-    def test_inno_setup_para_hub_antes_do_mysql(self):
+    def test_inno_setup_para_hub_mysql_e_agent_antes_da_copia(self):
         iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
         hub_pos = iss.index("StopServiceForInstall('SysvarHub')")
         mysql_pos = iss.index("StopServiceForInstall('SysvarHubMySQL')")
+        agent_pos = iss.index("StopSysvarLocalAgentIfNeeded", mysql_pos)
         post_install_pos = iss.index("if CurStep = ssPostInstall then")
 
         self.assertLess(hub_pos, mysql_pos)
-        self.assertLess(mysql_pos, post_install_pos)
+        self.assertLess(mysql_pos, agent_pos)
+        self.assertLess(agent_pos, post_install_pos)
 
     def test_inno_setup_aceita_servico_inexistente_ou_ja_parado(self):
         iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
@@ -508,6 +548,49 @@ class WindowsInstallerReinstallTests(SimpleTestCase):
         self.assertNotIn("delete SysvarHub", prepare_block)
         self.assertNotIn("Remove-Item", prepare_block)
         self.assertNotIn("ProgramData", prepare_block)
+
+    def test_inno_setup_registra_estado_original_do_sysvarlocalagent(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+
+        self.assertIn("SysvarLocalAgentWasRunning: Boolean", iss)
+        self.assertIn("SysvarLocalAgentTouched: Boolean", iss)
+        self.assertIn("GetServiceStatus('SysvarLocalAgent', Status)", iss)
+        self.assertIn("if Status = 'Running' then", iss)
+        self.assertIn("SysvarLocalAgentWasRunning := True", iss)
+        self.assertIn("SysvarLocalAgentTouched := True", iss)
+
+    def test_inno_setup_restaura_sysvarlocalagent_somente_se_estava_rodando(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+        restore_block = iss[iss.index("procedure RestoreSysvarLocalAgent"):iss.index("function PrepareToInstall")]
+
+        self.assertIn("if (not SysvarLocalAgentTouched) or (not SysvarLocalAgentWasRunning) then", restore_block)
+        self.assertIn("Start-Service -Name ''SysvarLocalAgent'' -ErrorAction Stop", restore_block)
+        self.assertIn("$service.Status -eq ''Running''", restore_block)
+
+    def test_inno_setup_restaura_sysvarlocalagent_em_sucesso_falha_e_cancelamento(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+
+        self.assertIn("RestoreSysvarLocalAgent;", iss[iss.index("procedure CurStepChanged"):])
+        self.assertIn("procedure DeinitializeSetup()", iss)
+        self.assertIn("procedure DeinitializeUninstall()", iss)
+
+    def test_inno_setup_desinstalacao_coordena_sysvarlocalagent(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+        uninstall_block = iss[iss.index("procedure CurUninstallStepChanged"):iss.index("procedure DeinitializeUninstall")]
+
+        self.assertIn("if CurUninstallStep = usUninstall then", uninstall_block)
+        self.assertIn("ErrorMessage := StopSysvarLocalAgentIfNeeded", uninstall_block)
+        self.assertIn("RunUninstallHubScript", uninstall_block)
+        self.assertIn("if CurUninstallStep = usPostUninstall then", uninstall_block)
+        self.assertIn("RestoreSysvarLocalAgent", uninstall_block)
+
+    def test_inno_setup_tem_limpeza_final_segura_do_app(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+
+        self.assertIn("[UninstallDelete]", iss)
+        self.assertIn('Type: files; Name: "{app}\\is-*.tmp"', iss)
+        self.assertIn('Type: dirifempty; Name: "{app}"', iss)
+        self.assertNotIn("{commonappdata}\\SysvarHub", iss[iss.index("[UninstallDelete]"):iss.index("[Code]")])
 
     def test_inno_setup_mantem_install_hub_no_sspostinstall(self):
         iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")

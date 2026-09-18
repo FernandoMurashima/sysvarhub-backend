@@ -30,12 +30,15 @@ Name: "{group}\Verificar Status"; Filename: "powershell.exe"; Parameters: "-Exec
 Name: "{group}\Configurar Sysvar Hub"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\configurar-hub.ps1"""
 Name: "{group}\Abrir Logs"; Filename: "{commonappdata}\SysvarHub\logs"
 
-[UninstallRun]
-Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\uninstall-hub.ps1"" -InstallRoot ""{app}"""; Flags: runhidden waituntilterminated
+[UninstallDelete]
+Type: files; Name: "{app}\is-*.tmp"
+Type: dirifempty; Name: "{app}"
 
 [Code]
 var
   InstallHubFailed: Boolean;
+  SysvarLocalAgentWasRunning: Boolean;
+  SysvarLocalAgentTouched: Boolean;
 
 procedure FailInstallHub(Message: String);
 begin
@@ -79,8 +82,79 @@ begin
   Result := '';
 end;
 
+function GetServiceStatus(ServiceName: String; var Status: String): Boolean;
+var
+  ResultCode: Integer;
+  PowerShell: String;
+  Parameters: String;
+  OutputFile: String;
+  LoadedStatus: AnsiString;
+begin
+  Result := False;
+  Status := '';
+  OutputFile := ExpandConstant('{tmp}\sysvarhub-service-status.txt');
+  DeleteFile(OutputFile);
+  PowerShell := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  Parameters :=
+    '-NoProfile -ExecutionPolicy Bypass -Command "' +
+    '$service = Get-Service -Name ''' + ServiceName + ''' -ErrorAction SilentlyContinue; ' +
+    'if ($null -eq $service) { exit 3 }; ' +
+    '[System.IO.File]::WriteAllText(''' + OutputFile + ''', [string]$service.Status); exit 0"';
+
+  if Exec(PowerShell, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+  begin
+    if LoadStringFromFile(OutputFile, LoadedStatus) then
+    begin
+      Status := LoadedStatus;
+      Result := True;
+    end;
+  end;
+  DeleteFile(OutputFile);
+end;
+
+function StopSysvarLocalAgentIfNeeded: String;
+var
+  Status: String;
+begin
+  Result := '';
+  if not GetServiceStatus('SysvarLocalAgent', Status) then
+  begin
+    exit;
+  end;
+
+  if Status = 'Running' then
+  begin
+    SysvarLocalAgentWasRunning := True;
+    SysvarLocalAgentTouched := True;
+    Result := StopServiceForInstall('SysvarLocalAgent');
+  end;
+end;
+
+procedure RestoreSysvarLocalAgent;
+var
+  ResultCode: Integer;
+  PowerShell: String;
+  Parameters: String;
+begin
+  if (not SysvarLocalAgentTouched) or (not SysvarLocalAgentWasRunning) then
+  begin
+    exit;
+  end;
+
+  PowerShell := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  Parameters :=
+    '-NoProfile -ExecutionPolicy Bypass -Command "' +
+    '$service = Get-Service -Name ''SysvarLocalAgent'' -ErrorAction SilentlyContinue; ' +
+    'if ($null -eq $service -or $service.Status -eq ''Running'') { exit 0 }; ' +
+    'Start-Service -Name ''SysvarLocalAgent'' -ErrorAction Stop; exit 0"';
+  Exec(PowerShell, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
+  SysvarLocalAgentWasRunning := False;
+  SysvarLocalAgentTouched := False;
+
   Result := StopServiceForInstall('SysvarHub');
   if Result <> '' then
   begin
@@ -88,6 +162,12 @@ begin
   end;
 
   Result := StopServiceForInstall('SysvarHubMySQL');
+  if Result <> '' then
+  begin
+    exit;
+  end;
+
+  Result := StopSysvarLocalAgentIfNeeded;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -110,7 +190,64 @@ begin
     begin
       FailInstallHub('A instalacao operacional do Sysvar Hub falhou. Verifique os logs em C:\ProgramData\SysvarHub\logs antes de tentar novamente.');
     end;
+
+    RestoreSysvarLocalAgent;
   end;
+end;
+
+procedure DeinitializeSetup();
+begin
+  RestoreSysvarLocalAgent;
+end;
+
+procedure RunUninstallHubScript;
+var
+  ResultCode: Integer;
+  PowerShell: String;
+  Parameters: String;
+begin
+  PowerShell := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  Parameters := ExpandConstant('-NoProfile -ExecutionPolicy Bypass -File "{app}\scripts\uninstall-hub.ps1" -InstallRoot "{app}"');
+
+  if not Exec(PowerShell, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    MsgBox('Falha ao iniciar a limpeza operacional do Sysvar Hub.', mbError, MB_OK);
+    Abort;
+  end;
+
+  if ResultCode <> 0 then
+  begin
+    MsgBox('A limpeza operacional do Sysvar Hub falhou. Verifique a parada dos servicos SysvarHub e SysvarHubMySQL antes de tentar novamente.', mbError, MB_OK);
+    Abort;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ErrorMessage: String;
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    SysvarLocalAgentWasRunning := False;
+    SysvarLocalAgentTouched := False;
+    ErrorMessage := StopSysvarLocalAgentIfNeeded;
+    if ErrorMessage <> '' then
+    begin
+      MsgBox(ErrorMessage, mbError, MB_OK);
+      Abort;
+    end;
+    RunUninstallHubScript;
+  end;
+
+  if CurUninstallStep = usPostUninstall then
+  begin
+    RestoreSysvarLocalAgent;
+  end;
+end;
+
+procedure DeinitializeUninstall();
+begin
+  RestoreSysvarLocalAgent;
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
