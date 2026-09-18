@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -15,6 +16,7 @@ from runtime.windows_runtime import (
     create_default_env,
     create_mysql_admin_file,
     generate_secret,
+    load_env_file,
     local_hostnames_and_ips,
     merge_csv,
     write_locked_file,
@@ -116,6 +118,35 @@ class WindowsRuntimeTests(SimpleTestCase):
         self.assertIn("SYSVARHUB_FRONTEND_DIST_DIR=", content)
         self.assertNotIn("dev-insecure-sysvarhub-change-me", content)
 
+    def test_load_env_file_aceita_utf8_com_bom_na_primeira_variavel(self):
+        with TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            env_file = Path(temp_dir) / "sysvarhub.env"
+            env_file.write_bytes(
+                b"\xef\xbb\xbfDJANGO_SECRET_KEY=segredo-teste\n"
+                b"DJANGO_DEBUG=False\n"
+            )
+
+            loaded = load_env_file(env_file)
+
+        self.assertEqual(loaded["DJANGO_SECRET_KEY"], "segredo-teste")
+        self.assertEqual(loaded["DJANGO_DEBUG"], "False")
+        self.assertNotIn("\ufeffDJANGO_SECRET_KEY", loaded)
+
+    def test_load_env_file_aceita_utf8_sem_bom_na_primeira_variavel(self):
+        with TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            env_file = Path(temp_dir) / "sysvarhub.env"
+            env_file.write_text(
+                "DJANGO_SECRET_KEY=segredo-teste\n"
+                "DJANGO_DEBUG=False\n",
+                encoding="utf-8",
+            )
+
+            loaded = load_env_file(env_file)
+
+        self.assertEqual(loaded["DJANGO_SECRET_KEY"], "segredo-teste")
+        self.assertEqual(loaded["DJANGO_DEBUG"], "False")
+        self.assertNotIn("\ufeffDJANGO_SECRET_KEY", loaded)
+
     def test_mysql_admin_file_usa_formato_canonico_cnf(self):
         with TemporaryDirectory() as temp_dir:
             import runtime.windows_runtime as windows_runtime
@@ -160,6 +191,24 @@ class WindowsRuntimeTests(SimpleTestCase):
         self.assertIn("/inheritance:r", script)
         self.assertNotIn("Administrators:F", script)
         self.assertNotIn("SYSTEM:F", script)
+
+    def test_install_hub_cria_sysvarhub_env_utf8_sem_bom_compativel_com_ps51(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+        env_block = script[script.index("if (-not (Test-Path $EnvFile))"):script.index("if (-not (Test-Path $MyIni))")]
+
+        self.assertIn("$EnvLines = @(", env_block)
+        self.assertIn("New-Object System.Text.UTF8Encoding($false)", env_block)
+        self.assertIn("[System.IO.File]::WriteAllLines($EnvFile, $EnvLines, $Utf8NoBom)", env_block)
+        self.assertNotIn("Set-Content -LiteralPath $EnvFile -Encoding UTF8", env_block)
+        self.assertIn("Protect-SecretFile $EnvFile", env_block)
+
+    def test_install_hub_nao_reescreve_sysvarhub_env_existente_para_remover_bom(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+        env_block = script[script.index("if (-not (Test-Path $EnvFile))"):script.index("if (-not (Test-Path $MyIni))")]
+
+        self.assertTrue(env_block.strip().startswith("if (-not (Test-Path $EnvFile))"))
+        self.assertIn("[System.IO.File]::WriteAllLines($EnvFile, $EnvLines, $Utf8NoBom)", env_block)
+        self.assertNotIn("Remove-Item", env_block)
 
     def test_pyinstaller_spec_resolve_backend_root_para_collect_e_pathex(self):
         spec = Path(settings.BASE_DIR, "runtime", "SysvarHubService.spec").read_text(encoding="utf-8")

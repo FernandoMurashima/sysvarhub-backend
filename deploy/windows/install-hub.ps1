@@ -139,7 +139,7 @@ function Set-MySqlRootPasswordFromAdminFile {
 if (-not (Test-Path $EnvFile)) {
     $SecretKey = New-Secret 64
     $DbPassword = New-Secret 48
-    @(
+    $EnvLines = @(
         "DJANGO_SECRET_KEY=$SecretKey",
         "DJANGO_DEBUG=False",
         "DJANGO_ALLOWED_HOSTS=127.0.0.1,localhost",
@@ -154,7 +154,9 @@ if (-not (Test-Path $EnvFile)) {
         "HUB_PORT=8000",
         "SYSVARHUB_LOG_DIR=$LogRoot",
         "SYSVARHUB_FRONTEND_DIST_DIR=$(Join-Path $InstallRoot 'frontend')"
-    ) | Set-Content -LiteralPath $EnvFile -Encoding UTF8
+    )
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines($EnvFile, $EnvLines, $Utf8NoBom)
     Protect-SecretFile $EnvFile
 }
 
