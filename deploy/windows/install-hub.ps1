@@ -225,7 +225,7 @@ if ($LASTEXITCODE -ne 0) { throw "Migrations falharam." }
 if ($LASTEXITCODE -ne 0) { throw "Preparacao da instalacao falhou." }
 
 if (-not (Get-Service -Name "SysvarHub" -ErrorAction SilentlyContinue)) {
-    & $ServiceExe install --startup auto
+    & $ServiceExe --startup auto install
     if ($LASTEXITCODE -ne 0) { throw "Registro do servico SysvarHub falhou." }
 }
 sc.exe config SysvarHub depend= SysvarHubMySQL start= delayed-auto | Out-Null

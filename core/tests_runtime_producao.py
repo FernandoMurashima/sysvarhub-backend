@@ -9,6 +9,7 @@ from django.test import Client, SimpleTestCase, override_settings
 from django.urls import resolve
 
 from sysvarhub.urls import angular_spa
+import runtime.windows_service as windows_service
 from runtime.windows_runtime import (
     ACL_ADMINISTRATORS,
     ACL_SYSTEM,
@@ -381,6 +382,12 @@ class WindowsInstallScriptTests(SimpleTestCase):
         self.assertIn('-InputSql "ALTER USER', script)
         self.assertIn('-InputSql "CREATE DATABASE', script)
 
+    def test_install_hub_registra_servico_com_startup_antes_do_install(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("& $ServiceExe --startup auto install", script)
+        self.assertNotIn("& $ServiceExe install --startup auto", script)
+
     def test_runtime_nao_mantem_mysql_admin_env_concorrente(self):
         runtime = Path(settings.BASE_DIR, "runtime", "windows_runtime.py").read_text(encoding="utf-8")
 
@@ -398,7 +405,7 @@ class WindowsInstallScriptTests(SimpleTestCase):
         self.assertIn("[Code]", iss)
         self.assertIn("Exec(PowerShell, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)", iss)
         self.assertIn("if ResultCode <> 0 then", iss)
-        self.assertIn("RaiseException('install-hub.ps1 retornou codigo de erro ' + IntToStr(ResultCode) + '.')", iss)
+        self.assertIn("FailInstallHub('A instalacao operacional do Sysvar Hub falhou.", iss)
         self.assertNotIn('[Run]\nFilename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\\scripts\\install-hub.ps1""', iss)
 
 
@@ -455,6 +462,24 @@ class WindowsInstallerReinstallTests(SimpleTestCase):
         self.assertGreater(install_script_pos, post_install_pos)
         self.assertIn("Exec(PowerShell, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)", iss[post_install_pos:])
 
+    def test_inno_setup_falha_do_install_hub_nao_mostra_pagina_final_de_sucesso(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+
+        self.assertIn("InstallHubFailed: Boolean", iss)
+        self.assertIn("procedure FailInstallHub(Message: String);", iss)
+        self.assertIn("InstallHubFailed := True", iss)
+        self.assertIn("Abort;", iss)
+        self.assertIn("function ShouldSkipPage(PageID: Integer): Boolean;", iss)
+        self.assertIn("Result := InstallHubFailed and (PageID = wpFinished);", iss)
+        self.assertNotIn("Setup has finished installing Sysvar Hub", iss)
+
+    def test_inno_setup_exit_code_zero_permite_finalizacao(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+        post_install_block = iss[iss.index("procedure CurStepChanged"):iss.index("function ShouldSkipPage")]
+
+        self.assertIn("if ResultCode <> 0 then", post_install_block)
+        self.assertNotIn("InstallHubFailed := True;", post_install_block[:post_install_block.index("if ResultCode <> 0 then")])
+
 
 class WindowsServiceLifecycleTests(SimpleTestCase):
     def test_runtime_armazena_servidor_controlavel(self):
@@ -481,6 +506,56 @@ class WindowsServiceLifecycleTests(SimpleTestCase):
 
     def test_stop_runtime_ignora_runtime_ausente(self):
         stop_runtime(None)
+
+    def test_main_manage_preserva_cli_django(self):
+        with patch.object(windows_service.sys, "argv", ["SysvarHubService.exe", "manage", "check"]), \
+                patch("runtime.windows_service.run_manage") as run_manage:
+            windows_service.main()
+
+        run_manage.assert_called_once_with(["check"])
+
+    def test_main_console_preserva_cli_console(self):
+        with patch.object(windows_service.sys, "argv", ["SysvarHubService.exe", "console"]), \
+                patch("runtime.windows_service.run_console") as run_console:
+            windows_service.main()
+
+        run_console.assert_called_once_with()
+
+    def test_main_comando_administrativo_usa_handle_command_line(self):
+        command_line = Mock()
+        service_class = object()
+
+        with patch.object(windows_service.sys, "argv", ["SysvarHubService.exe", "install"]), \
+                patch.object(windows_service, "win32serviceutil", Mock(HandleCommandLine=command_line)), \
+                patch.object(windows_service, "SysvarHubService", service_class, create=True), \
+                patch("runtime.windows_service.run_service_dispatcher") as dispatcher:
+            windows_service.main()
+
+        command_line.assert_called_once_with(service_class)
+        dispatcher.assert_not_called()
+
+    def test_main_sem_argumentos_entra_no_dispatcher_scm(self):
+        with patch.object(windows_service.sys, "argv", ["SysvarHubService.exe"]), \
+                patch("runtime.windows_service.run_service_dispatcher") as dispatcher, \
+                patch.object(windows_service, "win32serviceutil", Mock()):
+            windows_service.main()
+
+        dispatcher.assert_called_once_with()
+
+    def test_dispatcher_scm_hospeda_sysvarhubservice_sem_handle_command_line(self):
+        service_manager = Mock()
+        command_line = Mock()
+        service_class = object()
+
+        with patch.object(windows_service, "servicemanager", service_manager), \
+                patch.object(windows_service, "win32serviceutil", Mock(HandleCommandLine=command_line)), \
+                patch.object(windows_service, "SysvarHubService", service_class, create=True):
+            windows_service.run_service_dispatcher()
+
+        service_manager.Initialize.assert_called_once_with()
+        service_manager.PrepareToHostSingle.assert_called_once_with(service_class)
+        service_manager.StartServiceCtrlDispatcher.assert_called_once_with()
+        command_line.assert_not_called()
 
     def test_check_hub_script_tem_retry_e_timeout(self):
         script = Path(settings.BASE_DIR, "deploy", "windows", "check-hub.ps1").read_text(encoding="utf-8")

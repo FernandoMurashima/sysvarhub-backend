@@ -68,6 +68,15 @@ def run_manage(argv):
     execute_from_command_line(["SysvarHubService.exe", *argv])
 
 
+def run_service_dispatcher(service_class=None):
+    if servicemanager is None:
+        raise RuntimeError("pywin32 nao esta disponivel para executar servico Windows.")
+    service_class = service_class or SysvarHubService
+    servicemanager.Initialize()
+    servicemanager.PrepareToHostSingle(service_class)
+    servicemanager.StartServiceCtrlDispatcher()
+
+
 try:
     import win32event
     import win32service
@@ -106,7 +115,11 @@ if win32serviceutil is not None:
 
 
 def main():
-    command = sys.argv[1] if len(sys.argv) > 1 else "service"
+    if len(sys.argv) == 1:
+        run_service_dispatcher()
+        return
+
+    command = sys.argv[1]
     if command == "console":
         run_console()
         return

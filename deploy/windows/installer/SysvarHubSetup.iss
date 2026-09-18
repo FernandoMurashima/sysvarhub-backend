@@ -34,6 +34,16 @@ Name: "{group}\Abrir Logs"; Filename: "{commonappdata}\SysvarHub\logs"
 Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\uninstall-hub.ps1"" -InstallRoot ""{app}"""; Flags: runhidden waituntilterminated
 
 [Code]
+var
+  InstallHubFailed: Boolean;
+
+procedure FailInstallHub(Message: String);
+begin
+  InstallHubFailed := True;
+  MsgBox(Message, mbError, MB_OK);
+  Abort;
+end;
+
 function StopServiceForInstall(ServiceName: String): String;
 var
   ResultCode: Integer;
@@ -93,14 +103,17 @@ begin
 
     if not Exec(PowerShell, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     begin
-      MsgBox('Falha ao iniciar a instalacao operacional do Sysvar Hub.', mbError, MB_OK);
-      RaiseException('Falha ao iniciar install-hub.ps1.');
+      FailInstallHub('Falha ao iniciar a instalacao operacional do Sysvar Hub.');
     end;
 
     if ResultCode <> 0 then
     begin
-      MsgBox('A instalacao operacional do Sysvar Hub falhou. Verifique os logs em C:\ProgramData\SysvarHub\logs antes de tentar novamente.', mbError, MB_OK);
-      RaiseException('install-hub.ps1 retornou codigo de erro ' + IntToStr(ResultCode) + '.');
+      FailInstallHub('A instalacao operacional do Sysvar Hub falhou. Verifique os logs em C:\ProgramData\SysvarHub\logs antes de tentar novamente.');
     end;
   end;
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := InstallHubFailed and (PageID = wpFinished);
 end;
