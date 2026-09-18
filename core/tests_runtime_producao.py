@@ -149,6 +149,41 @@ class WindowsRuntimeTests(SimpleTestCase):
         self.assertIn('collect_submodules("sysvarhub"', spec)
 
 
+class WindowsUninstallScriptTests(SimpleTestCase):
+    def test_uninstall_hub_nao_remove_install_root(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "uninstall-hub.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('$InstallRoot = "C:\\Program Files\\Sysvar Hub"', script)
+        self.assertNotIn("Remove-Item", script)
+        self.assertNotIn("Test-Path $InstallRoot", script)
+        self.assertNotIn("C:\\Program Files\\Sysvar Hub", script.replace('$InstallRoot = "C:\\Program Files\\Sysvar Hub"', ""))
+
+    def test_uninstall_hub_preserva_program_data(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "uninstall-hub.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("C:\\ProgramData\\SysvarHub foi preservado", script)
+        self.assertNotIn("purge-data.ps1", script)
+        self.assertNotIn("ProgramData\\SysvarHub", script.replace("C:\\ProgramData\\SysvarHub foi preservado", ""))
+
+    def test_uninstall_hub_remove_servicos_e_firewall(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "uninstall-hub.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('@("SysvarHub", "SysvarHubMySQL")', script)
+        self.assertIn("Get-Service -Name $service -ErrorAction SilentlyContinue", script)
+        self.assertIn("Stop-Service -Name $service -Force -ErrorAction SilentlyContinue", script)
+        self.assertIn("sc.exe delete $service", script)
+        self.assertIn('Get-NetFirewallRule -DisplayName "Sysvar Hub" -ErrorAction SilentlyContinue', script)
+        self.assertIn("Remove-NetFirewallRule", script)
+
+    def test_inno_setup_chama_uninstall_hub_no_uninstall_run(self):
+        iss = Path(settings.BASE_DIR, "deploy", "windows", "installer", "SysvarHubSetup.iss").read_text(encoding="utf-8")
+        uninstall_run_pos = iss.index("[UninstallRun]")
+        uninstall_script_pos = iss.index("uninstall-hub.ps1", uninstall_run_pos)
+
+        self.assertGreater(uninstall_script_pos, uninstall_run_pos)
+        self.assertIn('-InstallRoot ""{app}""', iss[uninstall_run_pos:])
+
+
 class WindowsServiceLifecycleTests(SimpleTestCase):
     def test_runtime_armazena_servidor_controlavel(self):
         server = Mock()

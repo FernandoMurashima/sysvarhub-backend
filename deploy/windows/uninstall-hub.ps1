@@ -16,8 +16,4 @@ foreach ($service in @("SysvarHub", "SysvarHubMySQL")) {
 
 Get-NetFirewallRule -DisplayName "Sysvar Hub" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 
-if (Test-Path $InstallRoot) {
-    Remove-Item -LiteralPath $InstallRoot -Recurse -Force
-}
-
-Write-Host "Sysvar Hub removido. C:\ProgramData\SysvarHub foi preservado."
+Write-Host "Limpeza operacional concluida. O Inno Setup removera os arquivos em Program Files. C:\ProgramData\SysvarHub foi preservado."
