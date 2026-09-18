@@ -46,11 +46,11 @@ function Stop-ServiceWithTimeout {
     $status = Get-ServiceStatus $Name
     if ($AllowServicePidKill -and $Name -eq "SysvarHub" -and $status -eq "StopPending") {
         $wmiService = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
-        $pid = 0
-        if ($wmiService) { $pid = [int]$wmiService.ProcessId }
-        if ($pid -gt 0) {
-            Write-Host "Servico $Name permaneceu em Stop Pending. Encerrando somente o PID associado ao servico: $pid."
-            Stop-Process -Id $pid -Force -ErrorAction Stop
+        $serviceProcessId = 0
+        if ($wmiService) { $serviceProcessId = [int]$wmiService.ProcessId }
+        if ($serviceProcessId -gt 0) {
+            Write-Host "Servico $Name permaneceu em Stop Pending. Encerrando somente o PID associado ao servico: $serviceProcessId."
+            Stop-Process -Id $serviceProcessId -Force -ErrorAction Stop
             if (Wait-ServiceStopped -Name $Name -TimeoutSeconds $ForcedHubStopTimeoutSeconds) { return }
         }
     }

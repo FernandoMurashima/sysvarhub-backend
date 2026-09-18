@@ -319,9 +319,11 @@ class WindowsUninstallScriptTests(SimpleTestCase):
         self.assertIn('$Name -eq "SysvarHub"', script)
         self.assertIn('$status -eq "StopPending"', script)
         self.assertIn('Get-CimInstance Win32_Service -Filter "Name=\'$Name\'"', script)
-        self.assertIn("$pid = [int]$wmiService.ProcessId", script)
-        self.assertIn("if ($pid -gt 0)", script)
-        self.assertIn("Stop-Process -Id $pid -Force -ErrorAction Stop", script)
+        self.assertIn("$serviceProcessId = [int]$wmiService.ProcessId", script)
+        self.assertIn("if ($serviceProcessId -gt 0)", script)
+        self.assertIn("Stop-Process -Id $serviceProcessId -Force -ErrorAction Stop", script)
+        self.assertNotIn("$pid = [int]$wmiService.ProcessId", script)
+        self.assertNotIn("Stop-Process -Id $pid", script)
 
     def test_uninstall_hub_nao_tem_kill_generico_de_hub_ou_mysql(self):
         script = Path(settings.BASE_DIR, "deploy", "windows", "uninstall-hub.ps1").read_text(encoding="utf-8")
