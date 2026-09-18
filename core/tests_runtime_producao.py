@@ -288,6 +288,50 @@ class WindowsInstallScriptTests(SimpleTestCase):
         self.assertIn("Wait-MySqlReady 60", script)
         self.assertNotIn("Start-Sleep -Seconds 5", script)
 
+    def test_install_hub_mysql_usa_argumentos_explicitos_sem_formas_compactas(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+
+        self.assertNotIn("-h127.0.0.1", script)
+        self.assertNotIn("-P3307", script)
+        self.assertNotIn("-uroot", script)
+        self.assertIn('"--host=127.0.0.1"', script)
+        self.assertIn('"--port=3307"', script)
+        self.assertIn('"--user=root"', script)
+        self.assertIn('"--connect-timeout=5"', script)
+        self.assertIn('"--defaults-extra-file=$MysqlAdminFile"', script)
+
+    def test_install_hub_mysql_probes_retornam_boolean_por_exit_code_sem_abortar_stderr(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+        helper_block = script[script.index("function Invoke-MySqlCommand"):script.index("function Get-MySqlAdminArgs")]
+
+        self.assertIn('[switch]$Probe', helper_block)
+        self.assertIn('$ErrorActionPreference = "Continue"', helper_block)
+        self.assertIn('2>&1', helper_block)
+        self.assertIn('$exitCode = $LASTEXITCODE', helper_block)
+        self.assertIn("if ($Probe)", helper_block)
+        self.assertIn("return ($exitCode -eq 0)", helper_block)
+        self.assertNotIn("catch", helper_block)
+        self.assertIn('$ErrorActionPreference = $previousErrorActionPreference', helper_block)
+
+    def test_install_hub_mysql_comandos_obrigatorios_falham_com_mensagem_controlada(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('throw $FailureMessage', script)
+        self.assertIn('-FailureMessage "Protecao do usuario administrativo MySQL falhou."', script)
+        self.assertIn('-FailureMessage "Preparacao do banco Sysvar Hub falhou."', script)
+        self.assertNotIn('if ($LASTEXITCODE -ne 0) { throw "Protecao do usuario administrativo MySQL falhou." }', script)
+        self.assertNotIn('if ($LASTEXITCODE -ne 0) { throw "Preparacao do banco Sysvar Hub falhou." }', script)
+
+    def test_install_hub_mysql_senhas_nao_entram_em_argumentos_do_processo(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+
+        self.assertNotIn('-e "ALTER USER', script)
+        self.assertNotIn('-e "CREATE DATABASE', script)
+        self.assertNotIn('IDENTIFIED BY \'$adminPassword\'" ', script)
+        self.assertNotIn('IDENTIFIED BY \'$DbPassword\'" ', script)
+        self.assertIn('-InputSql "ALTER USER', script)
+        self.assertIn('-InputSql "CREATE DATABASE', script)
+
     def test_runtime_nao_mantem_mysql_admin_env_concorrente(self):
         runtime = Path(settings.BASE_DIR, "runtime", "windows_runtime.py").read_text(encoding="utf-8")
 

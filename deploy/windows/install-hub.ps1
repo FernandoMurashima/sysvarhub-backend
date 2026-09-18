@@ -75,15 +75,51 @@ function Wait-MySqlReady([int]$TimeoutSeconds = 60) {
     }
 }
 
+function Invoke-MySqlCommand {
+    param(
+        [string[]]$Arguments,
+        [string]$InputSql,
+        [switch]$Probe,
+        [string]$FailureMessage = "Comando MySQL falhou."
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        if ($InputSql) {
+            $null = $InputSql | & $Mysql @Arguments 2>&1
+        } else {
+            $null = & $Mysql @Arguments 2>&1
+        }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if ($Probe) {
+        return ($exitCode -eq 0)
+    }
+
+    if ($exitCode -ne 0) {
+        throw $FailureMessage
+    }
+}
+
+function Get-MySqlAdminArgs {
+    return @("--defaults-extra-file=$MysqlAdminFile", "--host=127.0.0.1", "--port=3307", "--user=root", "--connect-timeout=5")
+}
+
+function Get-MySqlLocalRootArgs {
+    return @("--host=127.0.0.1", "--port=3307", "--user=root", "--connect-timeout=5")
+}
+
 function Test-MySqlAdminCredential {
     if (-not (Test-Path $MysqlAdminFile)) { return $false }
-    & $Mysql --defaults-extra-file="$MysqlAdminFile" --connect-timeout=5 -e "SELECT 1;" *> $null
-    return ($LASTEXITCODE -eq 0)
+    return (Invoke-MySqlCommand -Arguments (Get-MySqlAdminArgs) -InputSql "SELECT 1;" -Probe)
 }
 
 function Test-MySqlRootWithoutPassword {
-    & $Mysql -h127.0.0.1 -P3307 -uroot --connect-timeout=5 -e "SELECT 1;" *> $null
-    return ($LASTEXITCODE -eq 0)
+    return (Invoke-MySqlCommand -Arguments (Get-MySqlLocalRootArgs) -InputSql "SELECT 1;" -Probe)
 }
 
 function Set-MySqlRootPasswordFromAdminFile {
@@ -91,8 +127,10 @@ function Set-MySqlRootPasswordFromAdminFile {
     if (-not $adminPassword) {
         throw "Credencial administrativa local do MySQL esta ausente ou invalida."
     }
-    & $Mysql -h127.0.0.1 -P3307 -uroot --connect-timeout=5 -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$adminPassword'; FLUSH PRIVILEGES;"
-    if ($LASTEXITCODE -ne 0) { throw "Protecao do usuario administrativo MySQL falhou." }
+    Invoke-MySqlCommand `
+        -Arguments (Get-MySqlLocalRootArgs) `
+        -InputSql "ALTER USER 'root'@'localhost' IDENTIFIED BY '$adminPassword'; FLUSH PRIVILEGES;" `
+        -FailureMessage "Protecao do usuario administrativo MySQL falhou."
     if (-not (Test-MySqlAdminCredential)) {
         throw "Validacao da credencial administrativa local do MySQL falhou apos bootstrap."
     }
@@ -174,8 +212,10 @@ if ($NeedsRootPasswordBootstrap) {
     throw "Estado administrativo do MySQL inconsistente: credencial local ausente ou invalida, e root sem senha nao esta acessivel. Execute recuperacao explicita antes de reinstalar."
 }
 
-& $Mysql --defaults-extra-file="$MysqlAdminFile" -e "CREATE DATABASE IF NOT EXISTS sysvarhub_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE USER IF NOT EXISTS 'sysvarhub'@'127.0.0.1' IDENTIFIED BY '$DbPassword'; GRANT ALL PRIVILEGES ON sysvarhub_db.* TO 'sysvarhub'@'127.0.0.1'; FLUSH PRIVILEGES;"
-if ($LASTEXITCODE -ne 0) { throw "Preparacao do banco Sysvar Hub falhou." }
+Invoke-MySqlCommand `
+    -Arguments (Get-MySqlAdminArgs) `
+    -InputSql "CREATE DATABASE IF NOT EXISTS sysvarhub_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE USER IF NOT EXISTS 'sysvarhub'@'127.0.0.1' IDENTIFIED BY '$DbPassword'; GRANT ALL PRIVILEGES ON sysvarhub_db.* TO 'sysvarhub'@'127.0.0.1'; FLUSH PRIVILEGES;" `
+    -FailureMessage "Preparacao do banco Sysvar Hub falhou."
 
 & $ServiceExe manage migrate --noinput
 if ($LASTEXITCODE -ne 0) { throw "Migrations falharam." }
