@@ -1,5 +1,7 @@
 import io
 import json
+from pathlib import Path
+import tempfile
 import uuid
 from unittest.mock import patch
 
@@ -855,7 +857,93 @@ class CatalogoHubServiceTests(TestCase):
         self.assertEqual(self.hub.catalogo_versao, 1)
 
     def test_versao_desconhecida_rejeita(self):
-        self.assert_rejeita(self.resposta(catalogo_versao=2))
+        self.assert_rejeita(self.resposta(catalogo_versao=3))
+
+    def test_versao_2_com_imagem_persiste_metadados_e_baixa_foto(self):
+        class FakeClient:
+            chamadas = []
+
+            def baixar_catalogo_imagem(self, *, token, imagem_id, destino):
+                self.chamadas.append((token, imagem_id, destino))
+                destino.parent.mkdir(parents=True, exist_ok=True)
+                destino.write_bytes(b"foto")
+
+        item = self.item(imagem={"id": 55, "versao": "2026-09-19T10:00:00-03:00", "tipo": "reduzida"})
+        with tempfile.TemporaryDirectory() as tmp, patch("integracao.services.catalogo.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
+            client = FakeClient()
+            sincronizar_catalogo(self.hub, self.resposta([item], catalogo_versao=2), client=client)
+
+            catalogo = CatalogoItemHub.objects.get()
+            self.assertEqual(catalogo.imagem_retaguarda_id, 55)
+            self.assertEqual(catalogo.imagem_versao, "2026-09-19T10:00:00-03:00")
+            self.assertEqual(catalogo.imagem_tipo, "reduzida")
+            self.assertTrue((Path(tmp) / catalogo.imagem_local).is_file())
+            self.assertEqual(len(client.chamadas), 1)
+
+    def test_mesma_imagem_mesma_versao_nao_baixa_novamente(self):
+        class FakeClient:
+            chamadas = 0
+
+            def baixar_catalogo_imagem(self, *, token, imagem_id, destino):
+                self.chamadas += 1
+                destino.parent.mkdir(parents=True, exist_ok=True)
+                destino.write_bytes(b"foto")
+
+        item = self.item(imagem={"id": 55, "versao": "v1", "tipo": "original"})
+        with tempfile.TemporaryDirectory() as tmp, patch("integracao.services.catalogo.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
+            client = FakeClient()
+            sincronizar_catalogo(self.hub, self.resposta([item], catalogo_versao=2), client=client)
+            sincronizar_catalogo(self.hub, self.resposta([item], catalogo_versao=2), client=client)
+
+            self.assertEqual(client.chamadas, 1)
+
+    def test_falha_download_nao_cancela_catalogo_e_nao_mantem_foto_antiga(self):
+        class FakeClient:
+            def baixar_catalogo_imagem(self, *, token, imagem_id, destino):
+                raise RetaguardaError("falha controlada")
+
+        antigo = CatalogoItemHub.objects.create(
+            hub=self.hub,
+            retaguarda_produto_id=10,
+            retaguarda_sku_id=100,
+            tipo_produto="SIMPLES",
+            referencia="REF-10",
+            descricao="Produto antigo",
+            sincronizado_em=timezone.now(),
+            imagem_retaguarda_id=55,
+            imagem_versao="v1",
+            imagem_tipo="original",
+            imagem_local="catalogo-imagens/produto-10/antiga.bin",
+        )
+        item = self.item(imagem={"id": 55, "versao": "v2", "tipo": "original"})
+        with tempfile.TemporaryDirectory() as tmp, patch("integracao.services.catalogo.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
+            sincronizar_catalogo(self.hub, self.resposta([item], catalogo_versao=2), client=FakeClient())
+
+            antigo.refresh_from_db()
+            self.assertEqual(antigo.descricao, "Produto Teste")
+            self.assertEqual(antigo.imagem_versao, "v2")
+            self.assertEqual(antigo.imagem_local, "")
+
+    def test_imagem_null_limpa_associacao(self):
+        CatalogoItemHub.objects.create(
+            hub=self.hub,
+            retaguarda_produto_id=10,
+            retaguarda_sku_id=100,
+            tipo_produto="SIMPLES",
+            referencia="REF-10",
+            descricao="Produto antigo",
+            sincronizado_em=timezone.now(),
+            imagem_retaguarda_id=55,
+            imagem_versao="v1",
+            imagem_tipo="original",
+            imagem_local="catalogo-imagens/produto-10/antiga.bin",
+        )
+
+        sincronizar_catalogo(self.hub, self.resposta([self.item(imagem=None)], catalogo_versao=2))
+
+        item = CatalogoItemHub.objects.get()
+        self.assertIsNone(item.imagem_retaguarda_id)
+        self.assertEqual(item.imagem_local, "")
 
     def test_hub_id_divergente_rejeita(self):
         resposta = self.resposta()

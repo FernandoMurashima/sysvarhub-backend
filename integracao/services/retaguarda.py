@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 from urllib import error, request
 from urllib.parse import urljoin
 
@@ -58,6 +60,44 @@ class RetaguardaClient:
             method="GET",
             headers={"Authorization": f"Hub {token}"},
         )
+
+    def baixar_catalogo_imagem(self, *, token, imagem_id, destino, limite_bytes=5 * 1024 * 1024):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        url = urljoin(self.base_url, f"api/hub/catalogo/imagens/{imagem_id}/")
+        req = request.Request(
+            url,
+            headers={"Authorization": f"Hub {token}", "Accept": "image/*"},
+            method="GET",
+        )
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        tmp = None
+        total = 0
+        try:
+            with request.urlopen(req, timeout=self.timeout) as response:
+                fd, tmp = tempfile.mkstemp(prefix=destino.name + ".", suffix=".tmp", dir=str(destino.parent))
+                with os.fdopen(fd, "wb") as arquivo:
+                    while True:
+                        chunk = response.read(64 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > limite_bytes:
+                            raise RetaguardaError("Imagem da retaguarda excedeu o limite permitido.")
+                        arquivo.write(chunk)
+                os.replace(tmp, destino)
+                tmp = None
+        except error.HTTPError as exc:
+            raise RetaguardaError(f"Retaguarda retornou HTTP {exc.code}.") from exc
+        except error.URLError as exc:
+            reason = getattr(exc, "reason", "indisponível")
+            raise RetaguardaError(f"Não foi possível baixar imagem da retaguarda: {reason}") from exc
+        except TimeoutError as exc:
+            raise RetaguardaError("Tempo esgotado ao baixar imagem da retaguarda.") from exc
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+        return destino
 
     def operadores(self, *, token):
         if not token:

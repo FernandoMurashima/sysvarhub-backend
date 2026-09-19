@@ -107,6 +107,7 @@ def create_default_env(install_root=PROGRAM_FILES_ROOT, program_data=PROGRAM_DAT
             "HUB_BIND_HOST=0.0.0.0",
             "HUB_PORT=8000",
             f"SYSVARHUB_LOG_DIR={program_data / 'logs'}",
+            f"SYSVARHUB_DATA_DIR={program_data / 'data'}",
             f"SYSVARHUB_FRONTEND_DIST_DIR={install_root / 'frontend'}",
             "",
         ]

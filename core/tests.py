@@ -1,4 +1,6 @@
 from io import StringIO
+from pathlib import Path
+import tempfile
 from unittest.mock import patch
 
 from django.core.management import call_command
@@ -599,6 +601,43 @@ class TerminalCatalogoApiTests(TestCase):
 
         self.assertEqual(resposta.status_code, 200)
         self.assertEqual(len(resposta.data["itens"]), 1)
+
+    def test_catalogo_retorna_imagem_url_local_quando_cache_existe(self):
+        self.criar_item(imagem_versao="v1", imagem_local="catalogo-imagens/produto-181/foto.bin")
+
+        resposta = self.get_catalogo()
+
+        self.assertEqual(
+            resposta.data["itens"][0]["imagem_url"],
+            "/api/terminal/catalogo/imagens/181/v1/",
+        )
+
+    def test_catalogo_sem_foto_retorna_imagem_url_null(self):
+        self.criar_item()
+
+        resposta = self.get_catalogo()
+
+        self.assertIsNone(resposta.data["itens"][0]["imagem_url"])
+
+    def test_endpoint_local_entrega_imagem_cacheada(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("core.api.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
+            caminho = Path(tmp) / "catalogo-imagens/produto-181/foto.bin"
+            caminho.parent.mkdir(parents=True)
+            caminho.write_bytes(b"foto-local")
+            self.criar_item(imagem_versao="v1", imagem_local="catalogo-imagens/produto-181/foto.bin")
+
+            resposta = self.client.get("/api/terminal/catalogo/imagens/181/v1/")
+
+            self.assertEqual(resposta.status_code, 200)
+            self.assertEqual(b"".join(resposta.streaming_content), b"foto-local")
+
+    def test_endpoint_local_nao_permite_path_traversal_por_registro(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("core.api.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
+            self.criar_item(imagem_versao="v1", imagem_local="../segredo.bin")
+
+            resposta = self.client.get("/api/terminal/catalogo/imagens/181/v1/")
+
+            self.assertEqual(resposta.status_code, 404)
 
     def test_sem_token_e_rejeitado(self):
         self.client.credentials()

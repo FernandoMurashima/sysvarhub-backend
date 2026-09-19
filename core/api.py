@@ -1,3 +1,7 @@
+from pathlib import Path
+
+from django.conf import settings
+from django.http import FileResponse, Http404
 from django.db.models import Case, IntegerField, Q, Value, When
 from django.utils import timezone
 from rest_framework import status
@@ -175,6 +179,31 @@ class TerminalCatalogoView(APIView):
                 "itens": [_serializar_catalogo_item(item) for item in itens],
             }
         )
+
+
+class TerminalCatalogoImagemView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, produto_id, versao):
+        item = (
+            CatalogoItemHub.objects.filter(
+                ativo=True,
+                retaguarda_produto_id=produto_id,
+                imagem_versao=versao,
+                imagem_local__gt="",
+            )
+            .order_by("retaguarda_sku_id")
+            .first()
+        )
+        if not item:
+            raise Http404
+        caminho = _resolver_catalogo_imagem_local(item.imagem_local)
+        if not caminho.is_file():
+            raise Http404
+        response = FileResponse(caminho.open("rb"), content_type=_content_type_imagem(caminho.name))
+        response["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
 
 
 class OperadorLoginView(APIView):
@@ -920,6 +949,9 @@ def _aplicar_busca_vendedores(queryset, termo):
 
 
 def _serializar_catalogo_item(item):
+    imagem_url = None
+    if item.imagem_local and item.imagem_versao:
+        imagem_url = f"/api/terminal/catalogo/imagens/{item.retaguarda_produto_id}/{item.imagem_versao}/"
     return {
         "produto_id": item.retaguarda_produto_id,
         "sku_id": item.retaguarda_sku_id,
@@ -951,7 +983,27 @@ def _serializar_catalogo_item(item):
         "vendavel": item.vendavel,
         "motivos_bloqueio": item.motivos_bloqueio,
         "fiscal": item.fiscal,
+        "imagem_url": imagem_url,
     }
+
+
+def _resolver_catalogo_imagem_local(caminho_relativo):
+    base = Path(settings.SYSVARHUB_DATA_DIR).resolve()
+    caminho = (base / caminho_relativo).resolve()
+    if base != caminho and base not in caminho.parents:
+        raise Http404
+    return caminho
+
+
+def _content_type_imagem(nome):
+    extensao = (nome.rsplit(".", 1)[-1] if "." in nome else "").lower()
+    return {
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp",
+        "gif": "image/gif",
+    }.get(extensao, "application/octet-stream")
 
 
 def _serializar_cliente(cliente):

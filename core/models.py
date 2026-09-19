@@ -320,6 +320,10 @@ class CatalogoItemHub(models.Model):
     vendavel = models.BooleanField(default=False)
     motivos_bloqueio = models.JSONField(default=list, blank=True)
     fiscal = models.JSONField(default=dict, blank=True)
+    imagem_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    imagem_versao = models.CharField(max_length=80, blank=True, default="")
+    imagem_tipo = models.CharField(max_length=20, blank=True, default="")
+    imagem_local = models.CharField(max_length=255, blank=True, default="")
     ativo = models.BooleanField(default=True)
     sincronizado_em = models.DateTimeField()
 
@@ -340,6 +344,7 @@ class CatalogoItemHub(models.Model):
             models.Index(fields=["hub", "ativo"], name="idx_catalogo_hub_ativo"),
             models.Index(fields=["hub", "vendavel"], name="idx_catalogo_hub_vendavel"),
             models.Index(fields=["hub", "referencia"], name="idx_catalogo_hub_ref"),
+            models.Index(fields=["hub", "retaguarda_produto_id"], name="idx_catalogo_hub_prod"),
         ]
 
     def __str__(self):

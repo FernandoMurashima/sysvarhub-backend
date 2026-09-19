@@ -1,13 +1,20 @@
 from decimal import Decimal, InvalidOperation
+import logging
+import re
+from pathlib import Path
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
 from core.models import CatalogoItemHub
+from integracao.services.retaguarda import RetaguardaError
 
 
-CATALOGO_VERSOES_SUPORTADAS = {1}
+logger = logging.getLogger(__name__)
+
+CATALOGO_VERSOES_SUPORTADAS = {1, 2}
 CATALOGO_TABELA_PRECO_CODIGO_V1 = "PADRAO"
 CATALOGO_TABELA_PRECO_NOME_V1 = "Tabela Padrão"
 MOTIVOS_BLOQUEIO_V1 = {"SEM_PRECO", "SEM_ESTOQUE"}
@@ -17,9 +24,10 @@ class CatalogoValidationError(Exception):
     """Erro controlado na validação do catálogo da retaguarda."""
 
 
-def sincronizar_catalogo(hub, resposta):
+def sincronizar_catalogo(hub, resposta, client=None):
     dados = _validar_catalogo(hub, resposta)
     sincronizado_em = timezone.now()
+    imagens_cache = {}
 
     with transaction.atomic():
         sku_ids_recebidos = set()
@@ -28,11 +36,15 @@ def sincronizar_catalogo(hub, resposta):
 
         for item in dados["itens"]:
             sku_ids_recebidos.add(item["retaguarda_sku_id"])
+            imagem = item["imagem"]
+            item_catalogo = {chave: valor for chave, valor in item.items() if chave != "imagem"}
+            imagem_defaults = _imagem_defaults_para_item(hub, item["retaguarda_produto_id"], imagem)
             CatalogoItemHub.objects.update_or_create(
                 hub=hub,
                 retaguarda_sku_id=item["retaguarda_sku_id"],
                 defaults={
-                    **item,
+                    **item_catalogo,
+                    **imagem_defaults,
                     "ativo": True,
                     "sincronizado_em": sincronizado_em,
                 },
@@ -48,24 +60,28 @@ def sincronizar_catalogo(hub, resposta):
             .update(ativo=False, vendavel=False, sincronizado_em=sincronizado_em)
         )
 
-        tabela = dados["tabela_preco"]
-        hub.catalogo_versao = resposta["catalogo_versao"]
-        hub.catalogo_gerado_em = dados["gerado_em"]
-        hub.catalogo_sincronizado_em = sincronizado_em
-        hub.tabela_preco_retaguarda_id = tabela["id"] if tabela else None
-        hub.tabela_preco_codigo = tabela["codigo"] if tabela else ""
-        hub.tabela_preco_nome = tabela["nome"] if tabela else ""
-        hub.save(
-            update_fields=[
-                "catalogo_versao",
-                "catalogo_gerado_em",
-                "catalogo_sincronizado_em",
-                "tabela_preco_retaguarda_id",
-                "tabela_preco_codigo",
-                "tabela_preco_nome",
-                "atualizado_em",
-            ]
-        )
+    if client and hub.retaguarda_token:
+        _sincronizar_imagens(hub, dados["itens"], client, imagens_cache)
+        _limpar_arquivos_orfaos()
+
+    tabela = dados["tabela_preco"]
+    hub.catalogo_versao = resposta["catalogo_versao"]
+    hub.catalogo_gerado_em = dados["gerado_em"]
+    hub.catalogo_sincronizado_em = sincronizado_em
+    hub.tabela_preco_retaguarda_id = tabela["id"] if tabela else None
+    hub.tabela_preco_codigo = tabela["codigo"] if tabela else ""
+    hub.tabela_preco_nome = tabela["nome"] if tabela else ""
+    hub.save(
+        update_fields=[
+            "catalogo_versao",
+            "catalogo_gerado_em",
+            "catalogo_sincronizado_em",
+            "tabela_preco_retaguarda_id",
+            "tabela_preco_codigo",
+            "tabela_preco_nome",
+            "atualizado_em",
+        ]
+    )
 
     return {
         "empresa": dados["empresa_nome"],
@@ -236,7 +252,136 @@ def _validar_item(item, indice):
         "vendavel": item["vendavel"],
         "motivos_bloqueio": motivos,
         "fiscal": item["fiscal"],
+        "imagem": _validar_imagem(item.get("imagem")),
     }
+
+
+def _validar_imagem(imagem):
+    if imagem is None:
+        return None
+    if not isinstance(imagem, dict):
+        raise CatalogoValidationError("Catálogo retornou imagem inválida.")
+    _exigir_campos(imagem, ("id", "versao", "tipo"))
+    tipo = str(imagem["tipo"])
+    if tipo not in ("reduzida", "original"):
+        raise CatalogoValidationError("Catálogo retornou imagem.tipo inválido.")
+    return {
+        "id": _inteiro_obrigatorio(imagem["id"], "imagem.id"),
+        "versao": str(imagem["versao"]),
+        "tipo": tipo,
+    }
+
+
+def _imagem_defaults_para_item(hub, produto_id, imagem):
+    if not imagem:
+        return {
+            "imagem_retaguarda_id": None,
+            "imagem_versao": "",
+            "imagem_tipo": "",
+            "imagem_local": "",
+        }
+    existente = (
+        CatalogoItemHub.objects.filter(
+            hub=hub,
+            retaguarda_produto_id=produto_id,
+            imagem_retaguarda_id=imagem["id"],
+            imagem_versao=imagem["versao"],
+            imagem_local__gt="",
+        )
+        .first()
+    )
+    if existente and _resolver_imagem_local(existente.imagem_local).is_file():
+        return {
+            "imagem_retaguarda_id": imagem["id"],
+            "imagem_versao": imagem["versao"],
+            "imagem_tipo": imagem["tipo"],
+            "imagem_local": existente.imagem_local,
+        }
+    return {
+        "imagem_retaguarda_id": imagem["id"],
+        "imagem_versao": imagem["versao"],
+        "imagem_tipo": imagem["tipo"],
+        "imagem_local": "",
+    }
+
+
+def _sincronizar_imagens(hub, itens, client, imagens_cache):
+    imagens_por_produto = {}
+    for item in itens:
+        imagem = item.get("imagem")
+        if imagem:
+            imagens_por_produto.setdefault(item["retaguarda_produto_id"], imagem)
+
+    for produto_id, imagem in imagens_por_produto.items():
+        destino_relativo = _caminho_relativo_imagem(produto_id, imagem)
+        destino = _resolver_imagem_local(destino_relativo)
+        chave = (imagem["id"], imagem["versao"])
+        if destino.is_file():
+            _associar_imagem_produto(hub, produto_id, imagem, destino_relativo)
+            continue
+        if chave not in imagens_cache:
+            try:
+                client.baixar_catalogo_imagem(
+                    token=hub.retaguarda_token,
+                    imagem_id=imagem["id"],
+                    destino=destino,
+                )
+                imagens_cache[chave] = destino_relativo
+            except RetaguardaError as exc:
+                logger.warning(
+                    "Falha ao baixar imagem do catálogo produto=%s imagem=%s: %s",
+                    produto_id,
+                    imagem["id"],
+                    exc,
+                )
+                imagens_cache[chave] = None
+        if imagens_cache[chave]:
+            _associar_imagem_produto(hub, produto_id, imagem, imagens_cache[chave])
+
+
+def _associar_imagem_produto(hub, produto_id, imagem, caminho_relativo):
+    CatalogoItemHub.objects.filter(
+        hub=hub,
+        retaguarda_produto_id=produto_id,
+        imagem_retaguarda_id=imagem["id"],
+        imagem_versao=imagem["versao"],
+    ).update(
+        imagem_tipo=imagem["tipo"],
+        imagem_local=caminho_relativo,
+        atualizado_em=timezone.now(),
+    )
+
+
+def _catalogo_imagens_dir():
+    return Path(settings.SYSVARHUB_DATA_DIR) / "catalogo-imagens"
+
+
+def _caminho_relativo_imagem(produto_id, imagem):
+    versao = re.sub(r"[^A-Za-z0-9._-]", "-", imagem["versao"])[:80]
+    return f"catalogo-imagens/produto-{produto_id}/imagem-{imagem['id']}-{versao}.bin"
+
+
+def _resolver_imagem_local(caminho_relativo):
+    base = Path(settings.SYSVARHUB_DATA_DIR).resolve()
+    destino = (base / caminho_relativo).resolve()
+    if base != destino and base not in destino.parents:
+        raise CatalogoValidationError("Caminho local de imagem inválido.")
+    return destino
+
+
+def _limpar_arquivos_orfaos():
+    base = _catalogo_imagens_dir()
+    if not base.exists():
+        return
+    usados = set(
+        CatalogoItemHub.objects.exclude(imagem_local="")
+        .values_list("imagem_local", flat=True)
+        .distinct()
+    )
+    for arquivo in base.glob("produto-*/*"):
+        relativo = arquivo.relative_to(Path(settings.SYSVARHUB_DATA_DIR)).as_posix()
+        if arquivo.is_file() and relativo not in usados:
+            arquivo.unlink(missing_ok=True)
 
 
 def _normalizar_objeto_opcional(valor, campo):

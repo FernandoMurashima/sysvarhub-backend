@@ -187,6 +187,7 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 FRONTEND_DIST_DIR = Path(config("SYSVARHUB_FRONTEND_DIST_DIR", default=str(BASE_DIR / "frontend_dist")))
+SYSVARHUB_DATA_DIR = Path(config("SYSVARHUB_DATA_DIR", default=str(BASE_DIR / "data")))
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 

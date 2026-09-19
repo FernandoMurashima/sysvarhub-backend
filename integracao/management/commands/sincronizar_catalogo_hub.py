@@ -14,7 +14,7 @@ class Command(BaseCommand):
 
         try:
             resposta = client.catalogo(token=hub.retaguarda_token)
-            resultado = sincronizar_catalogo(hub, resposta)
+            resultado = sincronizar_catalogo(hub, resposta, client=client)
         except (RetaguardaError, CatalogoValidationError) as exc:
             raise CommandError(str(exc)) from exc
 
