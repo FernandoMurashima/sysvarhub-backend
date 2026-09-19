@@ -621,15 +621,42 @@ class TerminalCatalogoApiTests(TestCase):
 
     def test_endpoint_local_entrega_imagem_cacheada(self):
         with tempfile.TemporaryDirectory() as tmp, patch("core.api.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
-            caminho = Path(tmp) / "catalogo-imagens/produto-181/foto.bin"
+            caminho = Path(tmp) / "catalogo-imagens/produto-181/foto.jpg"
             caminho.parent.mkdir(parents=True)
             caminho.write_bytes(b"foto-local")
-            self.criar_item(imagem_versao="v1", imagem_local="catalogo-imagens/produto-181/foto.bin")
+            self.criar_item(imagem_versao="v1", imagem_local="catalogo-imagens/produto-181/foto.jpg")
 
             resposta = self.client.get("/api/terminal/catalogo/imagens/181/v1/")
 
             self.assertEqual(resposta.status_code, 200)
+            self.assertEqual(resposta["Content-Type"], "image/jpeg")
             self.assertEqual(b"".join(resposta.streaming_content), b"foto-local")
+
+    def test_endpoint_local_entrega_png_com_content_type_correto(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("core.api.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
+            caminho = Path(tmp) / "catalogo-imagens/produto-181/foto.png"
+            caminho.parent.mkdir(parents=True)
+            caminho.write_bytes(b"png")
+            self.criar_item(imagem_versao="v1", imagem_local="catalogo-imagens/produto-181/foto.png")
+
+            resposta = self.client.get("/api/terminal/catalogo/imagens/181/v1/")
+
+            self.assertEqual(resposta.status_code, 200)
+            self.assertEqual(resposta["Content-Type"], "image/png")
+            self.assertEqual(b"".join(resposta.streaming_content), b"png")
+
+    def test_endpoint_local_entrega_webp_com_content_type_correto(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("core.api.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
+            caminho = Path(tmp) / "catalogo-imagens/produto-181/foto.webp"
+            caminho.parent.mkdir(parents=True)
+            caminho.write_bytes(b"webp")
+            self.criar_item(imagem_versao="v1", imagem_local="catalogo-imagens/produto-181/foto.webp")
+
+            resposta = self.client.get("/api/terminal/catalogo/imagens/181/v1/")
+
+            self.assertEqual(resposta.status_code, 200)
+            self.assertEqual(resposta["Content-Type"], "image/webp")
+            self.assertEqual(b"".join(resposta.streaming_content), b"webp")
 
     def test_endpoint_local_nao_permite_path_traversal_por_registro(self):
         with tempfile.TemporaryDirectory() as tmp, patch("core.api.settings.SYSVARHUB_DATA_DIR", Path(tmp)):

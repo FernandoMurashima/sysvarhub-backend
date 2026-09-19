@@ -290,7 +290,17 @@ def _imagem_defaults_para_item(hub, produto_id, imagem):
         )
         .first()
     )
-    if existente and _resolver_imagem_local(existente.imagem_local).is_file():
+    try:
+        arquivo_existente = _resolver_imagem_local(existente.imagem_local) if existente else None
+    except CatalogoValidationError as exc:
+        logger.warning(
+            "Falha ao resolver imagem local existente produto=%s imagem=%s: %s",
+            produto_id,
+            imagem["id"],
+            exc,
+        )
+        arquivo_existente = None
+    if arquivo_existente and _arquivo_cache_valido(arquivo_existente):
         return {
             "imagem_retaguarda_id": imagem["id"],
             "imagem_versao": imagem["versao"],
@@ -313,21 +323,35 @@ def _sincronizar_imagens(hub, itens, client, imagens_cache):
             imagens_por_produto.setdefault(item["retaguarda_produto_id"], imagem)
 
     for produto_id, imagem in imagens_por_produto.items():
-        destino_relativo = _caminho_relativo_imagem(produto_id, imagem)
-        destino = _resolver_imagem_local(destino_relativo)
         chave = (imagem["id"], imagem["versao"])
-        if destino.is_file():
-            _associar_imagem_produto(hub, produto_id, imagem, destino_relativo)
+        try:
+            destino_relativo_base = _caminho_relativo_imagem_base(produto_id, imagem)
+            destino_base = _resolver_imagem_local(destino_relativo_base)
+            arquivo_cache = _arquivo_cache_existente(destino_base)
+        except (CatalogoValidationError, OSError) as exc:
+            logger.warning(
+                "Falha ao preparar cache de imagem produto=%s imagem=%s: %s",
+                produto_id,
+                imagem["id"],
+                exc,
+            )
+            imagens_cache[chave] = None
+            continue
+        if arquivo_cache:
+            _associar_imagem_produto(hub, produto_id, imagem, _relativo_data_dir(arquivo_cache))
             continue
         if chave not in imagens_cache:
             try:
-                client.baixar_catalogo_imagem(
+                arquivo_baixado = client.baixar_catalogo_imagem(
                     token=hub.retaguarda_token,
                     imagem_id=imagem["id"],
-                    destino=destino,
+                    destino=destino_base,
                 )
-                imagens_cache[chave] = destino_relativo
-            except RetaguardaError as exc:
+                if arquivo_baixado and _arquivo_existe(arquivo_baixado):
+                    imagens_cache[chave] = _relativo_data_dir(arquivo_baixado)
+                else:
+                    imagens_cache[chave] = None
+            except (RetaguardaError, OSError) as exc:
                 logger.warning(
                     "Falha ao baixar imagem do catálogo produto=%s imagem=%s: %s",
                     produto_id,
@@ -356,9 +380,28 @@ def _catalogo_imagens_dir():
     return Path(settings.SYSVARHUB_DATA_DIR) / "catalogo-imagens"
 
 
-def _caminho_relativo_imagem(produto_id, imagem):
+def _caminho_relativo_imagem_base(produto_id, imagem):
     versao = re.sub(r"[^A-Za-z0-9._-]", "-", imagem["versao"])[:80]
-    return f"catalogo-imagens/produto-{produto_id}/imagem-{imagem['id']}-{versao}.bin"
+    return f"catalogo-imagens/produto-{produto_id}/imagem-{imagem['id']}-{versao}"
+
+
+def _arquivo_cache_existente(destino_base):
+    for extensao in (".jpg", ".png", ".webp", ".gif"):
+        candidato = destino_base.with_suffix(extensao)
+        if _arquivo_cache_valido(candidato):
+            return candidato
+    return None
+
+
+def _arquivo_cache_valido(caminho):
+    return caminho.suffix.lower() in (".jpg", ".png", ".webp", ".gif") and _arquivo_existe(caminho)
+
+
+def _arquivo_existe(caminho):
+    try:
+        return caminho.is_file()
+    except OSError:
+        return False
 
 
 def _resolver_imagem_local(caminho_relativo):
@@ -369,19 +412,31 @@ def _resolver_imagem_local(caminho_relativo):
     return destino
 
 
+def _relativo_data_dir(caminho):
+    return caminho.relative_to(Path(settings.SYSVARHUB_DATA_DIR).resolve()).as_posix()
+
+
 def _limpar_arquivos_orfaos():
     base = _catalogo_imagens_dir()
-    if not base.exists():
+    try:
+        if not base.exists():
+            return
+        arquivos = list(base.glob("produto-*/*"))
+    except OSError as exc:
+        logger.warning("Falha ao varrer imagens órfãs do catálogo: %s", exc)
         return
     usados = set(
         CatalogoItemHub.objects.exclude(imagem_local="")
         .values_list("imagem_local", flat=True)
         .distinct()
     )
-    for arquivo in base.glob("produto-*/*"):
-        relativo = arquivo.relative_to(Path(settings.SYSVARHUB_DATA_DIR)).as_posix()
-        if arquivo.is_file() and relativo not in usados:
-            arquivo.unlink(missing_ok=True)
+    for arquivo in arquivos:
+        try:
+            relativo = arquivo.relative_to(Path(settings.SYSVARHUB_DATA_DIR)).as_posix()
+            if arquivo.is_file() and relativo not in usados:
+                arquivo.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Falha ao limpar imagem órfã do catálogo %s: %s", arquivo, exc)
 
 
 def _normalizar_objeto_opcional(valor, campo):

@@ -42,6 +42,36 @@ class _JsonResponse:
         return json.dumps(self.payload).encode("utf-8")
 
 
+class _Headers:
+    def __init__(self, content_type):
+        self.content_type = content_type
+
+    def get_content_type(self):
+        return self.content_type
+
+
+class _BytesResponse:
+    def __init__(self, payload, content_type="image/jpeg"):
+        self.payload = payload
+        self.headers = _Headers(content_type)
+        self.offset = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self, size=-1):
+        if self.offset >= len(self.payload):
+            return b""
+        if size is None or size < 0:
+            size = len(self.payload) - self.offset
+        chunk = self.payload[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+
 class RetaguardaClientTests(TestCase):
     def test_ativacao_envia_payload_esperado_sem_empresa_ou_loja(self):
         hub_uuid = uuid.uuid4()
@@ -204,6 +234,48 @@ class RetaguardaClientTests(TestCase):
                     hostname="loja-01",
                     versao="0.1.0",
                 )
+
+    def test_baixar_catalogo_imagem_salva_extensao_por_content_type(self):
+        casos = [
+            ("image/jpeg", ".jpg"),
+            ("image/png", ".png"),
+            ("image/webp", ".webp"),
+            ("image/gif", ".gif"),
+        ]
+        for content_type, extensao in casos:
+            with self.subTest(content_type=content_type), tempfile.TemporaryDirectory() as tmp:
+                destino_base = Path(tmp) / "foto"
+
+                with patch(
+                    "integracao.services.retaguarda.request.urlopen",
+                    return_value=_BytesResponse(b"foto", content_type),
+                ):
+                    destino = RetaguardaClient("http://central.test").baixar_catalogo_imagem(
+                        token="TOKEN-SECRETO",
+                        imagem_id=55,
+                        destino=destino_base,
+                    )
+
+                self.assertEqual(destino.suffix, extensao)
+                self.assertEqual(destino.read_bytes(), b"foto")
+                self.assertFalse(destino_base.exists())
+
+    def test_baixar_catalogo_imagem_rejeita_content_type_invalido_sem_parcial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destino_base = Path(tmp) / "foto"
+
+            with patch(
+                "integracao.services.retaguarda.request.urlopen",
+                return_value=_BytesResponse(b"foto", "application/octet-stream"),
+            ):
+                with self.assertRaises(RetaguardaError):
+                    RetaguardaClient("http://central.test").baixar_catalogo_imagem(
+                        token="TOKEN-SECRETO",
+                        imagem_id=55,
+                        destino=destino_base,
+                    )
+
+            self.assertEqual(list(Path(tmp).glob("*")), [])
 
 
 class ClientesSyncTests(TestCase):
@@ -865,8 +937,10 @@ class CatalogoHubServiceTests(TestCase):
 
             def baixar_catalogo_imagem(self, *, token, imagem_id, destino):
                 self.chamadas.append((token, imagem_id, destino))
-                destino.parent.mkdir(parents=True, exist_ok=True)
-                destino.write_bytes(b"foto")
+                final = destino.with_suffix(".jpg")
+                final.parent.mkdir(parents=True, exist_ok=True)
+                final.write_bytes(b"foto")
+                return final
 
         item = self.item(imagem={"id": 55, "versao": "2026-09-19T10:00:00-03:00", "tipo": "reduzida"})
         with tempfile.TemporaryDirectory() as tmp, patch("integracao.services.catalogo.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
@@ -878,6 +952,7 @@ class CatalogoHubServiceTests(TestCase):
             self.assertEqual(catalogo.imagem_versao, "2026-09-19T10:00:00-03:00")
             self.assertEqual(catalogo.imagem_tipo, "reduzida")
             self.assertTrue((Path(tmp) / catalogo.imagem_local).is_file())
+            self.assertTrue(catalogo.imagem_local.endswith(".jpg"))
             self.assertEqual(len(client.chamadas), 1)
 
     def test_mesma_imagem_mesma_versao_nao_baixa_novamente(self):
@@ -886,8 +961,10 @@ class CatalogoHubServiceTests(TestCase):
 
             def baixar_catalogo_imagem(self, *, token, imagem_id, destino):
                 self.chamadas += 1
-                destino.parent.mkdir(parents=True, exist_ok=True)
-                destino.write_bytes(b"foto")
+                final = destino.with_suffix(".png")
+                final.parent.mkdir(parents=True, exist_ok=True)
+                final.write_bytes(b"foto")
+                return final
 
         item = self.item(imagem={"id": 55, "versao": "v1", "tipo": "original"})
         with tempfile.TemporaryDirectory() as tmp, patch("integracao.services.catalogo.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
@@ -896,6 +973,81 @@ class CatalogoHubServiceTests(TestCase):
             sincronizar_catalogo(self.hub, self.resposta([item], catalogo_versao=2), client=client)
 
             self.assertEqual(client.chamadas, 1)
+
+    def test_erro_preparar_diretorio_nao_cancela_catalogo_comercial(self):
+        class FakeClient:
+            def baixar_catalogo_imagem(self, *, token, imagem_id, destino):
+                raise AssertionError("download nao deveria ser chamado")
+
+        item = self.item(imagem={"id": 55, "versao": "v1", "tipo": "original"})
+        with patch("integracao.services.catalogo._resolver_imagem_local", side_effect=OSError("mkdir falhou")):
+            sincronizar_catalogo(self.hub, self.resposta([item], catalogo_versao=2), client=FakeClient())
+
+        catalogo = CatalogoItemHub.objects.get()
+        self.assertEqual(catalogo.descricao, "Produto Teste")
+        self.assertEqual(catalogo.imagem_local, "")
+
+    def test_erro_escrita_nao_cancela_catalogo_comercial_e_nao_associa(self):
+        class FakeClient:
+            def baixar_catalogo_imagem(self, *, token, imagem_id, destino):
+                raise OSError("write falhou")
+
+        item = self.item(imagem={"id": 55, "versao": "v1", "tipo": "original"})
+        sincronizar_catalogo(self.hub, self.resposta([item], catalogo_versao=2), client=FakeClient())
+
+        catalogo = CatalogoItemHub.objects.get()
+        self.assertEqual(catalogo.descricao, "Produto Teste")
+        self.assertEqual(catalogo.imagem_local, "")
+
+    def test_erro_replace_nao_cancela_catalogo_comercial_e_nao_deixa_parcial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            item = self.item(imagem={"id": 55, "versao": "v1", "tipo": "original"})
+            with patch("integracao.services.catalogo.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
+                with patch("integracao.services.retaguarda.request.urlopen", return_value=_BytesResponse(b"foto", "image/jpeg")):
+                    with patch("integracao.services.retaguarda.os.replace", side_effect=OSError("replace falhou")):
+                        sincronizar_catalogo(
+                            self.hub,
+                            self.resposta([item], catalogo_versao=2),
+                            client=RetaguardaClient("http://central.test"),
+                        )
+
+                catalogo = CatalogoItemHub.objects.get()
+                self.assertEqual(catalogo.imagem_local, "")
+                self.assertEqual(list(Path(tmp).rglob("*.tmp")), [])
+
+    def test_content_type_invalido_nao_associa_foto(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            item = self.item(imagem={"id": 55, "versao": "v1", "tipo": "original"})
+            with patch("integracao.services.catalogo.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
+                with patch(
+                    "integracao.services.retaguarda.request.urlopen",
+                    return_value=_BytesResponse(b"foto", "application/octet-stream"),
+                ):
+                    sincronizar_catalogo(
+                        self.hub,
+                        self.resposta([item], catalogo_versao=2),
+                        client=RetaguardaClient("http://central.test"),
+                    )
+
+                catalogo = CatalogoItemHub.objects.get()
+                self.assertEqual(catalogo.imagem_local, "")
+                self.assertEqual(list(Path(tmp).rglob("*.*")), [])
+
+    def test_erro_limpeza_orfao_nao_cancela_catalogo_comercial(self):
+        class FakeClient:
+            def baixar_catalogo_imagem(self, *, token, imagem_id, destino):
+                return None
+
+        item = self.item(imagem=None)
+        with tempfile.TemporaryDirectory() as tmp:
+            orfao = Path(tmp) / "catalogo-imagens/produto-10/orfao.jpg"
+            orfao.parent.mkdir(parents=True)
+            orfao.write_bytes(b"orfao")
+            with patch("integracao.services.catalogo.settings.SYSVARHUB_DATA_DIR", Path(tmp)):
+                with patch("integracao.services.catalogo.Path.unlink", side_effect=OSError("unlink falhou")):
+                    sincronizar_catalogo(self.hub, self.resposta([item], catalogo_versao=2), client=FakeClient())
+
+        self.assertEqual(CatalogoItemHub.objects.get().descricao, "Produto Teste")
 
     def test_falha_download_nao_cancela_catalogo_e_nao_mantem_foto_antiga(self):
         class FakeClient:
