@@ -71,6 +71,7 @@ function New-RuntimeSmokeProgramData {
         "HUB_BIND_HOST=127.0.0.1",
         "HUB_PORT=$Port",
         "SYSVARHUB_LOG_DIR=$(Join-Path $Root 'logs')",
+        "SYSVARHUB_DATA_DIR=$(Join-Path $Root 'data')",
         "SYSVARHUB_FRONTEND_DIST_DIR=$FrontendRoot"
     )
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)

@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 
 $ConfigRoot = Join-Path $ProgramDataRoot "config"
 $LogRoot = Join-Path $ProgramDataRoot "logs"
+$DataRoot = Join-Path $ProgramDataRoot "data"
 $MysqlData = Join-Path $ProgramDataRoot "mysql\data"
 $EnvFile = Join-Path $ConfigRoot "sysvarhub.env"
 $MysqlAdminFile = Join-Path $ConfigRoot "mysql-admin.cnf"
@@ -17,7 +18,7 @@ $Mysql = Join-Path $InstallRoot "mysql\bin\mysql.exe"
 $AclSystem = "*S-1-5-18:F"
 $AclAdministrators = "*S-1-5-32-544:F"
 
-New-Item -ItemType Directory -Force -Path $ConfigRoot, $LogRoot, (Join-Path $ProgramDataRoot "backup"), (Join-Path $ProgramDataRoot "data"), $MysqlData | Out-Null
+New-Item -ItemType Directory -Force -Path $ConfigRoot, $LogRoot, (Join-Path $ProgramDataRoot "backup"), $DataRoot, $MysqlData | Out-Null
 
 function New-Secret([int]$Length = 48) {
     $bytes = New-Object byte[] $Length
@@ -153,11 +154,19 @@ if (-not (Test-Path $EnvFile)) {
         "HUB_BIND_HOST=0.0.0.0",
         "HUB_PORT=8000",
         "SYSVARHUB_LOG_DIR=$LogRoot",
+        "SYSVARHUB_DATA_DIR=$DataRoot",
         "SYSVARHUB_FRONTEND_DIST_DIR=$(Join-Path $InstallRoot 'frontend')"
     )
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllLines($EnvFile, $EnvLines, $Utf8NoBom)
     Protect-SecretFile $EnvFile
+} else {
+    $DataDirLine = Get-Content -LiteralPath $EnvFile |
+        Where-Object { $_ -match "^\s*SYSVARHUB_DATA_DIR\s*=" } |
+        Select-Object -First 1
+    if (-not $DataDirLine) {
+        Add-Content -LiteralPath $EnvFile -Value "SYSVARHUB_DATA_DIR=$DataRoot"
+    }
 }
 
 if (-not (Test-Path $MyIni)) {

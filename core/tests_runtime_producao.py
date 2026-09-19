@@ -202,6 +202,40 @@ class WindowsRuntimeTests(SimpleTestCase):
         self.assertIn("[System.IO.File]::WriteAllLines($EnvFile, $EnvLines, $Utf8NoBom)", env_block)
         self.assertNotIn("Set-Content -LiteralPath $EnvFile -Encoding UTF8", env_block)
         self.assertIn("Protect-SecretFile $EnvFile", env_block)
+        self.assertIn("SYSVARHUB_DATA_DIR=$DataRoot", env_block)
+
+    def test_install_hub_define_data_root_com_programdata_data(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+        data_root_pos = script.index('$DataRoot = Join-Path $ProgramDataRoot "data"')
+        mkdir_pos = script.index("New-Item -ItemType Directory")
+
+        self.assertLess(data_root_pos, mkdir_pos)
+        self.assertIn("$DataRoot", script[mkdir_pos:mkdir_pos + 180])
+        self.assertIn("SYSVARHUB_DATA_DIR=$DataRoot", script)
+
+    def test_install_hub_atualiza_env_antigo_sem_recriar_ou_trocar_segredos(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+        env_block = script[script.index("if (-not (Test-Path $EnvFile))"):script.index("if (-not (Test-Path $MyIni))")]
+        update_block = env_block[env_block.index("} else {"):]
+
+        self.assertIn("Get-Content -LiteralPath $EnvFile", update_block)
+        self.assertIn('$_ -match "^\\s*SYSVARHUB_DATA_DIR\\s*="', update_block)
+        self.assertIn('Add-Content -LiteralPath $EnvFile -Value "SYSVARHUB_DATA_DIR=$DataRoot"', update_block)
+        self.assertNotIn("[System.IO.File]::WriteAllLines", update_block)
+        self.assertNotIn("Protect-SecretFile", update_block)
+        self.assertNotIn("New-Secret", update_block)
+        self.assertNotIn("DJANGO_SECRET_KEY=", update_block)
+        self.assertNotIn("DB_PASSWORD=", update_block)
+
+    def test_install_hub_nao_duplica_data_dir_em_execucao_repetida(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
+        env_block = script[script.index("if (-not (Test-Path $EnvFile))"):script.index("if (-not (Test-Path $MyIni))")]
+        update_block = env_block[env_block.index("} else {"):]
+        add_pos = update_block.index('Add-Content -LiteralPath $EnvFile -Value "SYSVARHUB_DATA_DIR=$DataRoot"')
+        check_pos = update_block.index('if (-not $DataDirLine)')
+
+        self.assertLess(check_pos, add_pos)
+        self.assertEqual(update_block.count('Add-Content -LiteralPath $EnvFile -Value "SYSVARHUB_DATA_DIR=$DataRoot"'), 1)
 
     def test_install_hub_nao_reescreve_sysvarhub_env_existente_para_remover_bom(self):
         script = Path(settings.BASE_DIR, "deploy", "windows", "install-hub.ps1").read_text(encoding="utf-8")
@@ -276,6 +310,13 @@ class WindowsRuntimeTests(SimpleTestCase):
         self.assertNotIn("Stop-Service", gate_block)
         self.assertNotIn("--startup auto install", gate_block)
         self.assertNotIn("sc.exe", gate_block)
+
+    def test_build_installer_smoke_configura_data_dir_temporario(self):
+        script = Path(settings.BASE_DIR, "deploy", "windows", "build-installer.ps1").read_text(encoding="utf-8")
+        smoke_block = script[script.index("function New-RuntimeSmokeProgramData"):script.index("function Invoke-RuntimeGate")]
+
+        self.assertIn('New-Item -ItemType Directory -Force -Path $ConfigRoot, (Join-Path $Root "logs"), (Join-Path $Root "data")', smoke_block)
+        self.assertIn("SYSVARHUB_DATA_DIR=$(Join-Path $Root 'data')", smoke_block)
 
 
 class WindowsUninstallScriptTests(SimpleTestCase):
