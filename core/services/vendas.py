@@ -25,6 +25,12 @@ from core.models import (
 )
 from core.services.caixa import obter_caixa_terminal, obter_sessao_caixa_aberta
 from core.services.operadores import serializar_operador
+from core.services.nfce import (
+    NFCeErroDominio,
+    emitir_nfce_para_venda_finalizada,
+    nfce_habilitada_para_hub,
+    validar_nfce_para_finalizacao,
+)
 
 
 ZERO_2 = Decimal("0.00")
@@ -631,6 +637,13 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
         if total_pago > venda.total and not any(pagamento.tipo == DINHEIRO for pagamento in pagamentos):
             raise VendaConflictError("Valor do pagamento excede o valor pendente.")
 
+        emitir_nfce = nfce_habilitada_para_hub(venda.hub)
+        if emitir_nfce:
+            try:
+                validar_nfce_para_finalizacao(venda)
+            except NFCeErroDominio as exc:
+                raise VendaConflictError(exc.codigo) from exc
+
         catalogo_ids = sorted({item.catalogo_item_id for item in itens})
         catalogo_por_id = {
             item.id: item
@@ -693,6 +706,11 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
                     "troco": f"{troco:.2f}",
                 },
             )
+        if emitir_nfce:
+            try:
+                emitir_nfce_para_venda_finalizada(venda)
+            except NFCeErroDominio as exc:
+                raise VendaConflictError(exc.codigo) from exc
 
     return venda
 
@@ -1252,6 +1270,27 @@ def serializar_venda(venda):
         "operador_criacao": serializar_operador(venda.operador_criacao),
         "itens": [serializar_item(item) for item in itens],
         "pagamentos": [serializar_pagamento(pagamento) for pagamento in pagamentos],
+        "fiscal": serializar_fiscal_venda(venda),
+    }
+
+
+def serializar_fiscal_venda(venda):
+    if not nfce_habilitada_para_hub(venda.hub):
+        return {"emite_nfce": False}
+    try:
+        nfce = venda.nfce
+    except Exception:
+        return {"emite_nfce": True, "mensagem": "NFCE_AINDA_NAO_GERADA"}
+    return {
+        "emite_nfce": True,
+        "nfce_uuid": str(nfce.nfce_uuid),
+        "status": nfce.status,
+        "chave_acesso": nfce.chave_acesso,
+        "serie": nfce.serie,
+        "numero": nfce.numero,
+        "tipo_emissao": nfce.tipo_emissao,
+        "contingencia": nfce.status == nfce.STATUS_CONTINGENCIA,
+        "mensagem": nfce.mensagem_retorno,
     }
 
 

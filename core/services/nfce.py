@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from xml.etree import ElementTree as ET
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -42,6 +43,10 @@ class NFCeErroDominio(Exception):
         super().__init__(mensagem or codigo)
 
 
+class NFCeConfiguracaoErro(NFCeErroDominio):
+    pass
+
+
 @dataclass(frozen=True)
 class MaterialAssinatura:
     private_key_pem: bytes
@@ -57,7 +62,192 @@ class ConfigQRCodeDesenvolvimento:
     csc: str = ""
 
 
-def gerar_nfce_local(venda, *, material_assinatura, qr_config, codigo_numerico=None):
+@dataclass(frozen=True)
+class ResultadoSefazNFCe:
+    status: str
+    mensagem: str = ""
+    simulacao: bool = False
+
+
+class SefazNFCeClient:
+    AUTORIZADA = "AUTORIZADA"
+    REJEITADA = "REJEITADA"
+    INDISPONIVEL = "INDISPONIVEL"
+    TIMEOUT = "TIMEOUT"
+
+    def transmitir(self, nfce):
+        raise NotImplementedError
+
+
+class SefazNFCeClientDesenvolvimento(SefazNFCeClient):
+    def __init__(self, resultado=None):
+        self.resultado = resultado or SefazNFCeClient.AUTORIZADA
+
+    def transmitir(self, nfce):
+        mensagens = {
+            self.AUTORIZADA: "SIMULACAO_SEFAZ_AUTORIZADA_SEM_VALOR_FISCAL",
+            self.REJEITADA: "SIMULACAO_SEFAZ_REJEITADA_SEM_VALOR_FISCAL",
+            self.INDISPONIVEL: "SIMULACAO_SEFAZ_INDISPONIVEL",
+            self.TIMEOUT: "SIMULACAO_SEFAZ_TIMEOUT",
+        }
+        return ResultadoSefazNFCe(
+            status=self.resultado,
+            mensagem=mensagens.get(self.resultado, "SIMULACAO_SEFAZ_RESULTADO_DESCONHECIDO"),
+            simulacao=True,
+        )
+
+
+class NFCeMaterialProvider:
+    def obter(self):
+        raise NotImplementedError
+
+
+class NFCeMaterialProviderDesenvolvimento(NFCeMaterialProvider):
+    def obter(self):
+        try:
+            from cryptography import x509
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.x509.oid import NameOID
+        except ImportError as exc:
+            raise NFCeConfiguracaoErro("MATERIAL_ASSINATURA_INDISPONIVEL") from exc
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Sysvar Hub Desenvolvimento Sem Validade Fiscal")])
+        agora = timezone.now()
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(agora - timezone.timedelta(days=1))
+            .not_valid_after(agora + timezone.timedelta(days=1))
+            .sign(key, hashes.SHA256())
+        )
+        return MaterialAssinatura(
+            private_key_pem=key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ),
+            certificate_pem=cert.public_bytes(serialization.Encoding.PEM),
+        )
+
+
+def emitir_nfce_para_venda_finalizada(venda, *, material_provider=None, sefaz_client=None, qr_config=None):
+    material = (material_provider or obter_material_provider_configurado()).obter()
+    client = sefaz_client or obter_sefaz_client_configurado()
+    qr = qr_config or obter_qr_config_configurado()
+    nfce = gerar_nfce_local(venda, material_assinatura=material, qr_config=qr, tipo_emissao="1")
+    resultado = client.transmitir(nfce)
+    if resultado.status in {SefazNFCeClient.INDISPONIVEL, SefazNFCeClient.TIMEOUT}:
+        config = _obter_config_bloqueada(venda.hub)
+        nfce = regenerar_nfce_em_contingencia(
+            nfce,
+            config,
+            material,
+            qr,
+            resultado.mensagem or "SEFAZ indisponivel no ambiente local.",
+        )
+        return nfce, ResultadoSefazNFCe(status=resultado.status, mensagem=resultado.mensagem, simulacao=resultado.simulacao)
+    if resultado.status == SefazNFCeClient.REJEITADA:
+        nfce.status = NFCeHub.STATUS_REJEITADA
+        nfce.mensagem_retorno = resultado.mensagem
+        nfce.save(update_fields=["status", "mensagem_retorno", "atualizado_em"])
+        raise NFCeErroDominio("NFCE_REJEITADA", resultado.mensagem or "NFCE_REJEITADA")
+    nfce.mensagem_retorno = resultado.mensagem
+    nfce.save(update_fields=["mensagem_retorno", "atualizado_em"])
+    return nfce, resultado
+
+
+def regenerar_nfce_em_contingencia(nfce, config, material_assinatura, qr_config, justificativa):
+    entrada = timezone.now()
+    chave, dv = gerar_chave_acesso(
+        uf=config.uf,
+        emissao=nfce.emitida_em,
+        cnpj=config.cnpj,
+        serie=nfce.serie,
+        numero=nfce.numero,
+        tipo_emissao="9",
+        codigo_numerico=nfce.codigo_numerico,
+    )
+    nfce.tipo_emissao = "9"
+    nfce.chave_acesso = chave
+    nfce.digito_verificador = dv
+    nfce.entrada_contingencia_em = entrada
+    nfce.justificativa_contingencia = justificativa[:255]
+    nfce.status = NFCeHub.STATUS_GERANDO
+    nfce.save(update_fields=[
+        "tipo_emissao",
+        "chave_acesso",
+        "digito_verificador",
+        "entrada_contingencia_em",
+        "justificativa_contingencia",
+        "status",
+        "atualizado_em",
+    ])
+    qr_payload = gerar_qr_code_payload(nfce, config, qr_config, material_assinatura=material_assinatura)
+    xml = montar_xml_nfce(nfce, config, qr_payload, qr_config.url_chave)
+    xml_assinado = assinar_xml_nfce(xml, material_assinatura)
+    nfce.xml_sem_assinatura = xml
+    nfce.xml_assinado = xml_assinado
+    nfce.qr_code_payload = qr_payload
+    nfce.status = NFCeHub.STATUS_CONTINGENCIA
+    nfce.mensagem_retorno = justificativa[:255]
+    nfce.save(update_fields=[
+        "xml_sem_assinatura",
+        "xml_assinado",
+        "qr_code_payload",
+        "status",
+        "mensagem_retorno",
+        "atualizado_em",
+    ])
+    return nfce
+
+
+def obter_material_provider_configurado():
+    modo = (getattr(settings, "SYSVARHUB_NFCE_MATERIAL_MODE", "") or "").upper()
+    if modo == "DESENVOLVIMENTO":
+        if getattr(settings, "SYSVARHUB_NFCE_SEFAZ_CLIENT", "").upper() != "DESENVOLVIMENTO":
+            raise NFCeConfiguracaoErro("MATERIAL_DESENVOLVIMENTO_REQUER_SEFAZ_DESENVOLVIMENTO")
+        return NFCeMaterialProviderDesenvolvimento()
+    raise NFCeConfiguracaoErro("MATERIAL_ASSINATURA_NFCE_NAO_CONFIGURADO")
+
+
+def obter_sefaz_client_configurado():
+    modo = (getattr(settings, "SYSVARHUB_NFCE_SEFAZ_CLIENT", "") or "").upper()
+    if modo == "DESENVOLVIMENTO":
+        resultado = (getattr(settings, "SYSVARHUB_NFCE_SEFAZ_DESENVOLVIMENTO_RESULTADO", "") or "AUTORIZADA").upper()
+        return SefazNFCeClientDesenvolvimento(resultado)
+    raise NFCeConfiguracaoErro("CLIENTE_SEFAZ_NFCE_NAO_CONFIGURADO")
+
+
+def obter_qr_config_configurado():
+    url_qrcode = getattr(settings, "SYSVARHUB_NFCE_QRCODE_URL", "") or ""
+    url_chave = getattr(settings, "SYSVARHUB_NFCE_URL_CHAVE", "") or ""
+    if not url_qrcode or not url_chave:
+        raise NFCeConfiguracaoErro("QR_CODE_NFCE_NAO_CONFIGURADO")
+    return ConfigQRCodeDesenvolvimento(url_qrcode=url_qrcode, url_chave=url_chave)
+
+
+def validar_nfce_para_finalizacao(venda):
+    config = _obter_config_bloqueada(venda.hub)
+    _validar_conteudo_nfce(venda, config)
+    _validar_material_desenvolvimento_fora_de_producao(config)
+    obter_material_provider_configurado()
+    obter_sefaz_client_configurado()
+    obter_qr_config_configurado()
+    return config
+
+
+def _validar_material_desenvolvimento_fora_de_producao(config):
+    modo = (getattr(settings, "SYSVARHUB_NFCE_MATERIAL_MODE", "") or "").upper()
+    if config.ambiente_fiscal == "PRODUCAO" and modo == "DESENVOLVIMENTO":
+        raise NFCeConfiguracaoErro("MATERIAL_DESENVOLVIMENTO_NAO_PERMITIDO_EM_PRODUCAO")
+
+
+def gerar_nfce_local(venda, *, material_assinatura, qr_config, codigo_numerico=None, tipo_emissao="1", justificativa_contingencia=""):
     erro_para_relancar = None
     resultado = None
     with transaction.atomic():
@@ -80,7 +270,7 @@ def gerar_nfce_local(venda, *, material_assinatura, qr_config, codigo_numerico=N
             cnpj=config.cnpj,
             serie=serie,
             numero=numero,
-            tipo_emissao="1",
+            tipo_emissao=tipo_emissao,
             codigo_numerico=c_nf,
         )
         nfce = NFCeHub.objects.create(
@@ -92,13 +282,15 @@ def gerar_nfce_local(venda, *, material_assinatura, qr_config, codigo_numerico=N
             codigo_numerico=c_nf,
             digito_verificador=dv,
             chave_acesso=chave,
-            tipo_emissao="1",
+            tipo_emissao=tipo_emissao,
             status=NFCeHub.STATUS_GERANDO,
             emitida_em=emitida_em,
+            entrada_contingencia_em=emitida_em if tipo_emissao == "9" else None,
+            justificativa_contingencia=justificativa_contingencia if tipo_emissao == "9" else "",
         )
 
         try:
-            qr_payload = gerar_qr_code_payload(nfce, config, qr_config)
+            qr_payload = gerar_qr_code_payload(nfce, config, qr_config, material_assinatura=material_assinatura)
             xml = montar_xml_nfce(nfce, config, qr_payload, qr_config.url_chave)
             xml_assinado = assinar_xml_nfce(xml, material_assinatura)
         except NFCeErroDominio as exc:
@@ -119,7 +311,7 @@ def gerar_nfce_local(venda, *, material_assinatura, qr_config, codigo_numerico=N
             nfce.xml_sem_assinatura = xml
             nfce.xml_assinado = xml_assinado
             nfce.qr_code_payload = qr_payload
-            nfce.status = NFCeHub.STATUS_GERADA
+            nfce.status = NFCeHub.STATUS_CONTINGENCIA if tipo_emissao == "9" else NFCeHub.STATUS_GERADA
             nfce.save(update_fields=["xml_sem_assinatura", "xml_assinado", "qr_code_payload", "status", "atualizado_em"])
             resultado = nfce
     if erro_para_relancar:
@@ -130,6 +322,10 @@ def gerar_nfce_local(venda, *, material_assinatura, qr_config, codigo_numerico=N
 def _validar_venda_finalizada(venda):
     if venda.status != VendaHub.STATUS_FINALIZADA:
         raise NFCeErroDominio("VENDA_NAO_FINALIZADA")
+
+
+def nfce_habilitada_para_hub(hub):
+    return ConfiguracaoFiscalHub.objects.filter(hub=hub, emite_nfce=True).exists()
 
 
 def _obter_config_bloqueada(hub):
@@ -239,6 +435,37 @@ def montar_xml_nfce(nfce, config, qr_code_payload, url_chave):
     return ET.tostring(root, encoding="unicode", short_empty_elements=False)
 
 
+def _validar_conteudo_nfce(venda, config):
+    itens = list(venda.itens.all().order_by("id"))
+    pagamentos = list(venda.pagamentos.filter(status=VendaPagamentoHub.STATUS_ATIVO).order_by("id"))
+    if not itens:
+        raise NFCeErroDominio("DADOS_FISCAIS_INSUFICIENTES")
+    if not pagamentos:
+        raise NFCeErroDominio("PAGAMENTO_SEM_TPAG")
+    if Decimal(venda.desconto_geral or 0) != Decimal("0"):
+        raise NFCeErroDominio("DESCONTO_GERAL_FISCAL_NAO_SUPORTADO")
+    for item in itens:
+        fiscal = item.fiscal or {}
+        _validar_fiscal_item(fiscal)
+        v_prod = money(Decimal(item.quantidade) * Decimal(item.preco_unitario))
+        v_bc = money(v_prod - money(item.desconto))
+        imposto = ET.Element(q("imposto"))
+        _montar_icms(imposto, fiscal, config, v_bc)
+        _montar_pis(imposto, fiscal, v_bc)
+        _montar_cofins(imposto, fiscal, v_bc)
+    for pagamento in pagamentos:
+        mapas = list(
+            FormaPagamentoFiscalMapHub.objects.filter(
+                hub=venda.hub,
+                forma_pagamento_retaguarda_id=pagamento.retaguarda_forma_pagamento_id,
+            ).order_by("codigo_tpag")
+        )
+        if not mapas:
+            raise NFCeErroDominio("PAGAMENTO_SEM_TPAG")
+        if len(mapas) > 1:
+            raise NFCeErroDominio("PAGAMENTO_TPAG_AMBIGUO")
+
+
 def _montar_ide(inf, nfce, config):
     ide = ET.SubElement(inf, q("ide"))
     for tag, valor in (
@@ -263,6 +490,9 @@ def _montar_ide(inf, nfce, config):
         ("verProc", "SysvarHub-1"),
     ):
         ide.append(_el(tag, valor))
+    if nfce.tipo_emissao == "9":
+        ide.append(_el("dhCont", nfce.entrada_contingencia_em.isoformat()))
+        ide.append(_el("xJust", nfce.justificativa_contingencia))
 
 
 def _montar_emit(inf, config):
@@ -551,10 +781,51 @@ def verificar_assinatura_nfce(xml_assinado):
         return False
 
 
-def gerar_qr_code_payload(nfce, config, qr_config):
+def gerar_qr_code_payload(nfce, config, qr_config, *, material_assinatura=None):
     if qr_config.versao != 3:
         raise NFCeErroDominio("QR_CODE_VERSAO_NAO_SUPORTADA")
+    if nfce.tipo_emissao == "9":
+        if material_assinatura is None:
+            raise NFCeErroDominio("MATERIAL_ASSINATURA_INDISPONIVEL")
+        assinatura = assinar_qr_code_offline(nfce, material_assinatura)
+        return "|".join([
+            f"{qr_config.url_qrcode}?p={nfce.chave_acesso}",
+            "3",
+            _tp_amb(config.ambiente_fiscal),
+            nfce.emitida_em.strftime("%d"),
+            dec(nfce.venda.total, 2),
+            _tipo_identificacao_destinatario(nfce.venda),
+            somente_digitos(nfce.venda.cliente_documento or ""),
+            assinatura,
+        ])
     return f"{qr_config.url_qrcode}?p={nfce.chave_acesso}|3|{_tp_amb(config.ambiente_fiscal)}"
+
+
+def assinar_qr_code_offline(nfce, material):
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+    except ImportError as exc:
+        raise NFCeErroDominio("DADOS_FISCAIS_INSUFICIENTES") from exc
+    payload = "|".join([
+        nfce.chave_acesso,
+        "3",
+        _tp_amb(nfce.ambiente),
+        nfce.emitida_em.strftime("%d"),
+        dec(nfce.venda.total, 2),
+        _tipo_identificacao_destinatario(nfce.venda),
+        somente_digitos(nfce.venda.cliente_documento or ""),
+    ])
+    key = serialization.load_pem_private_key(material.private_key_pem, password=None)
+    assinatura = key.sign(payload.encode("utf-8"), padding.PKCS1v15(), hashes.SHA1())
+    return base64.b64encode(assinatura).decode("ascii")
+
+
+def listar_nfces_pendentes_transmissao(hub=None):
+    qs = NFCeHub.objects.filter(status__in=[NFCeHub.STATUS_CONTINGENCIA, NFCeHub.STATUS_PENDENTE_TRANSMISSAO]).order_by("emitida_em", "id")
+    if hub is not None:
+        qs = qs.filter(hub=hub)
+    return qs
 
 
 def q(tag):
@@ -580,6 +851,15 @@ def _elds(tag, text=None, attrs=None):
 
 def somente_digitos(valor):
     return re.sub(r"\D", "", str(valor or ""))
+
+
+def _tipo_identificacao_destinatario(venda):
+    documento = somente_digitos(venda.cliente_documento or "")
+    if len(documento) == 11:
+        return "1"
+    if len(documento) == 14:
+        return "2"
+    return ""
 
 
 def dec(valor, casas):

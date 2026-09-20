@@ -20,6 +20,7 @@ from core.services.nfce import (
     calcular_dv_chave,
     gerar_chave_acesso,
     gerar_nfce_local,
+    listar_nfces_pendentes_transmissao,
     verificar_assinatura_nfce,
 )
 from core.tests_pagamentos import PagamentoHubTestMixin
@@ -106,9 +107,13 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
         )
 
     def venda_finalizada(self, valor_pagamento="199.90"):
+        self.config.emite_nfce = False
+        self.config.save(update_fields=["emite_nfce"])
         venda_uuid = self.criar_venda_com_item()
         self.pagar(venda_uuid, self.dinheiro, valor=valor_pagamento)
         self.finalizar(venda_uuid)
+        self.config.emite_nfce = True
+        self.config.save(update_fields=["emite_nfce"])
         return VendaHub.objects.get(venda_uuid=venda_uuid)
 
     def gerar_nfce(self, venda, codigo_numerico="12345678"):
@@ -327,8 +332,44 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
         ns = {"n": "http://www.portalfiscal.inf.br/nfe"}
         self.assertEqual(root.find("n:infNFe/n:pag/n:vTroco", ns).text, "0.10")
 
+    def test_qr_code_offline_v3_tem_assinatura_valida_e_pendencia_listavel(self):
+        venda = self.venda_finalizada()
+        nfce = gerar_nfce_local(
+            venda,
+            material_assinatura=self.material,
+            qr_config=self.qr,
+            codigo_numerico="12345678",
+            tipo_emissao="9",
+            justificativa_contingencia="SEFAZ indisponivel em teste",
+        )
+
+        self.assertEqual(nfce.status, NFCeHub.STATUS_CONTINGENCIA)
+        self.assertEqual(nfce.chave_acesso[34], "9")
+        self.assertIn("<dhCont>", nfce.xml_assinado)
+        self.assertIn("<xJust>SEFAZ indisponivel em teste</xJust>", nfce.xml_assinado)
+        self.assertNotIn("cHashQRCode", nfce.qr_code_payload)
+        self.assertIn(nfce, list(listar_nfces_pendentes_transmissao(self.hub)))
+        partes = nfce.qr_code_payload.split("?p=", 1)[1].split("|")
+        self.assertEqual(partes[:3], [nfce.chave_acesso, "3", "2"])
+        self.assertEqual(partes[5], "")
+        self.assertEqual(partes[6], "")
+        self._verificar_assinatura_qr_offline(partes, self.material)
+
     def _digest_inf_nfe(self, xml, chave):
         root = etree.fromstring(xml.encode("utf-8"), parser=etree.XMLParser(remove_blank_text=True))
         inf = root.xpath("//*[@Id=$id]", id=f"NFe{chave}")[0]
         canonico = etree.tostring(inf, method="c14n", exclusive=False, with_comments=False)
         return base64.b64encode(hashlib.sha1(canonico).digest()).decode("ascii")
+
+    def _verificar_assinatura_qr_offline(self, partes, material):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        cert = x509.load_pem_x509_certificate(material.certificate_pem)
+        cert.public_key().verify(
+            base64.b64decode(partes[7]),
+            "|".join(partes[:7]).encode("utf-8"),
+            padding.PKCS1v15(),
+            hashes.SHA1(),
+        )

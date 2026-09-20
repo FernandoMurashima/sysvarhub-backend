@@ -2,13 +2,15 @@ import uuid
 from decimal import Decimal
 
 from django.db import connection
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from core.models import (
     CatalogoItemHub,
+    ConfiguracaoFiscalHub,
     EstoqueMovimentoHub,
+    FormaPagamentoFiscalMapHub,
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
     SessaoCaixaHub,
@@ -18,12 +20,27 @@ from core.models import (
     VendaPagamentoHub,
     VendaPagamentoParcelaHub,
     VendedorHub,
+    NFCeHub,
 )
 from core.services.caixa import fechar_caixa
 from core.services.terminais import configurar_terminal
 from core.services.vendas import calcular_disponivel_local, listar_formas_pagamento
 from core.tests_caixa import criar_hub
 from core.tests_vendas import VendaHubTestMixin
+
+
+FISCAL_ITEM_NFCE = {
+    "ncm": "62046200",
+    "origem_mercadoria": 0,
+    "cfop_venda_dentro": "5102",
+    "cfop_venda_fora": "6102",
+    "csosn_ou_cst_icms": "102",
+    "aliquota_icms": "0.00",
+    "cst_pis": "01",
+    "aliq_pis": "0.0000",
+    "cst_cofins": "01",
+    "aliq_cofins": "0.0000",
+}
 
 
 class PagamentoHubTestMixin(VendaHubTestMixin):
@@ -363,6 +380,38 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
 
 
 class VendaFinalizacaoTests(PagamentoHubTestMixin, TestCase):
+    def habilitar_nfce(self):
+        self.catalogo_item.fiscal = FISCAL_ITEM_NFCE.copy()
+        self.catalogo_item.save(update_fields=["fiscal"])
+        config = ConfiguracaoFiscalHub.objects.create(
+            hub=self.hub,
+            emite_nfce=True,
+            ambiente_fiscal="HOMOLOGACAO",
+            regime_tributario="SIMPLES",
+            inscricao_estadual="110042490114",
+            serie_nfce=7,
+            proximo_numero_nfce=10,
+            razao_social="Empresa Teste Ltda",
+            nome_fantasia="Empresa Teste",
+            cnpj="12345678000199",
+            endereco="Rua Teste",
+            numero="123",
+            bairro="Centro",
+            cidade="Sao Paulo",
+            uf="SP",
+            cep="01001000",
+            codigo_municipio_ibge="3550308",
+            sincronizado_em=timezone.now(),
+        )
+        FormaPagamentoFiscalMapHub.objects.create(
+            hub=self.hub,
+            forma_pagamento_retaguarda_id=self.dinheiro.retaguarda_id,
+            codigo_tpag="01",
+            descricao_fiscal="Dinheiro",
+            sincronizado_em=timezone.now(),
+        )
+        return config
+
     def test_venda_sem_item_nao_finaliza(self):
         venda = VendaHub.objects.create(
             hub=self.hub,
@@ -403,6 +452,112 @@ class VendaFinalizacaoTests(PagamentoHubTestMixin, TestCase):
         self.assertIsNone(venda.chave_venda_aberta_terminal)
         self.assertEqual(venda.operador_finalizacao, self.operador)
         self.assertEqual(EstoqueMovimentoHub.objects.count(), 1)
+        self.assertEqual(resposta.data["venda"]["fiscal"], {"emite_nfce": False})
+        self.assertEqual(NFCeHub.objects.count(), 0)
+
+    @override_settings(
+        SYSVARHUB_NFCE_MATERIAL_MODE="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_CLIENT="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_DESENVOLVIMENTO_RESULTADO="AUTORIZADA",
+        SYSVARHUB_NFCE_QRCODE_URL="https://sefaz.test/qrcode",
+        SYSVARHUB_NFCE_URL_CHAVE="https://sefaz.test/consulta",
+    )
+    def test_finalizacao_com_nfce_cria_documento_e_payload_fiscal(self):
+        self.habilitar_nfce()
+        venda_uuid = self.criar_venda_com_item()
+        self.pagar(venda_uuid, self.dinheiro)
+
+        resposta = self.finalizar(venda_uuid)
+        nfce = NFCeHub.objects.get()
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(nfce.status, NFCeHub.STATUS_GERADA)
+        self.assertEqual(nfce.tipo_emissao, "1")
+        self.assertEqual(nfce.protocolo, "")
+        self.assertIn(f"?p={nfce.chave_acesso}|3|2", nfce.qr_code_payload)
+        self.assertIn("SIMULACAO_SEFAZ_AUTORIZADA_SEM_VALOR_FISCAL", nfce.mensagem_retorno)
+        self.assertEqual(resposta.data["venda"]["fiscal"]["emite_nfce"], True)
+        self.assertEqual(resposta.data["venda"]["fiscal"]["nfce_uuid"], str(nfce.nfce_uuid))
+        self.assertEqual(resposta.data["venda"]["fiscal"]["tipo_emissao"], "1")
+        self.assertNotIn("PRIVATE KEY", str(resposta.data))
+        self.assertNotIn("CERTIFICATE", str(resposta.data))
+
+    @override_settings(
+        SYSVARHUB_NFCE_MATERIAL_MODE="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_CLIENT="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_DESENVOLVIMENTO_RESULTADO="AUTORIZADA",
+        SYSVARHUB_NFCE_QRCODE_URL="https://sefaz.test/qrcode",
+        SYSVARHUB_NFCE_URL_CHAVE="https://sefaz.test/consulta",
+    )
+    def test_erro_fiscal_pre_validacao_nao_finaliza_nem_consume_numero(self):
+        config = self.habilitar_nfce()
+        venda_uuid = self.criar_venda_com_item()
+        item = VendaItemHub.objects.get()
+        item.fiscal = {}
+        item.save(update_fields=["fiscal"])
+        self.pagar(venda_uuid, self.dinheiro)
+
+        resposta = self.finalizar(venda_uuid)
+        venda = VendaHub.objects.get()
+        config.refresh_from_db()
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(resposta.data["detail"], "PRODUTO_SEM_NCM")
+        self.assertEqual(venda.status, VendaHub.STATUS_ABERTA)
+        self.assertEqual(EstoqueMovimentoHub.objects.count(), 0)
+        self.assertEqual(VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_VENDA_FINALIZADA).count(), 0)
+        self.assertEqual(NFCeHub.objects.count(), 0)
+        self.assertEqual(config.proximo_numero_nfce, 10)
+
+    @override_settings(
+        SYSVARHUB_NFCE_MATERIAL_MODE="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_CLIENT="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_DESENVOLVIMENTO_RESULTADO="AUTORIZADA",
+        SYSVARHUB_NFCE_QRCODE_URL="https://sefaz.test/qrcode",
+        SYSVARHUB_NFCE_URL_CHAVE="https://sefaz.test/consulta",
+    )
+    def test_retry_finalizar_com_nfce_nao_duplica_documento_numero_movimento_nem_evento(self):
+        config = self.habilitar_nfce()
+        venda_uuid = self.criar_venda_com_item()
+        self.pagar(venda_uuid, self.dinheiro)
+
+        primeira = self.finalizar(venda_uuid)
+        segunda = self.finalizar(venda_uuid)
+        config.refresh_from_db()
+
+        self.assertEqual(primeira.status_code, 200)
+        self.assertEqual(segunda.status_code, 200)
+        self.assertEqual(NFCeHub.objects.count(), 1)
+        self.assertEqual(NFCeHub.objects.get().numero, 10)
+        self.assertEqual(config.proximo_numero_nfce, 11)
+        self.assertEqual(EstoqueMovimentoHub.objects.count(), 1)
+        self.assertEqual(VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_VENDA_FINALIZADA).count(), 1)
+
+    @override_settings(
+        SYSVARHUB_NFCE_MATERIAL_MODE="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_CLIENT="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_DESENVOLVIMENTO_RESULTADO="TIMEOUT",
+        SYSVARHUB_NFCE_QRCODE_URL="https://sefaz.test/qrcode",
+        SYSVARHUB_NFCE_URL_CHAVE="https://sefaz.test/consulta",
+    )
+    def test_finalizacao_com_timeout_gera_contingencia_offline(self):
+        self.habilitar_nfce()
+        venda_uuid = self.criar_venda_com_item()
+        self.pagar(venda_uuid, self.dinheiro)
+
+        resposta = self.finalizar(venda_uuid)
+        nfce = NFCeHub.objects.get()
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(nfce.status, NFCeHub.STATUS_CONTINGENCIA)
+        self.assertEqual(nfce.tipo_emissao, "9")
+        self.assertEqual(nfce.chave_acesso[34], "9")
+        self.assertIn("<tpEmis>9</tpEmis>", nfce.xml_assinado)
+        self.assertIn("<dhCont>", nfce.xml_assinado)
+        self.assertIn("<xJust>SIMULACAO_SEFAZ_TIMEOUT</xJust>", nfce.xml_assinado)
+        self.assertIn(f"?p={nfce.chave_acesso}|3|2|", nfce.qr_code_payload)
+        self.assertNotIn("cHashQRCode", nfce.qr_code_payload)
+        self.assertEqual(resposta.data["venda"]["fiscal"]["contingencia"], True)
 
     def test_um_movimento_por_item_e_catalogo_bruto_nao_alterado(self):
         venda_uuid = self.criar_venda_com_item()

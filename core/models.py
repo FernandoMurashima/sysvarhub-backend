@@ -1457,6 +1457,8 @@ class NFCeHub(models.Model):
     mensagem_retorno = models.CharField(max_length=255, blank=True, default="")
     emitida_em = models.DateTimeField()
     autorizada_em = models.DateTimeField(null=True, blank=True)
+    entrada_contingencia_em = models.DateTimeField(null=True, blank=True)
+    justificativa_contingencia = models.CharField(max_length=255, blank=True, default="")
     criado_em = models.DateTimeField(auto_now_add=True)
     atualizado_em = models.DateTimeField(auto_now=True)
 
