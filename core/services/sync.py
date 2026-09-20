@@ -1,4 +1,6 @@
 import uuid
+import json
+import hashlib
 from datetime import timedelta
 
 from django.db import transaction
@@ -124,21 +126,22 @@ def payload_nfce_atualizada(nfce):
 
 def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=None):
     agora = agora or timezone.now()
-    qs = EventoSyncHub.objects.select_for_update().filter(
-        status__in=[EventoSyncHub.STATUS_PENDENTE, EventoSyncHub.STATUS_ERRO, EventoSyncHub.STATUS_PROCESSANDO],
-    )
-    if hub is not None:
-        qs = qs.filter(hub=hub)
-    qs = qs.filter(Q(proxima_tentativa_em__isnull=True) | Q(proxima_tentativa_em__lte=agora))
-    eventos = list(qs.order_by("criado_em", "id")[:limite])
+    with transaction.atomic():
+        qs = EventoSyncHub.objects.select_for_update().filter(
+            status__in=[EventoSyncHub.STATUS_PENDENTE, EventoSyncHub.STATUS_ERRO, EventoSyncHub.STATUS_PROCESSANDO],
+        )
+        if hub is not None:
+            qs = qs.filter(hub=hub)
+        qs = qs.filter(Q(proxima_tentativa_em__isnull=True) | Q(proxima_tentativa_em__lte=agora))
+        eventos = list(qs.order_by("criado_em", "id")[:limite])
+        for evento in eventos:
+            evento.status = EventoSyncHub.STATUS_PROCESSANDO
+            evento.tentativas += 1
+            evento.save(update_fields=["status", "tentativas", "atualizado_em"])
     if not eventos:
         return {"enviados": 0, "sincronizados": 0, "conflitos": 0, "erros": 0}
     hub = eventos[0].hub
     client = client or RetaguardaClient(hub.retaguarda_url)
-    for evento in eventos:
-        evento.status = EventoSyncHub.STATUS_PROCESSANDO
-        evento.tentativas += 1
-        evento.save(update_fields=["status", "tentativas", "atualizado_em"])
     try:
         resposta = client.sync_push(token=hub.retaguarda_token, eventos=[_serializar_evento(e) for e in eventos])
     except RetaguardaError as exc:
@@ -172,20 +175,20 @@ def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=Non
 def _criar_ou_atualizar_evento(*, hub, tipo, chave, payload, evento_uuid):
     if any(segredo in str(payload).lower() for segredo in SEGREDOS_BLOQUEADOS):
         raise ValueError("Payload de sync contém segredo fiscal.")
-    evento, _created = EventoSyncHub.objects.update_or_create(
-        hub=hub,
-        chave_idempotencia=chave,
-        defaults={
-            "evento_uuid": evento_uuid,
-            "tipo": tipo,
-            "payload": payload,
-            "status": EventoSyncHub.STATUS_PENDENTE,
-            "ultimo_erro": "",
-            "resposta": {},
-            "proxima_tentativa_em": None,
-        },
-    )
-    return evento
+    with transaction.atomic():
+        existente = EventoSyncHub.objects.select_for_update().filter(hub=hub, chave_idempotencia=chave).first()
+        if existente:
+            if _payload_hash(existente.payload) != _payload_hash(payload):
+                raise ValueError("Chave idempotente já existe com payload diferente.")
+            return existente
+        return EventoSyncHub.objects.create(
+            hub=hub,
+            chave_idempotencia=chave,
+            evento_uuid=evento_uuid,
+            tipo=tipo,
+            payload=payload,
+            status=EventoSyncHub.STATUS_PENDENTE,
+        )
 
 
 def _serializar_evento(evento):
@@ -208,6 +211,11 @@ def _marcar_retry(evento, mensagem, agora, resposta=None):
 
 def _uuid_deterministico(*partes):
     return uuid.uuid5(uuid.NAMESPACE_URL, ":".join(str(p) for p in partes))
+
+
+def _payload_hash(payload):
+    normalizado = json.dumps(payload or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(normalizado.encode("utf-8")).hexdigest()
 
 
 def _venda_queryset():

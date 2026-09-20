@@ -1,8 +1,12 @@
 import base64
 import hashlib
+import json
 import os
 import random
 import re
+import ssl
+import tempfile
+from urllib import error, request
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from xml.etree import ElementTree as ET
@@ -93,38 +97,116 @@ class SefazNFCeClient:
 
 class SefazNFCeClientDesenvolvimento(SefazNFCeClient):
     def __init__(self, resultado=None):
-        self.resultado = resultado or SefazNFCeClient.AUTORIZADA
+        self.resultado = resultado or NFCeHub.STATUS_GERADA
 
     def transmitir(self, nfce):
         mensagens = {
-            self.AUTORIZADA: "SIMULACAO_SEFAZ_AUTORIZADA_SEM_VALOR_FISCAL",
+            self.AUTORIZADA: "SIMULACAO_SEFAZ_AUTORIZADA_IGNORADA_SEM_VALOR_FISCAL",
+            NFCeHub.STATUS_GERADA: "SIMULACAO_SEFAZ_DESENVOLVIMENTO_SEM_AUTORIZACAO_FISCAL",
             self.REJEITADA: "SIMULACAO_SEFAZ_REJEITADA_SEM_VALOR_FISCAL",
             self.INDISPONIVEL: "SIMULACAO_SEFAZ_INDISPONIVEL",
             self.TIMEOUT: "SIMULACAO_SEFAZ_TIMEOUT",
         }
         return ResultadoSefazNFCe(
-            status=self.resultado,
-            codigo="100" if self.resultado == self.AUTORIZADA else "",
+            status=NFCeHub.STATUS_GERADA if self.resultado == self.AUTORIZADA else self.resultado,
+            codigo="",
             mensagem=mensagens.get(self.resultado, "SIMULACAO_SEFAZ_RESULTADO_DESCONHECIDO"),
-            protocolo="SIMULADO" if self.resultado == self.AUTORIZADA else "",
-            autorizada_em=timezone.now() if self.resultado == self.AUTORIZADA else None,
+            protocolo="",
+            autorizada_em=None,
             simulacao=True,
         )
 
 
 class SefazNFCeClientReal(SefazNFCeClient):
-    def __init__(self, *, autorizacao_url, consulta_url="", evento_url="", timeout=30):
+    def __init__(self, *, autorizacao_url, consulta_url="", evento_url="", timeout=30, transport=None, material_provider=None):
         self.autorizacao_url = autorizacao_url
         self.consulta_url = consulta_url
         self.evento_url = evento_url
         self.timeout = timeout
+        self.transport = transport or self._post_xml
+        self.material_provider = material_provider
+        self._transport_injetado = transport is not None
 
     def transmitir(self, nfce):
         if not self.autorizacao_url:
             raise NFCeConfiguracaoErro("SEFAZ_ENDPOINT_NAO_CONFIGURADO")
-        # Transporte real preparado para integração por mock/teste. A chamada externa fica
-        # desabilitada até homologação formal para evitar emissão acidental.
-        raise NFCeConfiguracaoErro("SEFAZ_REAL_NAO_HOMOLOGADA")
+        if not nfce.xml_assinado:
+            raise NFCeErroDominio("NFCE_SEM_XML_ASSINADO")
+        material = None if self._transport_injetado else (self.material_provider or obter_material_provider_configurado()).obter()
+        try:
+            resposta = self.transport(self.autorizacao_url, nfce.xml_assinado, self.timeout, material)
+        except TimeoutError:
+            return ResultadoSefazNFCe(status=self.TIMEOUT, mensagem="SEFAZ_TIMEOUT")
+        except (OSError, error.URLError):
+            return ResultadoSefazNFCe(status=self.INDISPONIVEL, mensagem="SEFAZ_INDISPONIVEL")
+        return self._interpretar_resposta(resposta)
+
+    @staticmethod
+    def _post_xml(url, xml, timeout, material):
+        cert_path = key_path = None
+        context = ssl.create_default_context()
+        try:
+            cert_fd, cert_path = tempfile.mkstemp(prefix="sysvarhub-nfce-cert-", suffix=".pem")
+            key_fd, key_path = tempfile.mkstemp(prefix="sysvarhub-nfce-key-", suffix=".pem")
+            with os.fdopen(cert_fd, "wb") as cert_file:
+                cert_file.write(material.certificate_pem)
+                for chain in material.chain_pem:
+                    cert_file.write(chain)
+            with os.fdopen(key_fd, "wb") as key_file:
+                key_file.write(material.private_key_pem)
+            context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+            opener = request.build_opener(request.HTTPSHandler(context=context))
+            req = request.Request(
+                url,
+                data=xml.encode("utf-8"),
+                headers={"Content-Type": "application/xml; charset=utf-8", "Accept": "application/json, application/xml"},
+                method="POST",
+            )
+            with opener.open(req, timeout=timeout) as response:
+                return response.read().decode("utf-8")
+        finally:
+            for path in (cert_path, key_path):
+                if path:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+
+    def _interpretar_resposta(self, resposta):
+        dados = resposta if isinstance(resposta, dict) else {}
+        if not dados:
+            try:
+                dados = json.loads(str(resposta or "{}"))
+            except json.JSONDecodeError:
+                dados = self._interpretar_xml(str(resposta or ""))
+        status = str(dados.get("status") or "").upper()
+        codigo = str(dados.get("codigo") or dados.get("cstat") or "")
+        mensagem = str(dados.get("mensagem") or dados.get("xmotivo") or "")
+        if status == self.AUTORIZADA or codigo in {"100", "150"}:
+            return ResultadoSefazNFCe(
+                status=self.AUTORIZADA,
+                codigo=codigo,
+                mensagem=mensagem,
+                protocolo=str(dados.get("protocolo") or ""),
+                autorizada_em=dados.get("autorizada_em") or timezone.now(),
+                xml_protocolo=str(dados.get("xml_protocolo") or dados.get("xml") or ""),
+            )
+        if status == self.REJEITADA or codigo:
+            return ResultadoSefazNFCe(status=self.REJEITADA, codigo=codigo, mensagem=mensagem)
+        return ResultadoSefazNFCe(status=self.INDISPONIVEL, mensagem=mensagem or "SEFAZ_RESPOSTA_INVALIDA")
+
+    @staticmethod
+    def _interpretar_xml(xml):
+        from xml.etree import ElementTree as ET
+
+        root = ET.fromstring(xml)
+        texto = {element.tag.rsplit("}", 1)[-1].lower(): element.text or "" for element in root.iter()}
+        return {
+            "codigo": texto.get("cstat", ""),
+            "mensagem": texto.get("xmotivo", ""),
+            "protocolo": texto.get("nprot", ""),
+            "xml_protocolo": xml,
+        }
 
 
 class NFCeMaterialProvider:
@@ -244,7 +326,7 @@ def processar_nfce_preparada(nfce, *, material_provider=None, sefaz_client=None,
             nfce.save(update_fields=["status", "codigo_retorno", "mensagem_retorno", "atualizado_em"])
             _enfileirar_nfce_para_central(nfce)
             return nfce, resultado
-        if resultado.status == SefazNFCeClient.AUTORIZADA:
+        if resultado.status == SefazNFCeClient.AUTORIZADA and not resultado.simulacao:
             nfce.status = NFCeHub.STATUS_AUTORIZADA
             nfce.codigo_retorno = resultado.codigo
             nfce.mensagem_retorno = resultado.mensagem

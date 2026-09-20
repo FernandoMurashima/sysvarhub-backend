@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 import base64
 import hashlib
+import uuid
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -22,16 +23,19 @@ from core.services.nfce import (
     NFCeErroDominio,
     SIGNATURE_ALGORITHM,
     SefazNFCeClient,
+    SefazNFCeClientDesenvolvimento,
+    SefazNFCeClientReal,
     ResultadoSefazNFCe,
     calcular_dv_chave,
     gerar_chave_acesso,
     gerar_nfce_local,
     listar_nfces_pendentes_transmissao,
     preparar_nfce_para_venda_finalizada,
+    processar_nfce_preparada,
     retransmitir_nfces_pendentes,
     verificar_assinatura_nfce,
 )
-from core.services.sync import enfileirar_nfce_atualizada, enfileirar_venda_finalizada, sincronizar_eventos_pendentes
+from core.services.sync import _criar_ou_atualizar_evento, enfileirar_nfce_atualizada, enfileirar_venda_finalizada, sincronizar_eventos_pendentes
 from core.services.danfe_nfce import montar_dados_danfe_nfce
 from core.tests_caixa import criar_hub
 from core.tests_pagamentos import PagamentoHubTestMixin
@@ -512,13 +516,61 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
         evento.refresh_from_db()
         self.assertEqual(evento.status, EventoSyncHub.STATUS_SINCRONIZADO)
 
+        conflito = _criar_ou_atualizar_evento(
+            hub=self.hub,
+            tipo="VENDA_FINALIZADA",
+            chave="VENDA:CONFLITO",
+            payload={"venda_uuid": str(venda.venda_uuid)},
+            evento_uuid=uuid.uuid4(),
+        )
+
+        class ClientConflito:
+            def sync_push(self, **kwargs):
+                return {"resultados": [{"chave_idempotencia": conflito.chave_idempotencia, "status": "CONFLITO"}]}
+
+        sincronizar_eventos_pendentes(self.hub, client=ClientConflito())
+        conflito.refresh_from_db()
+        self.assertEqual(conflito.status, EventoSyncHub.STATUS_CONFLITO)
+
+    def test_sync_evento_sincronizado_nao_volta_pendente_e_payload_divergente_bloqueia(self):
+        venda = self.venda_finalizada()
+        evento = enfileirar_venda_finalizada(venda)
+        evento.status = EventoSyncHub.STATUS_SINCRONIZADO
+        evento.sincronizado_em = timezone.now()
+        evento.save(update_fields=["status", "sincronizado_em"])
+
+        mesmo = enfileirar_venda_finalizada(venda)
+
+        self.assertEqual(mesmo.pk, evento.pk)
+        mesmo.refresh_from_db()
+        self.assertEqual(mesmo.status, EventoSyncHub.STATUS_SINCRONIZADO)
+        payload_diferente = dict(mesmo.payload)
+        payload_diferente["total"] = "999.99"
+        with self.assertRaises(ValueError):
+            _criar_ou_atualizar_evento(
+                hub=self.hub,
+                tipo=mesmo.tipo,
+                chave=mesmo.chave_idempotencia,
+                payload=payload_diferente,
+                evento_uuid=mesmo.evento_uuid,
+            )
+
+    def test_sync_worker_marca_processando_dentro_de_atomic_e_envia_fora_do_lock(self):
+        venda = self.venda_finalizada()
         enfileirar_venda_finalizada(venda)
-        evento.refresh_from_db()
-        evento.proxima_tentativa_em = None
-        evento.save(update_fields=["proxima_tentativa_em"])
-        sincronizar_eventos_pendentes(self.hub, client=ClientOk("CONFLITO"))
-        evento.refresh_from_db()
-        self.assertEqual(evento.status, EventoSyncHub.STATUS_CONFLITO)
+        estados = {}
+
+        class ClientObservador:
+            def sync_push(self, **kwargs):
+                evento = EventoSyncHub.objects.get()
+                estados["durante_http"] = evento.status
+                return {"resultados": [{"chave_idempotencia": evento.chave_idempotencia, "status": "DUPLICADO"}]}
+
+        sincronizar_eventos_pendentes(self.hub, client=ClientObservador())
+
+        evento = EventoSyncHub.objects.get()
+        self.assertEqual(estados["durante_http"], EventoSyncHub.STATUS_PROCESSANDO)
+        self.assertEqual(evento.status, EventoSyncHub.STATUS_SINCRONIZADO)
 
     def test_sync_nfce_nova_versao_mantem_uuid_e_muda_chave(self):
         venda = self.venda_finalizada()
@@ -536,6 +588,22 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual({e.payload["nfce_uuid"] for e in eventos}, {str(nfce.nfce_uuid)})
         self.assertNotEqual(eventos[0].chave_idempotencia, eventos[1].chave_idempotencia)
         self.assertIn(":V:2", eventos[1].chave_idempotencia)
+
+    def test_dev_nao_autoriza_nfce_nem_gera_protocolo_ficticio(self):
+        venda = self.venda_finalizada()
+        nfce = self.gerar_nfce(venda)
+
+        resultado = SefazNFCeClientDesenvolvimento(SefazNFCeClient.AUTORIZADA).transmitir(nfce)
+
+        self.assertTrue(resultado.simulacao)
+        self.assertEqual(resultado.status, NFCeHub.STATUS_GERADA)
+        self.assertEqual(resultado.protocolo, "")
+        self.assertEqual(resultado.codigo, "")
+        self.assertEqual(nfce.status, NFCeHub.STATUS_GERADA)
+        self.assertEqual(nfce.protocolo, "")
+        self.assertEqual(nfce.codigo_retorno, "")
+        self.assertIsNone(nfce.autorizada_em)
+        self.assertIn("SIMULACAO", resultado.mensagem)
 
     def test_provider_a1_carrega_pfx_e_erros_controlados(self):
         from cryptography import x509
@@ -608,6 +676,44 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(nfce.numero, numero)
         self.assertEqual(nfce.protocolo, "135")
         self.assertTrue(EventoSyncHub.objects.filter(tipo="NFCE_ATUALIZADA").exists())
+
+    def test_adapter_real_interpreta_transporte_mockado(self):
+        venda = self.venda_finalizada()
+        nfce = self.gerar_nfce(venda)
+        chamadas = []
+
+        def transporte(url, xml, timeout, material):
+            chamadas.append((url, xml, timeout, material))
+            return {
+                "status": "AUTORIZADA",
+                "codigo": "100",
+                "mensagem": "Autorizado",
+                "protocolo": "135",
+                "autorizada_em": timezone.now(),
+                "xml_protocolo": "<procNFe />",
+            }
+
+        client = SefazNFCeClientReal(autorizacao_url="https://sefaz.test/autorizacao", transport=transporte)
+        resultado = client.transmitir(nfce)
+        self.assertEqual(resultado.status, SefazNFCeClient.AUTORIZADA)
+        self.assertEqual(resultado.protocolo, "135")
+        self.assertEqual(chamadas[0][0], "https://sefaz.test/autorizacao")
+
+        rejeitado = SefazNFCeClientReal(
+            autorizacao_url="https://sefaz.test/autorizacao",
+            transport=lambda *args: {"status": "REJEITADA", "codigo": "204", "mensagem": "Rejeicao"},
+        ).transmitir(nfce)
+        self.assertEqual(rejeitado.status, SefazNFCeClient.REJEITADA)
+        self.assertEqual(rejeitado.codigo, "204")
+
+        timeout = SefazNFCeClientReal(
+            autorizacao_url="https://sefaz.test/autorizacao",
+            transport=lambda *args: (_ for _ in ()).throw(TimeoutError()),
+        ).transmitir(nfce)
+        self.assertEqual(timeout.status, SefazNFCeClient.TIMEOUT)
+
+        with self.assertRaises(NFCeErroDominio):
+            SefazNFCeClientReal(autorizacao_url="").transmitir(nfce)
 
     def _digest_inf_nfe(self, xml, chave):
         root = etree.fromstring(xml.encode("utf-8"), parser=etree.XMLParser(remove_blank_text=True))
