@@ -9,7 +9,10 @@ from django.utils import timezone
 
 from core.models import (
     CatalogoItemHub,
+    CashbackConfigHub,
+    CashbackMovimentoHub,
     ConfiguracaoFiscalHub,
+    EventoSyncHub,
     EstoqueMovimentoHub,
     FormaPagamentoFiscalMapHub,
     FormaPagamentoHub,
@@ -22,6 +25,9 @@ from core.models import (
     VendaPagamentoParcelaHub,
     VendedorHub,
     NFCeHub,
+    PromocaoHub,
+    ValeTrocaHub,
+    VendaDevolucaoHub,
 )
 from core.services.caixa import fechar_caixa
 from core.services.terminais import configurar_terminal
@@ -175,6 +181,104 @@ class FormasPagamentoApiTests(PagamentoHubTestMixin, TestCase):
 
         self.assertLessEqual(len(contexto), 2)
         self.assertGreaterEqual(len(payload["formas"]), 3)
+
+
+class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
+    def test_promocao_local_aplica_desconto_e_preserva_snapshot(self):
+        PromocaoHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=77,
+            nome="Promo 10",
+            tipo=PromocaoHub.TIPO_PERCENTUAL,
+            valor=Decimal("10.0000"),
+            sku_retaguarda_id=self.catalogo_item.retaguarda_sku_id,
+            ativo=True,
+            sincronizado_em=timezone.now(),
+        )
+
+        resposta = self.post_item()
+        item = VendaItemHub.objects.get()
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(item.desconto, Decimal("19.99"))
+        self.assertEqual(item.total_item, Decimal("179.91"))
+        self.assertEqual(resposta.data["venda"]["itens"][0]["promocao"]["id"], 77)
+
+    def test_cashback_e_vale_validam_saldo_e_geram_movimentos(self):
+        cliente = self.criar_cliente()
+        CashbackConfigHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=1,
+            ativo=True,
+            percentual=Decimal("5.0000"),
+            valor_minimo_uso=Decimal("1.00"),
+            sincronizado_em=timezone.now(),
+        )
+        CashbackMovimentoHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            tipo=CashbackMovimentoHub.TIPO_CREDITO,
+            valor=Decimal("30.00"),
+        )
+        vale = ValeTrocaHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            documento="VT-1",
+            valor_original=Decimal("40.00"),
+            saldo=Decimal("40.00"),
+            status=ValeTrocaHub.STATUS_ABERTO,
+        )
+        cashback = self.criar_forma("CBK", "CASHBACK")
+        troca = self.criar_forma("TRO", "TROCA")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+
+        self.assertEqual(self.pagar(venda_uuid, cashback, "30.00").status_code, 201)
+        resposta_troca = self.client.post(
+            "/api/terminal/venda/pagamento/",
+            {
+                "venda_uuid": venda_uuid,
+                "operacao_uuid": str(uuid.uuid4()),
+                "forma_pagamento_id": troca.id,
+                "valor": "40.00",
+                "autorizacao": "VT-1",
+            },
+            format="json",
+        )
+        self.assertEqual(resposta_troca.status_code, 201)
+        self.assertEqual(self.pagar(venda_uuid, self.dinheiro, "129.90").status_code, 201)
+        self.assertEqual(self.finalizar(venda_uuid).status_code, 200)
+
+        vale.refresh_from_db()
+        self.assertEqual(vale.saldo, Decimal("0.00"))
+        self.assertTrue(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_DEBITO).exists())
+        self.assertTrue(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_CREDITO).exists())
+
+    def test_devolucao_gera_vale_local_e_evento_sync(self):
+        cliente = self.criar_cliente()
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        self.assertEqual(self.pagar(venda_uuid, self.dinheiro, "199.90").status_code, 201)
+        self.assertEqual(self.finalizar(venda_uuid).status_code, 200)
+        item = VendaItemHub.objects.get()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            resposta = self.client.post(
+                "/api/terminal/devolucoes/finalizar/",
+                {
+                    "venda_uuid": venda_uuid,
+                    "motivo": "Troca de tamanho",
+                    "itens": [{"item_uuid": str(item.item_uuid), "quantidade": 1}],
+                },
+                format="json",
+            )
+
+        self.assertEqual(resposta.status_code, 201)
+        self.assertEqual(VendaDevolucaoHub.objects.count(), 1)
+        self.assertEqual(ValeTrocaHub.objects.filter(documento__startswith="VT-HUB-").count(), 1)
+        self.assertEqual(EventoSyncHub.objects.filter(tipo="DEVOLUCAO_FINALIZADA").count(), 1)
 
 
 class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):

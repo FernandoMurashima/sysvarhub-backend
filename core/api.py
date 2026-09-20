@@ -84,6 +84,7 @@ from core.services.vendas import (
     venda_atual,
 )
 from core.services.danfe_nfce import DanfeNFCeErroDominio, montar_dados_danfe_nfce
+from core.services.devolucoes import consultar_venda_para_devolucao, finalizar_devolucao, serializar_devolucao
 
 
 CATALOGO_TERMINAL_LIMIT_DEFAULT = 40
@@ -884,6 +885,39 @@ class VendaDanfeNFCeView(APIView):
             return Response(montar_dados_danfe_nfce(nfce, via=request.query_params.get("via") or "CONSUMIDOR"))
         except DanfeNFCeErroDominio as exc:
             return Response({"detail": exc.codigo}, status=status.HTTP_409_CONFLICT)
+
+
+class DevolucaoConsultarView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request, venda_uuid):
+        try:
+            return Response({"venda": consultar_venda_para_devolucao(request.sysvar_terminal, venda_uuid)})
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+
+
+class DevolucaoFinalizarView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request):
+        try:
+            devolucao = finalizar_devolucao(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                venda_uuid=request.data.get("venda_uuid"),
+                itens=request.data.get("itens") or [],
+                motivo=request.data.get("motivo") or "",
+            )
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"devolucao": serializar_devolucao(devolucao)}, status=status.HTTP_201_CREATED)
 
 
 def _normalizar_limit(valor):

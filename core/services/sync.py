@@ -7,12 +7,13 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from core.models import EventoSyncHub, NFCeHub, VendaHub, VendaPagamentoHub
+from core.models import EventoSyncHub, NFCeHub, VendaDevolucaoHub, VendaHub, VendaPagamentoHub
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 
 
 TIPO_VENDA_FINALIZADA = "VENDA_FINALIZADA"
 TIPO_NFCE_ATUALIZADA = "NFCE_ATUALIZADA"
+TIPO_DEVOLUCAO_FINALIZADA = "DEVOLUCAO_FINALIZADA"
 STATUS_CONFIRMADOS = {"PROCESSADO", "DUPLICADO"}
 SEGREDOS_BLOQUEADOS = {"certificado", "private_key", "chave_privada", "senha", "csc", "token_csc"}
 
@@ -42,6 +43,22 @@ def enfileirar_nfce_atualizada(nfce):
         chave=f"NFCE:{nfce.nfce_uuid}:V:{nfce.sync_versao}",
         payload=payload,
         evento_uuid=_uuid_deterministico(nfce.hub_id, TIPO_NFCE_ATUALIZADA, str(nfce.nfce_uuid), str(nfce.sync_versao)),
+    )
+
+
+def enfileirar_devolucao_finalizada(devolucao):
+    devolucao = (
+        VendaDevolucaoHub.objects.select_related("hub", "venda_origem", "operador", "terminal")
+        .prefetch_related("itens")
+        .get(pk=devolucao.pk)
+    )
+    payload = payload_devolucao_finalizada(devolucao)
+    return _criar_ou_atualizar_evento(
+        hub=devolucao.hub,
+        tipo=TIPO_DEVOLUCAO_FINALIZADA,
+        chave=f"DEVOLUCAO:{devolucao.devolucao_uuid}:FINALIZADA",
+        payload=payload,
+        evento_uuid=_uuid_deterministico(devolucao.hub_id, TIPO_DEVOLUCAO_FINALIZADA, str(devolucao.devolucao_uuid)),
     )
 
 
@@ -82,6 +99,13 @@ def payload_venda_finalizada(venda):
                 "descricao": item.descricao,
                 "cor": item.cor_descricao,
                 "tamanho": item.tamanho_descricao,
+                "promocao": {
+                    "id": item.promocao_retaguarda_id,
+                    "nome": item.promocao_nome,
+                    "tipo": item.promocao_tipo,
+                    "valor": f"{item.promocao_valor:.4f}",
+                    "acumula_cashback": item.promocao_acumula_cashback,
+                } if item.promocao_retaguarda_id else None,
             }
             for item in venda.itens.order_by("id")
         ],
@@ -91,6 +115,8 @@ def payload_venda_finalizada(venda):
                 "descricao": pagamento.descricao,
                 "valor": f"{pagamento.valor:.2f}",
                 "autorizacao": pagamento.autorizacao,
+                "tipo": pagamento.tipo,
+                "vale_troca_documento": pagamento.vale_troca_documento,
             }
             for pagamento in pagamentos
         ],
@@ -122,6 +148,41 @@ def payload_nfce_atualizada(nfce):
     for segredo in SEGREDOS_BLOQUEADOS:
         payload.pop(segredo, None)
     return payload
+
+
+def payload_devolucao_finalizada(devolucao):
+    vale = getattr(devolucao, "vale_troca", None)
+    return {
+        "devolucao_uuid": str(devolucao.devolucao_uuid),
+        "venda_uuid": str(devolucao.venda_origem.venda_uuid),
+        "cliente_uuid": str(devolucao.cliente_uuid) if devolucao.cliente_uuid else None,
+        "cliente_retaguarda_id": devolucao.cliente_retaguarda_id,
+        "operador_retaguarda_usuario_id": devolucao.operador.retaguarda_usuario_id,
+        "terminal": devolucao.terminal.codigo,
+        "motivo": devolucao.motivo,
+        "valor_total": f"{devolucao.valor_total:.2f}",
+        "finalizada_em": devolucao.finalizada_em.isoformat(),
+        "itens": [
+            {
+                "item_uuid": str(item.venda_item.item_uuid),
+                "sku_retaguarda_id": item.retaguarda_sku_id,
+                "produto_retaguarda_id": item.retaguarda_produto_id,
+                "ean": item.ean13,
+                "descricao": item.descricao,
+                "quantidade": item.quantidade,
+                "preco_unitario": f"{item.preco_unitario:.4f}",
+                "desconto": f"{item.desconto:.2f}",
+                "total_item": f"{item.total_item:.2f}",
+            }
+            for item in devolucao.itens.order_by("id")
+        ],
+        "vale_troca": {
+            "documento": vale.documento,
+            "valor": f"{vale.valor_original:.2f}",
+            "saldo": f"{vale.saldo:.2f}",
+            "validade": vale.validade.isoformat() if vale.validade else None,
+        } if vale else None,
+    }
 
 
 def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=None):

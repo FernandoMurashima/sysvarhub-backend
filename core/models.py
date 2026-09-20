@@ -1218,6 +1218,11 @@ class VendaItemHub(models.Model):
     preco_unitario = models.DecimalField(max_digits=18, decimal_places=4)
     desconto = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     total_item = models.DecimalField(max_digits=18, decimal_places=2)
+    promocao_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    promocao_nome = models.CharField(max_length=120, blank=True, default="")
+    promocao_tipo = models.CharField(max_length=30, blank=True, default="")
+    promocao_valor = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    promocao_acumula_cashback = models.BooleanField(default=True)
     fiscal = models.JSONField(default=dict, blank=True)
     criado_em = models.DateTimeField(auto_now_add=True)
     atualizado_em = models.DateTimeField(auto_now=True)
@@ -1342,6 +1347,8 @@ class VendaPagamentoHub(models.Model):
     taxa_fixa = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     valor = models.DecimalField(max_digits=18, decimal_places=2)
     autorizacao = models.CharField(max_length=120, blank=True, default="")
+    vale_troca_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    vale_troca_documento = models.CharField(max_length=80, blank=True, default="")
     origem_captura = models.CharField(max_length=10, choices=ORIGEM_CHOICES, default=ORIGEM_MANUAL)
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_ATIVO)
     terminal_inclusao = models.ForeignKey(Terminal, on_delete=models.PROTECT, related_name="pagamentos_incluidos")
@@ -1389,6 +1396,160 @@ class VendaPagamentoHub(models.Model):
 
     def __str__(self):
         return f"{self.venda_id} - {self.codigo} - {self.valor}"
+
+
+class CashbackConfigHub(models.Model):
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="cashback_configs")
+    retaguarda_id = models.PositiveBigIntegerField()
+    nome = models.CharField(max_length=80, default="Regra padrão")
+    ativo = models.BooleanField(default=False)
+    percentual = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    validade_dias = models.PositiveIntegerField(default=180)
+    valor_minimo_geracao = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    valor_minimo_uso = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    limite_uso_percentual = models.DecimalField(max_digits=7, decimal_places=4, default=100)
+    consumidor_final_participa = models.BooleanField(default=False)
+    sincronizado_em = models.DateTimeField()
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("-ativo", "retaguarda_id")
+        constraints = [
+            models.UniqueConstraint(fields=["hub", "retaguarda_id"], name="uniq_cashback_cfg_hub_ret"),
+        ]
+
+
+class CashbackMovimentoHub(models.Model):
+    TIPO_CREDITO = "CREDITO"
+    TIPO_DEBITO = "DEBITO"
+    STATUS_ATIVO = "ATIVO"
+
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="cashback_movimentos")
+    cliente_uuid = models.UUIDField(null=True, blank=True, db_index=True)
+    cliente_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True, db_index=True)
+    venda = models.ForeignKey(VendaHub, on_delete=models.PROTECT, null=True, blank=True, related_name="cashback_movimentos")
+    tipo = models.CharField(max_length=10)
+    status = models.CharField(max_length=10, default=STATUS_ATIVO)
+    valor = models.DecimalField(max_digits=18, decimal_places=2)
+    validade = models.DateField(null=True, blank=True)
+    observacao = models.CharField(max_length=255, blank=True, default="")
+    criado_em = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-criado_em", "-id")
+        indexes = [
+            models.Index(fields=["hub", "cliente_retaguarda_id", "status"], name="idx_cash_hub_cli_ret"),
+            models.Index(fields=["hub", "cliente_uuid", "status"], name="idx_cash_hub_cli_uuid"),
+        ]
+
+
+class ValeTrocaHub(models.Model):
+    STATUS_ABERTO = "ABERTO"
+    STATUS_USADO = "USADO"
+    STATUS_CANCELADO = "CANCELADO"
+    STATUS_EXPIRADO = "EXPIRADO"
+
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="vales_troca")
+    vale_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    devolucao = models.OneToOneField("VendaDevolucaoHub", on_delete=models.PROTECT, null=True, blank=True, related_name="vale_troca")
+    retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    cliente_uuid = models.UUIDField(null=True, blank=True, db_index=True)
+    cliente_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True, db_index=True)
+    documento = models.CharField(max_length=80)
+    valor_original = models.DecimalField(max_digits=18, decimal_places=2)
+    saldo = models.DecimalField(max_digits=18, decimal_places=2)
+    status = models.CharField(max_length=12, default=STATUS_ABERTO)
+    validade = models.DateField(null=True, blank=True)
+    origem_devolucao_uuid = models.UUIDField(null=True, blank=True)
+    sincronizado_em = models.DateTimeField(null=True, blank=True)
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("-criado_em", "-id")
+        constraints = [
+            models.UniqueConstraint(fields=["hub", "documento"], name="uniq_vale_hub_doc"),
+        ]
+
+
+class ValeTrocaMovimentoHub(models.Model):
+    TIPO_CREDITO = "CREDITO"
+    TIPO_USO = "USO"
+    TIPO_ESTORNO = "ESTORNO"
+
+    vale = models.ForeignKey(ValeTrocaHub, on_delete=models.PROTECT, related_name="movimentos")
+    venda = models.ForeignKey(VendaHub, on_delete=models.PROTECT, null=True, blank=True, related_name="vales_troca_movimentos")
+    tipo = models.CharField(max_length=10)
+    valor = models.DecimalField(max_digits=18, decimal_places=2)
+    saldo_apos = models.DecimalField(max_digits=18, decimal_places=2)
+    observacao = models.CharField(max_length=255, blank=True, default="")
+    criado_em = models.DateTimeField(auto_now_add=True)
+
+
+class PromocaoHub(models.Model):
+    TIPO_PERCENTUAL = "PERCENTUAL"
+    TIPO_VALOR_FIXO = "VALOR_FIXO"
+    TIPO_PRECO_FIXO = "PRECO_FIXO"
+
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="promocoes")
+    retaguarda_id = models.PositiveBigIntegerField()
+    nome = models.CharField(max_length=120)
+    tipo = models.CharField(max_length=30)
+    valor = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    produto_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    sku_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True, db_index=True)
+    ativo = models.BooleanField(default=True)
+    acumula_cashback = models.BooleanField(default=True)
+    prioridade = models.PositiveIntegerField(default=0)
+    inicio = models.DateTimeField(null=True, blank=True)
+    fim = models.DateTimeField(null=True, blank=True)
+    sincronizado_em = models.DateTimeField()
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("prioridade", "retaguarda_id")
+        constraints = [
+            models.UniqueConstraint(fields=["hub", "retaguarda_id"], name="uniq_promo_hub_ret"),
+        ]
+
+
+class VendaDevolucaoHub(models.Model):
+    STATUS_FINALIZADA = "FINALIZADA"
+
+    devolucao_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="devolucoes")
+    venda_origem = models.ForeignKey(VendaHub, on_delete=models.PROTECT, related_name="devolucoes")
+    operador = models.ForeignKey(OperadorHub, on_delete=models.PROTECT, related_name="devolucoes")
+    terminal = models.ForeignKey(Terminal, on_delete=models.PROTECT, related_name="devolucoes")
+    cliente_uuid = models.UUIDField(null=True, blank=True)
+    cliente_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    motivo = models.CharField(max_length=255, blank=True, default="")
+    valor_total = models.DecimalField(max_digits=18, decimal_places=2)
+    status = models.CharField(max_length=12, default=STATUS_FINALIZADA)
+    finalizada_em = models.DateTimeField()
+    criado_em = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-finalizada_em", "-id")
+
+
+class VendaDevolucaoItemHub(models.Model):
+    devolucao = models.ForeignKey(VendaDevolucaoHub, on_delete=models.PROTECT, related_name="itens")
+    venda_item = models.ForeignKey(VendaItemHub, on_delete=models.PROTECT, related_name="devolucoes")
+    catalogo_item = models.ForeignKey(CatalogoItemHub, on_delete=models.PROTECT, related_name="devolucoes")
+    retaguarda_produto_id = models.PositiveBigIntegerField()
+    retaguarda_sku_id = models.PositiveBigIntegerField()
+    ean13 = models.CharField(max_length=13, blank=True, default="")
+    descricao = models.CharField(max_length=200)
+    quantidade = models.PositiveIntegerField()
+    preco_unitario = models.DecimalField(max_digits=18, decimal_places=4)
+    desconto = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total_item = models.DecimalField(max_digits=18, decimal_places=2)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["devolucao", "venda_item"], name="uniq_dev_hub_item"),
+        ]
 
 
 class VendaPagamentoParcelaHub(models.Model):

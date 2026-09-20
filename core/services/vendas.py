@@ -24,6 +24,7 @@ from core.models import (
     VendedorHub,
 )
 from core.services.caixa import obter_caixa_terminal, obter_sessao_caixa_aberta
+from core.services.beneficios import aplicar_promocao, registrar_beneficios_venda, validar_pagamento_beneficio
 from core.services.operadores import serializar_operador
 from core.services.nfce import (
     NFCeErroDominio,
@@ -499,6 +500,10 @@ def adicionar_pagamento(
             raise VendaValidationError("Forma de pagamento inválida.")
         if forma.tef_habilitado:
             raise VendaConflictError("Forma de pagamento exige integração TEF.")
+        try:
+            validar_pagamento_beneficio(venda, forma, valor, autorizacao)
+        except ValueError as exc:
+            raise VendaConflictError(str(exc)) from exc
 
         total_pago_atual = calcular_total_pago(venda)
         pendente = calcular_pendente(venda, total_pago_atual)
@@ -526,6 +531,7 @@ def adicionar_pagamento(
             taxa_fixa=forma.taxa_fixa,
             valor=valor,
             autorizacao=autorizacao,
+            vale_troca_documento=autorizacao if forma.tipo in ("TROCA", "VALE_TROCA") else "",
             origem_captura=VendaPagamentoHub.ORIGEM_MANUAL,
             status=VendaPagamentoHub.STATUS_ATIVO,
             terminal_inclusao=terminal_bloqueado,
@@ -639,6 +645,11 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
             raise VendaConflictError("Pagamento insuficiente.")
         if total_pago > venda.total and not any(pagamento.tipo == DINHEIRO for pagamento in pagamentos):
             raise VendaConflictError("Valor do pagamento excede o valor pendente.")
+        for pagamento in pagamentos:
+            try:
+                validar_pagamento_beneficio(venda, pagamento.forma_pagamento, pagamento.valor, pagamento.autorizacao)
+            except ValueError as exc:
+                raise VendaConflictError(str(exc)) from exc
 
         emitir_nfce = nfce_habilitada_para_hub(venda.hub)
         if emitir_nfce:
@@ -673,6 +684,10 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
                     "quantidade": Decimal(item.quantidade).quantize(QUANTIDADE_ESTOQUE),
                 },
             )
+        try:
+            registrar_beneficios_venda(venda, pagamentos)
+        except ValueError as exc:
+            raise VendaConflictError(str(exc)) from exc
 
         agora = timezone.now()
         troco = calcular_troco(venda, total_pago)
@@ -1068,6 +1083,7 @@ def calcular_movimento_sku(hub, sku_id):
 
 
 def criar_item_venda(venda, catalogo_item, quantidade, operador, sessao_operador, terminal):
+    preco_unitario, desconto, promo = aplicar_promocao(catalogo_item, quantidade)
     return VendaItemHub.objects.create(
         venda=venda,
         catalogo_item=catalogo_item,
@@ -1082,9 +1098,14 @@ def criar_item_venda(venda, catalogo_item, quantidade, operador, sessao_operador
         tamanho_descricao=catalogo_item.tamanho_descricao,
         unidade_codigo=catalogo_item.unidade_codigo,
         quantidade=quantidade,
-        preco_unitario=catalogo_item.preco_venda,
-        desconto=ZERO_2,
-        total_item=calcular_total_item(quantidade, catalogo_item.preco_venda, ZERO_2),
+        preco_unitario=preco_unitario,
+        desconto=desconto,
+        total_item=calcular_total_item(quantidade, preco_unitario, desconto),
+        promocao_retaguarda_id=promo.get("promocao_retaguarda_id"),
+        promocao_nome=promo.get("promocao_nome", ""),
+        promocao_tipo=promo.get("promocao_tipo", ""),
+        promocao_valor=promo.get("promocao_valor", ZERO_2),
+        promocao_acumula_cashback=promo.get("promocao_acumula_cashback", True),
         fiscal=deepcopy(catalogo_item.fiscal or {}),
         operador_inclusao=operador,
         sessao_operador_inclusao=sessao_operador,
@@ -1220,6 +1241,13 @@ def dados_item(item, quantidade_anterior, quantidade_nova):
         "quantidade_nova": quantidade_nova,
         "preco_unitario": f"{item.preco_unitario:.4f}",
         "total_item": f"{item.total_item:.2f}",
+        "promocao": {
+            "id": item.promocao_retaguarda_id,
+            "nome": item.promocao_nome,
+            "tipo": item.promocao_tipo,
+            "valor": f"{item.promocao_valor:.4f}",
+            "acumula_cashback": item.promocao_acumula_cashback,
+        } if item.promocao_retaguarda_id else None,
     }
 
 
@@ -1388,6 +1416,13 @@ def serializar_item(item):
         "preco_unitario": f"{item.preco_unitario:.4f}",
         "desconto": f"{item.desconto:.2f}",
         "total_item": f"{item.total_item:.2f}",
+        "promocao": {
+            "id": item.promocao_retaguarda_id,
+            "nome": item.promocao_nome,
+            "tipo": item.promocao_tipo,
+            "valor": f"{item.promocao_valor:.4f}",
+            "acumula_cashback": item.promocao_acumula_cashback,
+        } if item.promocao_retaguarda_id else None,
     }
 
 
@@ -1402,6 +1437,7 @@ def serializar_pagamento(pagamento):
         "num_parcelas": pagamento.num_parcelas,
         "valor": f"{pagamento.valor:.2f}",
         "autorizacao": pagamento.autorizacao,
+        "vale_troca_documento": pagamento.vale_troca_documento,
         "origem_captura": pagamento.origem_captura,
         "criado_em": pagamento.criado_em.isoformat(),
     }
