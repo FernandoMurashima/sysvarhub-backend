@@ -24,6 +24,8 @@ from core.services.nfce import (
     preparar_nfce_para_venda_finalizada,
     verificar_assinatura_nfce,
 )
+from core.services.danfe_nfce import montar_dados_danfe_nfce
+from core.tests_caixa import criar_hub
 from core.tests_pagamentos import PagamentoHubTestMixin
 
 
@@ -363,6 +365,96 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
 
         self.assertEqual(nfce.status, NFCeHub.STATUS_PENDENTE_TRANSMISSAO)
         self.assertIn(nfce, list(listar_nfces_pendentes_transmissao(self.hub)))
+
+    def test_danfe_usa_xml_historico_emitente_itens_totais_pagamentos_e_qr(self):
+        venda = self.venda_finalizada()
+        nfce = self.gerar_nfce(venda)
+        self.catalogo_item.descricao = "Descricao alterada depois da emissao"
+        self.catalogo_item.preco_venda = Decimal("1.0000")
+        self.catalogo_item.save(update_fields=["descricao", "preco_venda"])
+
+        dados = montar_dados_danfe_nfce(nfce)
+
+        self.assertEqual(dados["nfce_uuid"], str(nfce.nfce_uuid))
+        self.assertTrue(dados["imprimivel"])
+        self.assertEqual(dados["via"], "CONSUMIDOR")
+        self.assertEqual(dados["emitente"]["razao_social"], "Empresa Teste Ltda")
+        self.assertEqual(dados["emitente"]["cnpj"], "12345678000199")
+        self.assertEqual(dados["documento"]["numero"], 10)
+        self.assertEqual(dados["documento"]["serie"], 7)
+        self.assertEqual(dados["documento"]["chave_acesso"], nfce.chave_acesso)
+        self.assertEqual(len(dados["documento"]["chave_acesso_formatada"].split()), 11)
+        self.assertFalse(dados["consumidor"]["identificado"])
+        self.assertEqual(dados["itens"][0]["codigo"], str(self.catalogo_item.retaguarda_sku_id))
+        self.assertEqual(dados["itens"][0]["descricao"], "Calça Jeans Reta Aurora")
+        self.assertEqual(dados["itens"][0]["quantidade"], "1.0000")
+        self.assertEqual(dados["itens"][0]["unidade"], "UN")
+        self.assertEqual(dados["itens"][0]["valor_bruto"], "199.90")
+        self.assertEqual(dados["itens"][0]["valor_liquido"], "199.90")
+        self.assertEqual(dados["totais"]["vProd"], "199.90")
+        self.assertEqual(dados["totais"]["vNF"], "199.90")
+        self.assertEqual(dados["pagamentos"][0]["tPag"], "01")
+        self.assertEqual(dados["pagamentos"][0]["descricao"], "Dinheiro")
+        self.assertEqual(dados["troco"], "0.00")
+        self.assertIn("SEM VALOR FISCAL", " ".join(dados["mensagens"]))
+        self.assertEqual(dados["qr_code_payload"], nfce.qr_code_payload)
+        self.assertTrue(dados["qr_code_data_uri"].startswith("data:image/svg+xml;base64,"))
+
+    def test_danfe_consumidor_identificado_contingencia_via_e_status_nao_imprimiveis(self):
+        venda = self.venda_finalizada()
+        venda.cliente_documento = "12345678901"
+        venda.cliente_nome = "Cliente NFCe"
+        venda.cliente_padrao = False
+        venda.save(update_fields=["cliente_documento", "cliente_nome", "cliente_padrao"])
+        nfce = gerar_nfce_local(
+            venda,
+            material_assinatura=self.material,
+            qr_config=self.qr,
+            codigo_numerico="12345678",
+            tipo_emissao="9",
+            justificativa_contingencia="SEFAZ indisponivel em teste",
+        )
+
+        dados = montar_dados_danfe_nfce(nfce, via="ESTABELECIMENTO")
+        self.assertTrue(dados["imprimivel"])
+        self.assertEqual(dados["via_texto"], "Via do Estabelecimento")
+        self.assertTrue(dados["consumidor"]["identificado"])
+        self.assertEqual(dados["consumidor"]["tipo_documento"], "CPF")
+        self.assertEqual(dados["consumidor"]["nome"], "Cliente NFCe")
+        self.assertIn("EMITIDA EM CONTINGENCIA", dados["mensagens"])
+        self.assertIn("Pendente de autorizacao", dados["mensagens"])
+        self.assertIsNone(dados["protocolo"])
+
+        nfce.status = NFCeHub.STATUS_REJEITADA
+        nfce.save(update_fields=["status"])
+        rejeitada = montar_dados_danfe_nfce(nfce)
+        self.assertFalse(rejeitada["imprimivel"])
+        self.assertEqual(rejeitada["motivo_nao_imprimivel"], "NFCE_REJEITADA")
+
+        nfce.status = NFCeHub.STATUS_ERRO_GERACAO
+        nfce.save(update_fields=["status"])
+        erro = montar_dados_danfe_nfce(nfce)
+        self.assertFalse(erro["imprimivel"])
+        self.assertEqual(erro["motivo_nao_imprimivel"], "NFCE_ERRO_GERACAO")
+
+    def test_endpoint_danfe_autenticado_isola_hub_e_nao_expoe_xml_ou_segredo(self):
+        venda = self.venda_finalizada()
+        nfce = self.gerar_nfce(venda)
+
+        resposta = self.client.get(f"/api/terminal/venda/{venda.venda_uuid}/danfe-nfce/")
+
+        self.assertEqual(resposta.status_code, 200)
+        conteudo = str(resposta.data)
+        self.assertEqual(resposta.data["nfce_uuid"], str(nfce.nfce_uuid))
+        self.assertNotIn("xml_assinado", resposta.data)
+        self.assertNotIn("<NFe", conteudo)
+        self.assertNotIn("PRIVATE KEY", conteudo)
+        self.assertNotIn("CERTIFICATE", conteudo)
+
+        venda.hub = criar_hub(retaguarda_hub_id=999, empresa_id=99, loja_id=99)
+        venda.save(update_fields=["hub"])
+        negada = self.client.get(f"/api/terminal/venda/{venda.venda_uuid}/danfe-nfce/")
+        self.assertEqual(negada.status_code, 404)
 
     def _digest_inf_nfe(self, xml, chave):
         root = etree.fromstring(xml.encode("utf-8"), parser=etree.XMLParser(remove_blank_text=True))

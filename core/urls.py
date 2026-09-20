@@ -23,6 +23,7 @@ from core.api import (
     VendaCancelarView,
     VendaClienteView,
     VendaFinalizarView,
+    VendaDanfeNFCeView,
     VendaIniciarView,
     VendaItemDetalheView,
     VendaItemView,
@@ -64,5 +65,6 @@ urlpatterns = [
         name="terminal-venda-pagamento-detalhe",
     ),
     path("venda/finalizar/", VendaFinalizarView.as_view(), name="terminal-venda-finalizar"),
+    path("venda/<uuid:venda_uuid>/danfe-nfce/", VendaDanfeNFCeView.as_view(), name="terminal-venda-danfe-nfce"),
     path("venda/cancelar/", VendaCancelarView.as_view(), name="terminal-venda-cancelar"),
 ]

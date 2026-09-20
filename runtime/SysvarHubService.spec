@@ -24,6 +24,7 @@ hiddenimports = [
     "whitenoise",
     "cryptography",
     "lxml",
+    "qrcode",
     "MySQLdb",
     "win32timezone",
 ]
@@ -36,6 +37,7 @@ hiddenimports += collect_submodules("drf_yasg", filter=lambda name: ".tests" not
 hiddenimports += collect_submodules("corsheaders", filter=lambda name: ".tests" not in name)
 hiddenimports += collect_submodules("whitenoise", filter=lambda name: ".tests" not in name)
 hiddenimports += collect_submodules("lxml")
+hiddenimports += collect_submodules("qrcode")
 datas = collect_data_files("coreschema")
 
 a = Analysis(

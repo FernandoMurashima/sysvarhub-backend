@@ -10,7 +10,7 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from core.authentication import TerminalOperadorAuthentication, TerminalTokenAuthentication
-from core.models import CaixaHub, CatalogoItemHub, ClienteHub, TipoDespesaPdvHub, VendedorHub
+from core.models import CaixaHub, CatalogoItemHub, ClienteHub, NFCeHub, TipoDespesaPdvHub, VendaHub, VendedorHub
 from core.permissions import IsOperadorAuthenticated, IsTerminalAuthenticated
 from core.services.caixa import (
     CaixaConflictError,
@@ -83,6 +83,7 @@ from core.services.vendas import (
     selecionar_vendedor,
     venda_atual,
 )
+from core.services.danfe_nfce import DanfeNFCeErroDominio, montar_dados_danfe_nfce
 
 
 CATALOGO_TERMINAL_LIMIT_DEFAULT = 40
@@ -864,6 +865,25 @@ class VendaFinalizarView(APIView):
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({"venda": serializar_venda(venda)})
+
+
+class VendaDanfeNFCeView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request, venda_uuid):
+        nfce = (
+            NFCeHub.objects
+            .select_related("venda", "hub")
+            .filter(venda__venda_uuid=venda_uuid, venda__hub=request.sysvar_terminal.hub)
+            .first()
+        )
+        if not nfce or nfce.venda.status != VendaHub.STATUS_FINALIZADA:
+            return Response({"detail": "DANFE NFC-e não encontrado."}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            return Response(montar_dados_danfe_nfce(nfce, via=request.query_params.get("via") or "CONSUMIDOR"))
+        except DanfeNFCeErroDominio as exc:
+            return Response({"detail": exc.codigo}, status=status.HTTP_409_CONFLICT)
 
 
 def _normalizar_limit(valor):
