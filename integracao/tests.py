@@ -1,5 +1,6 @@
 import io
 import json
+from decimal import Decimal
 from pathlib import Path
 import tempfile
 import uuid
@@ -13,12 +14,14 @@ from django.utils import timezone
 from core.models import (
     CaixaHub,
     CatalogoItemHub,
+    CashbackConfigHub,
     ClienteHub,
     ConfiguracaoFiscalHub,
     FormaPagamentoFiscalMapHub,
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
     HubConfig,
+    ValeTrocaHub,
 )
 from integracao.services.bootstrap import BootstrapValidationError, sincronizar_bootstrap
 from integracao.services.catalogo import CatalogoValidationError, sincronizar_catalogo
@@ -485,6 +488,52 @@ class ClientesSyncTests(TestCase):
         self.assertEqual(resultado["clientes_reconciliados_por_documento"], 1)
         self.assertEqual(ClienteHub.objects.count(), 1)
 
+    def test_reconcilia_vale_local_por_documento_sem_duplicar(self):
+        cliente_local = ClienteHub.objects.create(
+            hub=self.hub,
+            origem=ClienteHub.ORIGEM_LOCAL,
+            retaguarda_id=None,
+            tipo_pessoa="PF",
+            documento="12345678901",
+            nome_cliente="Cliente Local",
+            sincronizado_em=timezone.now(),
+        )
+        vale = ValeTrocaHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente_local.cliente_uuid,
+            documento="VT-100",
+            valor_original="50.00",
+            saldo="50.00",
+        )
+
+        sincronizar_clientes(
+            self.hub,
+            self.resposta(clientes=[
+                self.cliente(
+                    vales_troca=[
+                        {
+                            "id": 900,
+                            "documento": "VT-100",
+                            "valor_original": "50.00",
+                            "saldo": "50.00",
+                            "status": "ABERTO",
+                        }
+                    ]
+                )
+            ]),
+        )
+
+        vale.refresh_from_db()
+        self.assertEqual(ValeTrocaHub.objects.count(), 1)
+        self.assertEqual(vale.retaguarda_id, 900)
+        self.assertIsNotNone(vale.sincronizado_em)
+
+    def test_sincroniza_saldo_cashback_retaguarda_cliente(self):
+        sincronizar_clientes(self.hub, self.resposta(clientes=[self.cliente(cashback_saldo_retaguarda="123.45")]))
+
+        cliente = ClienteHub.objects.get(hub=self.hub, retaguarda_id=123)
+        self.assertEqual(cliente.cashback_saldo_retaguarda, Decimal("123.45"))
+
     def test_atomicidade_em_erro_e_timestamps_apenas_apos_sucesso(self):
         ClienteHub.objects.create(
             hub=self.hub,
@@ -911,6 +960,36 @@ class BootstrapHubServiceTests(TestCase):
         sincronizar_bootstrap(self.hub, self.resposta())
 
         self.assertEqual(CaixaHub.objects.filter(hub=self.hub, retaguarda_id=10).count(), 1)
+
+    def test_cashback_config_recebida_desativa_config_antiga(self):
+        CashbackConfigHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=1,
+            nome="Antiga",
+            ativo=True,
+            percentual=Decimal("1.0000"),
+            sincronizado_em=timezone.now(),
+        )
+
+        sincronizar_bootstrap(
+            self.hub,
+            self.resposta(
+                cashback_config={
+                    "retaguarda_id": 2,
+                    "nome": "Nova",
+                    "ativo": True,
+                    "percentual": "5.0000",
+                    "validade_dias": 30,
+                    "valor_minimo_geracao": "0.00",
+                    "valor_minimo_uso": "0.00",
+                    "limite_uso_percentual": "100.0000",
+                    "consumidor_final_participa": False,
+                }
+            ),
+        )
+
+        self.assertFalse(CashbackConfigHub.objects.get(hub=self.hub, retaguarda_id=1).ativo)
+        self.assertTrue(CashbackConfigHub.objects.get(hub=self.hub, retaguarda_id=2).ativo)
 
     def test_ultima_sincronizacao_em_atualiza_somente_com_sucesso(self):
         with self.assertRaises(BootstrapValidationError):

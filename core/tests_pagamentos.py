@@ -30,6 +30,7 @@ from core.models import (
     VendaDevolucaoHub,
 )
 from core.services.caixa import fechar_caixa
+from core.services.sync import enfileirar_venda_finalizada, sincronizar_eventos_pendentes
 from core.services.terminais import configurar_terminal
 from core.services.vendas import calcular_disponivel_local, listar_formas_pagamento
 from core.tests_caixa import criar_hub
@@ -204,6 +205,27 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(item.total_item, Decimal("179.91"))
         self.assertEqual(resposta.data["venda"]["itens"][0]["promocao"]["id"], 77)
 
+    def test_promocao_recalcula_ao_incrementar_mesmo_sku(self):
+        PromocaoHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=78,
+            nome="Promo 10",
+            tipo=PromocaoHub.TIPO_PERCENTUAL,
+            valor=Decimal("10.0000"),
+            sku_retaguarda_id=self.catalogo_item.retaguarda_sku_id,
+            ativo=True,
+            sincronizado_em=timezone.now(),
+        )
+
+        self.post_item()
+        resposta = self.post_item()
+        item = VendaItemHub.objects.get()
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(item.quantidade, 2)
+        self.assertEqual(item.desconto, Decimal("39.98"))
+        self.assertEqual(item.total_item, Decimal("359.82"))
+
     def test_cashback_e_vale_validam_saldo_e_geram_movimentos(self):
         cliente = self.criar_cliente()
         CashbackConfigHub.objects.create(
@@ -370,6 +392,140 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(VendaDevolucaoHub.objects.count(), 1)
         self.assertEqual(ValeTrocaHub.objects.filter(documento__startswith="VT-HUB-").count(), 1)
         self.assertEqual(EventoSyncHub.objects.filter(tipo="DEVOLUCAO_FINALIZADA").count(), 1)
+
+    def test_consulta_beneficios_nao_bloqueia_e_separa_saldos_offline_retaguarda(self):
+        cliente = self.criar_cliente(cashback_saldo_retaguarda=Decimal("80.00"))
+        CashbackMovimentoHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            tipo=CashbackMovimentoHub.TIPO_CREDITO,
+            valor=Decimal("30.00"),
+        )
+        ValeTrocaHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            documento="VT-LOCAL",
+            valor_original=Decimal("10.00"),
+            saldo=Decimal("10.00"),
+        )
+        ValeTrocaHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            documento="VT-RET",
+            valor_original=Decimal("20.00"),
+            saldo=Decimal("20.00"),
+            sincronizado_em=timezone.now(),
+        )
+
+        resposta = self.client.get(f"/api/terminal/clientes/{cliente.cliente_uuid}/beneficios/")
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(resposta.data["cashback"]["saldo_retaguarda"], "80.00")
+        self.assertEqual(resposta.data["cashback"]["saldo_offline_utilizavel"], "30.00")
+        vales = {vale["documento"]: vale for vale in resposta.data["vales_troca"]}
+        self.assertTrue(vales["VT-LOCAL"]["utilizavel_offline"])
+        self.assertFalse(vales["VT-RET"]["utilizavel_offline"])
+
+    def test_vale_retaguarda_nao_pode_ser_consumido_offline(self):
+        cliente = self.criar_cliente()
+        ValeTrocaHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            documento="VT-RET",
+            valor_original=Decimal("40.00"),
+            saldo=Decimal("40.00"),
+            sincronizado_em=timezone.now(),
+        )
+        troca = self.criar_forma("TRO", "TROCA")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+
+        resposta = self.client.post(
+            "/api/terminal/venda/pagamento/",
+            {
+                "venda_uuid": venda_uuid,
+                "operacao_uuid": str(uuid.uuid4()),
+                "forma_pagamento_id": troca.id,
+                "valor": "10.00",
+                "autorizacao": "VT-RET",
+            },
+            format="json",
+        )
+
+        self.assertEqual(resposta.status_code, 409)
+
+    def test_sync_confirmado_centraliza_cashback_e_vale_local(self):
+        cliente = self.criar_cliente()
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        movimento = CashbackMovimentoHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            venda=VendaHub.objects.get(venda_uuid=venda_uuid),
+            tipo=CashbackMovimentoHub.TIPO_CREDITO,
+            valor=Decimal("5.00"),
+        )
+        evento_venda = enfileirar_venda_finalizada(VendaHub.objects.get(venda_uuid=venda_uuid))
+        vale = ValeTrocaHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            documento="VT-LOCAL",
+            valor_original=Decimal("15.00"),
+            saldo=Decimal("15.00"),
+        )
+        evento_dev = EventoSyncHub.objects.create(
+            hub=self.hub,
+            tipo="DEVOLUCAO_FINALIZADA",
+            chave_idempotencia="DEVOLUCAO:1:FINALIZADA",
+            payload={"devolucao_uuid": str(uuid.uuid4()), "vale_troca": {"documento": vale.documento}},
+        )
+
+        class ClientOk:
+            def sync_push(self, **kwargs):
+                return {
+                    "resultados": [
+                        {"chave_idempotencia": evento_venda.chave_idempotencia, "status": "PROCESSADO"},
+                        {"chave_idempotencia": evento_dev.chave_idempotencia, "status": "PROCESSADO"},
+                    ]
+                }
+
+        sincronizar_eventos_pendentes(self.hub, client=ClientOk())
+        movimento.refresh_from_db()
+        vale.refresh_from_db()
+
+        self.assertIsNotNone(movimento.centralizado_em)
+        self.assertIsNotNone(vale.sincronizado_em)
+
+    def test_consulta_devolucao_por_numero_nfce(self):
+        cliente = self.criar_cliente()
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        self.assertEqual(self.pagar(venda_uuid, self.dinheiro, "199.90").status_code, 201)
+        self.assertEqual(self.finalizar(venda_uuid).status_code, 200)
+        venda = VendaHub.objects.get(venda_uuid=venda_uuid)
+        NFCeHub.objects.create(
+            hub=self.hub,
+            venda=venda,
+            ambiente="HOMOLOGACAO",
+            serie=1,
+            numero=123,
+            codigo_numerico="00000001",
+            digito_verificador="1",
+            chave_acesso="35260900000000000123650010000001231000000011",
+            status=NFCeHub.STATUS_AUTORIZADA,
+            emitida_em=timezone.now(),
+        )
+
+        resposta = self.client.get("/api/terminal/devolucoes/vendas/?documento=123")
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(resposta.data["venda"]["uuid"], str(venda.venda_uuid))
 
 
 class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):

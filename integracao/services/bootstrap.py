@@ -195,11 +195,16 @@ def _sincronizar_cashback(hub, config, sincronizado_em):
         "consumidor_final_participa": bool(config.get("consumidor_final_participa")),
         "sincronizado_em": sincronizado_em,
     }
-    CashbackConfigHub.objects.update_or_create(
+    regra, _criada = CashbackConfigHub.objects.update_or_create(
         hub=hub,
         retaguarda_id=config["retaguarda_id"],
         defaults=defaults,
     )
+    if regra.ativo:
+        CashbackConfigHub.objects.filter(hub=hub, ativo=True).exclude(pk=regra.pk).update(
+            ativo=False,
+            sincronizado_em=sincronizado_em,
+        )
     return True
 
 

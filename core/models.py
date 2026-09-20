@@ -612,6 +612,8 @@ class ClienteHub(models.Model):
     origem_consentimento = models.CharField(max_length=80, blank=True, default="")
 
     ativo = models.BooleanField(default=True)
+    cashback_saldo_retaguarda = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    cashback_saldo_retaguarda_sincronizado_em = models.DateTimeField(null=True, blank=True)
 
     sincronizado_em = models.DateTimeField(null=True, blank=True)
     criado_em = models.DateTimeField(auto_now_add=True)
@@ -1436,6 +1438,7 @@ class CashbackMovimentoHub(models.Model):
     valor = models.DecimalField(max_digits=18, decimal_places=2)
     validade = models.DateField(null=True, blank=True)
     observacao = models.CharField(max_length=255, blank=True, default="")
+    centralizado_em = models.DateTimeField(null=True, blank=True)
     criado_em = models.DateTimeField(auto_now_add=True)
 
     class Meta:

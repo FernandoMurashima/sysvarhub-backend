@@ -1,3 +1,4 @@
+import uuid
 from decimal import Decimal
 
 from django.db import models, transaction
@@ -14,6 +15,26 @@ def consultar_venda_para_devolucao(terminal, venda_uuid):
         .prefetch_related("itens")
         .first()
     )
+    if not venda:
+        raise VendaNotFoundError("Venda finalizada não encontrada no Hub.")
+    return serializar_venda_devolucao(venda)
+
+
+def consultar_venda_para_devolucao_por_documento(terminal, documento):
+    termo = str(documento or "").strip()
+    if not termo:
+        raise VendaValidationError("Informe a venda ou cupom para devolução.")
+    qs = VendaHub.objects.filter(hub=terminal.hub, status=VendaHub.STATUS_FINALIZADA).prefetch_related("itens")
+    filtros = models.Q()
+    try:
+        filtros |= models.Q(venda_uuid=uuid.UUID(termo))
+    except (TypeError, ValueError, AttributeError):
+        pass
+    if termo.isdecimal():
+        filtros |= models.Q(nfce__numero=int(termo))
+    filtros |= models.Q(nfce__chave_acesso=termo)
+    filtros |= models.Q(nfce__protocolo=termo)
+    venda = qs.filter(filtros).order_by("-finalizada_em", "-id").first()
     if not venda:
         raise VendaNotFoundError("Venda finalizada não encontrada no Hub.")
     return serializar_venda_devolucao(venda)

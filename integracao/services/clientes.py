@@ -1,4 +1,5 @@
 import re
+from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
 from django.utils import timezone
@@ -249,6 +250,8 @@ def _validar_cliente(item):
         "consentimento_em": _datetime_opcional(item["consentimento_em"], "consentimento_em"),
         "origem_consentimento": _texto_opcional(item["origem_consentimento"], "origem_consentimento", max_length=80) or "",
         "ativo": item["ativo"],
+        "cashback_saldo_retaguarda": _decimal_nao_negativo(item.get("cashback_saldo_retaguarda") or item.get("cashback_saldo") or 0, "cashback_saldo_retaguarda"),
+        "cashback_saldo_retaguarda_sincronizado_em": timezone.now(),
         "vales_troca": _validar_vales(item.get("vales_troca") or []),
     }
 
@@ -277,20 +280,29 @@ def _sincronizar_vales_cliente(hub, cliente, vales, sincronizado_em):
     recebidos = set()
     for vale in vales:
         recebidos.add(vale["retaguarda_id"])
-        ValeTrocaHub.objects.update_or_create(
-            hub=hub,
-            retaguarda_id=vale["retaguarda_id"],
-            defaults={
-                "cliente_uuid": cliente.cliente_uuid,
-                "cliente_retaguarda_id": cliente.retaguarda_id,
-                "documento": vale["documento"],
-                "valor_original": vale["valor_original"],
-                "saldo": vale["saldo"],
-                "status": vale["status"],
-                "validade": vale["validade"],
-                "sincronizado_em": sincronizado_em,
-            },
+        registro = (
+            ValeTrocaHub.objects.select_for_update()
+            .filter(hub=hub, retaguarda_id=vale["retaguarda_id"])
+            .first()
         )
+        if registro is None:
+            registro = (
+                ValeTrocaHub.objects.select_for_update()
+                .filter(hub=hub, documento=vale["documento"])
+                .first()
+            )
+        if registro is None:
+            registro = ValeTrocaHub(hub=hub)
+        registro.retaguarda_id = vale["retaguarda_id"]
+        registro.cliente_uuid = cliente.cliente_uuid
+        registro.cliente_retaguarda_id = cliente.retaguarda_id
+        registro.documento = vale["documento"]
+        registro.valor_original = vale["valor_original"]
+        registro.saldo = vale["saldo"]
+        registro.status = vale["status"]
+        registro.validade = vale["validade"]
+        registro.sincronizado_em = sincronizado_em
+        registro.save()
     ValeTrocaHub.objects.filter(
         hub=hub,
         cliente_retaguarda_id=cliente.retaguarda_id,
@@ -363,6 +375,16 @@ def _inteiro_positivo(valor, campo):
     if isinstance(valor, bool) or not isinstance(valor, int) or valor <= 0:
         raise ClientesValidationError(f"Clientes retornou {campo} inválido.")
     return valor
+
+
+def _decimal_nao_negativo(valor, campo):
+    try:
+        decimal = Decimal(str(valor))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ClientesValidationError(f"Clientes retornou {campo} inválido.") from exc
+    if decimal < 0:
+        raise ClientesValidationError(f"Clientes retornou {campo} inválido.")
+    return decimal
 
 
 def _exigir_campos(payload, campos, *, permitir_nulos=None, permitir_vazios=None):

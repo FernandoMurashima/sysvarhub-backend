@@ -8,6 +8,7 @@ from core.api import (
     CaixaStatusView,
     DevolucaoConsultarView,
     DevolucaoFinalizarView,
+    DevolucaoVendasView,
     FechamentoDiaView,
     FormasPagamentoView,
     OperadorContextoView,
@@ -71,6 +72,7 @@ urlpatterns = [
     path("venda/finalizar/", VendaFinalizarView.as_view(), name="terminal-venda-finalizar"),
     path("venda/<uuid:venda_uuid>/danfe-nfce/", VendaDanfeNFCeView.as_view(), name="terminal-venda-danfe-nfce"),
     path("venda/cancelar/", VendaCancelarView.as_view(), name="terminal-venda-cancelar"),
+    path("devolucoes/vendas/", DevolucaoVendasView.as_view(), name="terminal-devolucao-vendas"),
     path("devolucoes/venda/<uuid:venda_uuid>/", DevolucaoConsultarView.as_view(), name="terminal-devolucao-consultar"),
     path("devolucoes/finalizar/", DevolucaoFinalizarView.as_view(), name="terminal-devolucao-finalizar"),
 ]

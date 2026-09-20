@@ -25,10 +25,18 @@ def cashback_config_ativa(hub):
 
 
 def saldo_cashback(venda):
+    return saldo_cashback_offline(venda)
+
+
+def saldo_cashback_offline(venda):
     if not (venda.cliente_retaguarda_id or venda.cliente_uuid):
         return ZERO
     hoje = timezone.localdate()
-    qs = CashbackMovimentoHub.objects.filter(hub=venda.hub, status=CashbackMovimentoHub.STATUS_ATIVO)
+    qs = CashbackMovimentoHub.objects.filter(
+        hub=venda.hub,
+        status=CashbackMovimentoHub.STATUS_ATIVO,
+        centralizado_em__isnull=True,
+    )
     qs = _filtrar_cliente(qs, venda)
     return money(
         qs.filter(models.Q(validade__isnull=True) | models.Q(validade__gte=hoje))
@@ -46,13 +54,17 @@ def saldo_cashback(venda):
     )
 
 
-def vales_abertos(venda):
+def vales_abertos(venda, *, bloquear=False, apenas_utilizaveis_offline=False):
     hoje = timezone.localdate()
-    qs = ValeTrocaHub.objects.select_for_update().filter(
+    qs = ValeTrocaHub.objects.filter(
         hub=venda.hub,
         status=ValeTrocaHub.STATUS_ABERTO,
         saldo__gt=0,
     )
+    if bloquear:
+        qs = qs.select_for_update()
+    if apenas_utilizaveis_offline:
+        qs = qs.filter(sincronizado_em__isnull=True)
     qs = _filtrar_cliente(qs, venda)
     return qs.filter(models.Q(validade__isnull=True) | models.Q(validade__gte=hoje)).order_by("criado_em", "id")
 
@@ -60,7 +72,7 @@ def vales_abertos(venda):
 def saldo_vale_troca(venda):
     if not (venda.cliente_retaguarda_id or venda.cliente_uuid):
         return ZERO
-    return money(vales_abertos(venda).aggregate(total=Sum("saldo")).get("total") or ZERO)
+    return money(vales_abertos(venda, apenas_utilizaveis_offline=True).aggregate(total=Sum("saldo")).get("total") or ZERO)
 
 
 def validar_pagamento_beneficio(venda, forma, valor, autorizacao=""):
@@ -101,7 +113,7 @@ def validar_vale_troca(venda, valor, autorizacao=""):
     if money(valor) > money(max(ZERO, venda.total - outros)):
         raise ValueError("Troca não pode gerar troco; use apenas o saldo pendente da venda.")
     if autorizacao:
-        vale = vales_abertos(venda).filter(documento=autorizacao.strip()).first()
+        vale = vales_abertos(venda, bloquear=True, apenas_utilizaveis_offline=True).filter(documento=autorizacao.strip()).first()
         if not vale:
             raise ValueError("Cupom de troca inválido para este cliente.")
         if money(valor) > money(vale.saldo):
@@ -187,7 +199,7 @@ def _gerar_cashback(venda, pagamentos):
 
 def _consumir_vale(venda, pagamento):
     restante = money(pagamento.valor)
-    qs = vales_abertos(venda)
+    qs = vales_abertos(venda, bloquear=True, apenas_utilizaveis_offline=True)
     if pagamento.vale_troca_documento:
         qs = qs.filter(documento=pagamento.vale_troca_documento)
     for vale in qs:
@@ -247,7 +259,16 @@ def consultar_beneficios_cliente(hub, cliente_uuid):
 
     cliente = ClienteHub.objects.filter(hub=hub, cliente_uuid=cliente_uuid, ativo=True, bloqueio=False).first()
     if not cliente:
-        return {"cashback": {"saldo": "0.00", "limite_uso_percentual": "0.0000"}, "vales_troca": []}
+        return {
+            "cashback": {
+                "saldo": "0.00",
+                "saldo_retaguarda": "0.00",
+                "saldo_offline_utilizavel": "0.00",
+                "limite_uso_percentual": "0.0000",
+                "valor_minimo_uso": "0.00",
+            },
+            "vales_troca": [],
+        }
     base = type("VendaCliente", (), {
         "hub": hub,
         "cliente_uuid": cliente.cliente_uuid,
@@ -256,10 +277,13 @@ def consultar_beneficios_cliente(hub, cliente_uuid):
         "cliente_documento": cliente.documento,
     })()
     config = cashback_config_ativa(hub)
+    saldo_offline = saldo_cashback_offline(base)
     vales = vales_abertos(base)
     return {
         "cashback": {
-            "saldo": f"{saldo_cashback(base):.2f}",
+            "saldo": f"{saldo_offline:.2f}",
+            "saldo_retaguarda": f"{cliente.cashback_saldo_retaguarda:.2f}",
+            "saldo_offline_utilizavel": f"{saldo_offline:.2f}",
             "limite_uso_percentual": f"{config.limite_uso_percentual:.4f}" if config else "0.0000",
             "valor_minimo_uso": f"{config.valor_minimo_uso:.2f}" if config else "0.00",
         },
@@ -268,6 +292,7 @@ def consultar_beneficios_cliente(hub, cliente_uuid):
                 "documento": vale.documento,
                 "saldo": f"{vale.saldo:.2f}",
                 "validade": vale.validade.isoformat() if vale.validade else None,
+                "utilizavel_offline": vale.sincronizado_em is None,
             }
             for vale in vales
         ],

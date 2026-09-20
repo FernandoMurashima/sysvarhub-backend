@@ -7,7 +7,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from core.models import EventoSyncHub, NFCeHub, VendaDevolucaoHub, VendaHub, VendaPagamentoHub
+from core.models import CashbackMovimentoHub, EventoSyncHub, NFCeHub, ValeTrocaHub, VendaDevolucaoHub, VendaHub, VendaPagamentoHub
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 
 
@@ -220,6 +220,7 @@ def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=Non
             evento.resposta = resultado
             evento.ultimo_erro = ""
             evento.save(update_fields=["status", "sincronizado_em", "resposta", "ultimo_erro", "atualizado_em"])
+            _marcar_beneficios_centralizados(evento, agora)
             contadores["sincronizados"] += 1
         elif status == "CONFLITO":
             evento.status = EventoSyncHub.STATUS_CONFLITO
@@ -268,6 +269,29 @@ def _marcar_retry(evento, mensagem, agora, resposta=None):
     evento.resposta = resposta or {}
     evento.proxima_tentativa_em = agora + timedelta(seconds=min(300, 2 ** min(evento.tentativas, 8)))
     evento.save(update_fields=["status", "ultimo_erro", "resposta", "proxima_tentativa_em", "atualizado_em"])
+
+
+def _marcar_beneficios_centralizados(evento, agora):
+    payload = evento.payload or {}
+    if evento.tipo == TIPO_VENDA_FINALIZADA:
+        venda_uuid = payload.get("venda_uuid")
+        if venda_uuid:
+            CashbackMovimentoHub.objects.filter(
+                hub=evento.hub,
+                venda__venda_uuid=venda_uuid,
+                centralizado_em__isnull=True,
+            ).update(centralizado_em=agora)
+    elif evento.tipo == TIPO_DEVOLUCAO_FINALIZADA:
+        devolucao_uuid = payload.get("devolucao_uuid")
+        vale_payload = payload.get("vale_troca") or {}
+        qs = ValeTrocaHub.objects.filter(hub=evento.hub, sincronizado_em__isnull=True)
+        if devolucao_uuid:
+            atualizados = qs.filter(devolucao__devolucao_uuid=devolucao_uuid).update(sincronizado_em=agora)
+            if atualizados:
+                return
+        documento = vale_payload.get("documento")
+        if documento:
+            qs.filter(documento=documento).update(sincronizado_em=agora)
 
 
 def _uuid_deterministico(*partes):

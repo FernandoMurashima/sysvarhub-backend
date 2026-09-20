@@ -147,8 +147,19 @@ def adicionar_item(terminal, operador, sessao_operador, *, sku_id, quantidade=1)
 
         if item:
             item.quantidade = quantidade_nova
-            item.total_item = calcular_total_item(item.quantidade, item.preco_unitario, item.desconto)
-            item.save(update_fields=["quantidade", "total_item", "atualizado_em"])
+            aplicar_precificacao_item(item, catalogo_item)
+            item.save(update_fields=[
+                "quantidade",
+                "preco_unitario",
+                "desconto",
+                "total_item",
+                "promocao_retaguarda_id",
+                "promocao_nome",
+                "promocao_tipo",
+                "promocao_valor",
+                "promocao_acumula_cashback",
+                "atualizado_em",
+            ])
             tipo_evento = VendaEventoHub.TIPO_ITEM_QUANTIDADE_ALTERADA
         else:
             item = criar_item_venda(venda, catalogo_item, quantidade, operador, sessao_operador, terminal_bloqueado)
@@ -190,8 +201,19 @@ def alterar_quantidade_item(terminal, operador, sessao_operador, *, item_uuid, q
             validar_disponibilidade(catalogo_item, delta)
 
         item.quantidade = quantidade
-        item.total_item = calcular_total_item(item.quantidade, item.preco_unitario, item.desconto)
-        item.save(update_fields=["quantidade", "total_item", "atualizado_em"])
+        aplicar_precificacao_item(item, catalogo_item)
+        item.save(update_fields=[
+            "quantidade",
+            "preco_unitario",
+            "desconto",
+            "total_item",
+            "promocao_retaguarda_id",
+            "promocao_nome",
+            "promocao_tipo",
+            "promocao_valor",
+            "promocao_acumula_cashback",
+            "atualizado_em",
+        ])
         recalcular_totais(venda)
         registrar_evento(
             venda,
@@ -1111,6 +1133,18 @@ def criar_item_venda(venda, catalogo_item, quantidade, operador, sessao_operador
         sessao_operador_inclusao=sessao_operador,
         terminal_inclusao=terminal,
     )
+
+
+def aplicar_precificacao_item(item, catalogo_item):
+    preco_unitario, desconto, promo = aplicar_promocao(catalogo_item, item.quantidade)
+    item.preco_unitario = preco_unitario
+    item.desconto = desconto
+    item.total_item = calcular_total_item(item.quantidade, preco_unitario, desconto)
+    item.promocao_retaguarda_id = promo.get("promocao_retaguarda_id")
+    item.promocao_nome = promo.get("promocao_nome", "")
+    item.promocao_tipo = promo.get("promocao_tipo", "")
+    item.promocao_valor = promo.get("promocao_valor", ZERO_2)
+    item.promocao_acumula_cashback = promo.get("promocao_acumula_cashback", True)
 
 
 def calcular_total_item(quantidade, preco_unitario, desconto):

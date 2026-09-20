@@ -85,7 +85,7 @@ from core.services.vendas import (
     venda_atual,
 )
 from core.services.danfe_nfce import DanfeNFCeErroDominio, montar_dados_danfe_nfce
-from core.services.devolucoes import consultar_venda_para_devolucao, finalizar_devolucao, serializar_devolucao
+from core.services.devolucoes import consultar_venda_para_devolucao, consultar_venda_para_devolucao_por_documento, finalizar_devolucao, serializar_devolucao
 
 
 CATALOGO_TERMINAL_LIMIT_DEFAULT = 40
@@ -905,6 +905,19 @@ class DevolucaoConsultarView(APIView):
             return Response({"venda": consultar_venda_para_devolucao(request.sysvar_terminal, venda_uuid)})
         except VendaNotFoundError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+
+
+class DevolucaoVendasView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        try:
+            return Response({"venda": consultar_venda_para_devolucao_por_documento(request.sysvar_terminal, request.query_params.get("documento"))})
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class DevolucaoFinalizarView(APIView):
