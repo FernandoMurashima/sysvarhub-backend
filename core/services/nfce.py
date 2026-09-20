@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import os
 import random
 import re
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ class NFCeConfiguracaoErro(NFCeErroDominio):
 class MaterialAssinatura:
     private_key_pem: bytes
     certificate_pem: bytes
+    chain_pem: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -65,7 +67,11 @@ class ConfigQRCodeDesenvolvimento:
 @dataclass(frozen=True)
 class ResultadoSefazNFCe:
     status: str
+    codigo: str = ""
     mensagem: str = ""
+    protocolo: str = ""
+    autorizada_em: object = None
+    xml_protocolo: str = ""
     simulacao: bool = False
 
 
@@ -77,6 +83,12 @@ class SefazNFCeClient:
 
     def transmitir(self, nfce):
         raise NotImplementedError
+
+    def cancelar(self, *args, **kwargs):
+        raise NFCeErroDominio("OPERACAO_SEFAZ_NAO_IMPLEMENTADA")
+
+    def inutilizar(self, *args, **kwargs):
+        raise NFCeErroDominio("OPERACAO_SEFAZ_NAO_IMPLEMENTADA")
 
 
 class SefazNFCeClientDesenvolvimento(SefazNFCeClient):
@@ -92,9 +104,27 @@ class SefazNFCeClientDesenvolvimento(SefazNFCeClient):
         }
         return ResultadoSefazNFCe(
             status=self.resultado,
+            codigo="100" if self.resultado == self.AUTORIZADA else "",
             mensagem=mensagens.get(self.resultado, "SIMULACAO_SEFAZ_RESULTADO_DESCONHECIDO"),
+            protocolo="SIMULADO" if self.resultado == self.AUTORIZADA else "",
+            autorizada_em=timezone.now() if self.resultado == self.AUTORIZADA else None,
             simulacao=True,
         )
+
+
+class SefazNFCeClientReal(SefazNFCeClient):
+    def __init__(self, *, autorizacao_url, consulta_url="", evento_url="", timeout=30):
+        self.autorizacao_url = autorizacao_url
+        self.consulta_url = consulta_url
+        self.evento_url = evento_url
+        self.timeout = timeout
+
+    def transmitir(self, nfce):
+        if not self.autorizacao_url:
+            raise NFCeConfiguracaoErro("SEFAZ_ENDPOINT_NAO_CONFIGURADO")
+        # Transporte real preparado para integração por mock/teste. A chamada externa fica
+        # desabilitada até homologação formal para evitar emissão acidental.
+        raise NFCeConfiguracaoErro("SEFAZ_REAL_NAO_HOMOLOGADA")
 
 
 class NFCeMaterialProvider:
@@ -135,6 +165,49 @@ class NFCeMaterialProviderDesenvolvimento(NFCeMaterialProvider):
         )
 
 
+class NFCeMaterialProviderA1(NFCeMaterialProvider):
+    def __init__(self, path=None, password=None):
+        self.path = path or getattr(settings, "SYSVARHUB_NFCE_A1_PATH", "")
+        self.password = password if password is not None else getattr(settings, "SYSVARHUB_NFCE_A1_PASSWORD", "")
+
+    def obter(self):
+        if not self.path or not os.path.exists(self.path):
+            raise NFCeConfiguracaoErro("A1_ARQUIVO_NAO_ENCONTRADO")
+        try:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.serialization import pkcs12
+        except ImportError as exc:
+            raise NFCeConfiguracaoErro("A1_CERTIFICADO_INVALIDO") from exc
+        try:
+            with open(self.path, "rb") as arquivo:
+                data = arquivo.read()
+            key, cert, chain = pkcs12.load_key_and_certificates(data, str(self.password or "").encode("utf-8") or None)
+        except ValueError as exc:
+            raise NFCeConfiguracaoErro("A1_SENHA_INVALIDA") from exc
+        except OSError as exc:
+            raise NFCeConfiguracaoErro("A1_ARQUIVO_NAO_ENCONTRADO") from exc
+        if key is None:
+            raise NFCeConfiguracaoErro("A1_SEM_CHAVE_PRIVADA")
+        if cert is None:
+            raise NFCeConfiguracaoErro("A1_CERTIFICADO_INVALIDO")
+        agora = timezone.now()
+        not_before = getattr(cert, "not_valid_before_utc", None) or timezone.make_aware(cert.not_valid_before)
+        not_after = getattr(cert, "not_valid_after_utc", None) or timezone.make_aware(cert.not_valid_after)
+        if agora < not_before:
+            raise NFCeConfiguracaoErro("A1_CERTIFICADO_INVALIDO")
+        if agora > not_after:
+            raise NFCeConfiguracaoErro("A1_CERTIFICADO_EXPIRADO")
+        return MaterialAssinatura(
+            private_key_pem=key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ),
+            certificate_pem=cert.public_bytes(serialization.Encoding.PEM),
+            chain_pem=tuple(c.public_bytes(serialization.Encoding.PEM) for c in (chain or ())),
+        )
+
+
 def emitir_nfce_para_venda_finalizada(venda, *, material_provider=None, sefaz_client=None, qr_config=None):
     with transaction.atomic():
         nfce = preparar_nfce_para_venda_finalizada(venda)
@@ -162,21 +235,50 @@ def processar_nfce_preparada(nfce, *, material_provider=None, sefaz_client=None,
                 qr,
                 resultado.mensagem or "SEFAZ indisponivel no ambiente local.",
             )
+            _enfileirar_nfce_para_central(nfce)
             return nfce, ResultadoSefazNFCe(status=resultado.status, mensagem=resultado.mensagem, simulacao=resultado.simulacao)
         if resultado.status == SefazNFCeClient.REJEITADA:
             nfce.status = NFCeHub.STATUS_REJEITADA
+            nfce.codigo_retorno = resultado.codigo
             nfce.mensagem_retorno = resultado.mensagem
-            nfce.save(update_fields=["status", "mensagem_retorno", "atualizado_em"])
+            nfce.save(update_fields=["status", "codigo_retorno", "mensagem_retorno", "atualizado_em"])
+            _enfileirar_nfce_para_central(nfce)
+            return nfce, resultado
+        if resultado.status == SefazNFCeClient.AUTORIZADA:
+            nfce.status = NFCeHub.STATUS_AUTORIZADA
+            nfce.codigo_retorno = resultado.codigo
+            nfce.mensagem_retorno = resultado.mensagem
+            nfce.protocolo = resultado.protocolo or nfce.protocolo
+            nfce.autorizada_em = resultado.autorizada_em or timezone.now()
+            nfce.xml_autorizado = resultado.xml_protocolo or nfce.xml_autorizado
+            nfce.save(update_fields=[
+                "status",
+                "codigo_retorno",
+                "mensagem_retorno",
+                "protocolo",
+                "autorizada_em",
+                "xml_autorizado",
+                "atualizado_em",
+            ])
+            _enfileirar_nfce_para_central(nfce)
             return nfce, resultado
         nfce.mensagem_retorno = resultado.mensagem
         nfce.save(update_fields=["mensagem_retorno", "atualizado_em"])
+        _enfileirar_nfce_para_central(nfce)
         return nfce, resultado
     except Exception as exc:
         codigo = exc.codigo if isinstance(exc, NFCeErroDominio) else "DADOS_FISCAIS_INSUFICIENTES"
         nfce.status = NFCeHub.STATUS_ERRO_GERACAO
         nfce.mensagem_retorno = codigo
         nfce.save(update_fields=["status", "mensagem_retorno", "atualizado_em"])
+        _enfileirar_nfce_para_central(nfce)
         return nfce, ResultadoSefazNFCe(status=NFCeHub.STATUS_ERRO_GERACAO, mensagem=codigo)
+
+
+def _enfileirar_nfce_para_central(nfce):
+    from core.services.sync import marcar_nfce_alterada_para_sync
+
+    marcar_nfce_alterada_para_sync(nfce)
 
 
 def regenerar_nfce_em_contingencia(nfce, config, material_assinatura, qr_config, justificativa):
@@ -242,6 +344,8 @@ def obter_material_provider_configurado():
         if getattr(settings, "SYSVARHUB_NFCE_SEFAZ_CLIENT", "").upper() != "DESENVOLVIMENTO":
             raise NFCeConfiguracaoErro("MATERIAL_DESENVOLVIMENTO_REQUER_SEFAZ_DESENVOLVIMENTO")
         return NFCeMaterialProviderDesenvolvimento()
+    if modo == "A1":
+        return NFCeMaterialProviderA1()
     raise NFCeConfiguracaoErro("MATERIAL_ASSINATURA_NFCE_NAO_CONFIGURADO")
 
 
@@ -250,6 +354,12 @@ def obter_sefaz_client_configurado():
     if modo == "DESENVOLVIMENTO":
         resultado = (getattr(settings, "SYSVARHUB_NFCE_SEFAZ_DESENVOLVIMENTO_RESULTADO", "") or "AUTORIZADA").upper()
         return SefazNFCeClientDesenvolvimento(resultado)
+    if modo == "REAL":
+        return SefazNFCeClientReal(
+            autorizacao_url=getattr(settings, "SYSVARHUB_NFCE_SEFAZ_AUTORIZACAO_URL", ""),
+            consulta_url=getattr(settings, "SYSVARHUB_NFCE_SEFAZ_CONSULTA_URL", ""),
+            evento_url=getattr(settings, "SYSVARHUB_NFCE_SEFAZ_EVENTO_URL", ""),
+        )
     raise NFCeConfiguracaoErro("CLIENTE_SEFAZ_NFCE_NAO_CONFIGURADO")
 
 
@@ -901,6 +1011,37 @@ def listar_nfces_pendentes_transmissao(hub=None):
     if hub is not None:
         qs = qs.filter(hub=hub)
     return qs
+
+
+def retransmitir_nfces_pendentes(hub=None, *, material_provider=None, sefaz_client=None, qr_config=None, limite=50):
+    resultados = []
+    for nfce in listar_nfces_pendentes_transmissao(hub).select_related("hub", "venda")[:limite]:
+        if nfce.status == NFCeHub.STATUS_CONTINGENCIA:
+            client = sefaz_client or obter_sefaz_client_configurado()
+            try:
+                resultado = client.transmitir(nfce)
+            except NFCeErroDominio as exc:
+                resultados.append((nfce, ResultadoSefazNFCe(status=NFCeHub.STATUS_CONTINGENCIA, mensagem=exc.codigo)))
+                continue
+            if resultado.status == SefazNFCeClient.AUTORIZADA:
+                nfce.status = NFCeHub.STATUS_AUTORIZADA
+                nfce.codigo_retorno = resultado.codigo
+                nfce.mensagem_retorno = resultado.mensagem
+                nfce.protocolo = resultado.protocolo or nfce.protocolo
+                nfce.autorizada_em = resultado.autorizada_em or timezone.now()
+                nfce.xml_autorizado = resultado.xml_protocolo or nfce.xml_autorizado
+                nfce.save(update_fields=["status", "codigo_retorno", "mensagem_retorno", "protocolo", "autorizada_em", "xml_autorizado", "atualizado_em"])
+                _enfileirar_nfce_para_central(nfce)
+            elif resultado.status == SefazNFCeClient.REJEITADA:
+                nfce.status = NFCeHub.STATUS_REJEITADA
+                nfce.codigo_retorno = resultado.codigo
+                nfce.mensagem_retorno = resultado.mensagem
+                nfce.save(update_fields=["status", "codigo_retorno", "mensagem_retorno", "atualizado_em"])
+                _enfileirar_nfce_para_central(nfce)
+            resultados.append((nfce, resultado))
+        else:
+            resultados.append(processar_nfce_preparada(nfce, material_provider=material_provider, sefaz_client=sefaz_client, qr_config=qr_config))
+    return resultados
 
 
 def q(tag):

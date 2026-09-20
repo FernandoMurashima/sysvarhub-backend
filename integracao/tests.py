@@ -131,6 +131,23 @@ class RetaguardaClientTests(TestCase):
         self.assertEqual(captured["payload"], {"hostname": "loja-01", "versao": "0.1.0"})
         self.assertEqual(captured["headers"]["Authorization"], "Hub TOKEN-SECRETO")
 
+    def test_sync_push_usa_endpoint_existente_e_authorization_hub_token(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout):
+            captured["url"] = req.full_url
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            captured["headers"] = dict(req.header_items())
+            return _JsonResponse({"resultados": []})
+
+        eventos = [{"evento_uuid": str(uuid.uuid4()), "chave_idempotencia": "x", "tipo": "VENDA_FINALIZADA", "payload": {}}]
+        with patch("integracao.services.retaguarda.request.urlopen", fake_urlopen):
+            RetaguardaClient("http://central.test").sync_push(token="TOKEN-SECRETO", eventos=eventos)
+
+        self.assertEqual(captured["url"], "http://central.test/api/hub/sync/push/")
+        self.assertEqual(captured["payload"], {"versao": 1, "eventos": eventos})
+        self.assertEqual(captured["headers"]["Authorization"], "Hub TOKEN-SECRETO")
+
     def test_bootstrap_usa_get_authorization_hub_token_sem_payload(self):
         captured = {}
 

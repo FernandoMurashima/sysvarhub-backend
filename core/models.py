@@ -1459,6 +1459,8 @@ class NFCeHub(models.Model):
     autorizada_em = models.DateTimeField(null=True, blank=True)
     entrada_contingencia_em = models.DateTimeField(null=True, blank=True)
     justificativa_contingencia = models.CharField(max_length=255, blank=True, default="")
+    xml_autorizado = models.TextField(blank=True, default="")
+    sync_versao = models.PositiveIntegerField(default=0)
     criado_em = models.DateTimeField(auto_now_add=True)
     atualizado_em = models.DateTimeField(auto_now=True)
 
@@ -1472,6 +1474,51 @@ class NFCeHub(models.Model):
 
     def __str__(self):
         return f"NFC-e {self.serie}/{self.numero} - {self.status}"
+
+
+class EventoSyncHub(models.Model):
+    STATUS_PENDENTE = "PENDENTE"
+    STATUS_PROCESSANDO = "PROCESSANDO"
+    STATUS_SINCRONIZADO = "SINCRONIZADO"
+    STATUS_ERRO = "ERRO"
+    STATUS_CONFLITO = "CONFLITO"
+    STATUS_CHOICES = [
+        (STATUS_PENDENTE, "Pendente"),
+        (STATUS_PROCESSANDO, "Processando"),
+        (STATUS_SINCRONIZADO, "Sincronizado"),
+        (STATUS_ERRO, "Erro"),
+        (STATUS_CONFLITO, "Conflito"),
+    ]
+
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="eventos_sync")
+    evento_uuid = models.UUIDField(default=uuid.uuid4, editable=False)
+    chave_idempotencia = models.CharField(max_length=120)
+    tipo = models.CharField(max_length=40, db_index=True)
+    payload = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=14, choices=STATUS_CHOICES, default=STATUS_PENDENTE, db_index=True)
+    tentativas = models.PositiveIntegerField(default=0)
+    proxima_tentativa_em = models.DateTimeField(null=True, blank=True, db_index=True)
+    ultimo_erro = models.CharField(max_length=255, blank=True, default="")
+    resposta = models.JSONField(default=dict, blank=True)
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+    sincronizado_em = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Evento de sincronização do Hub"
+        verbose_name_plural = "Eventos de sincronização do Hub"
+        ordering = ("criado_em", "id")
+        constraints = [
+            models.UniqueConstraint(fields=["hub", "evento_uuid"], name="uniq_evt_sync_hub_uuid"),
+            models.UniqueConstraint(fields=["hub", "chave_idempotencia"], name="uniq_evt_sync_hub_chave"),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "status", "criado_em"], name="idx_evt_sync_hub_status"),
+            models.Index(fields=["proxima_tentativa_em"], name="idx_evt_sync_prox"),
+        ]
+
+    def __str__(self):
+        return f"{self.tipo} - {self.status}"
 
 
 class FechamentoDiaHub(models.Model):

@@ -32,6 +32,7 @@ from core.services.nfce import (
     processar_nfce_preparada,
     validar_nfce_para_finalizacao,
 )
+from core.services.sync import enfileirar_nfce_atualizada, enfileirar_venda_finalizada
 
 
 ZERO_2 = Decimal("0.00")
@@ -710,9 +711,11 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
             )
         if emitir_nfce:
             nfce_para_processar = preparar_nfce_para_venda_finalizada(venda)
+        transaction.on_commit(lambda venda_id=venda.pk: enfileirar_venda_finalizada(VendaHub.objects.get(pk=venda_id)))
 
     if nfce_para_processar is not None:
         processar_nfce_preparada(nfce_para_processar)
+        transaction.on_commit(lambda nfce_id=nfce_para_processar.pk: enfileirar_nfce_atualizada(nfce_para_processar.__class__.objects.get(pk=nfce_id)))
         venda = VendaHub.objects.get(pk=venda.pk)
     return venda
 

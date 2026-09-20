@@ -2,28 +2,36 @@ from datetime import datetime, timedelta
 import base64
 import hashlib
 from decimal import Decimal
+from pathlib import Path
+from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
+from django.core.management import call_command
 from django.test import TestCase
 from django.utils import timezone
 from lxml import etree
 
-from core.models import ConfiguracaoFiscalHub, FormaPagamentoFiscalMapHub, NFCeHub, VendaHub, VendaItemHub
+from core.models import ConfiguracaoFiscalHub, EventoSyncHub, FormaPagamentoFiscalMapHub, NFCeHub, VendaHub, VendaItemHub
 from core.services.nfce import (
     CANONICALIZATION_ALGORITHM,
     DIGEST_ALGORITHM,
     ENVELOPED_SIGNATURE_ALGORITHM,
     ConfigQRCodeDesenvolvimento,
     MaterialAssinatura,
+    NFCeMaterialProviderA1,
     NFCeErroDominio,
     SIGNATURE_ALGORITHM,
+    SefazNFCeClient,
+    ResultadoSefazNFCe,
     calcular_dv_chave,
     gerar_chave_acesso,
     gerar_nfce_local,
     listar_nfces_pendentes_transmissao,
     preparar_nfce_para_venda_finalizada,
+    retransmitir_nfces_pendentes,
     verificar_assinatura_nfce,
 )
+from core.services.sync import enfileirar_nfce_atualizada, enfileirar_venda_finalizada, sincronizar_eventos_pendentes
 from core.services.danfe_nfce import montar_dados_danfe_nfce
 from core.tests_caixa import criar_hub
 from core.tests_pagamentos import PagamentoHubTestMixin
@@ -455,6 +463,151 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
         venda.save(update_fields=["hub"])
         negada = self.client.get(f"/api/terminal/venda/{venda.venda_uuid}/danfe-nfce/")
         self.assertEqual(negada.status_code, 404)
+
+    def test_sync_enfileira_venda_e_nfce_sem_segredos_e_em_ordem(self):
+        venda = self.venda_finalizada()
+        nfce = self.gerar_nfce(venda)
+
+        enfileirar_nfce_atualizada(nfce)
+
+        eventos = list(EventoSyncHub.objects.order_by("criado_em", "id"))
+        self.assertEqual([e.tipo for e in eventos], ["VENDA_FINALIZADA", "NFCE_ATUALIZADA"])
+        self.assertEqual(eventos[1].payload["nfce_uuid"], str(nfce.nfce_uuid))
+        self.assertEqual(eventos[1].payload["venda_uuid"], str(venda.venda_uuid))
+        self.assertEqual(eventos[1].payload["versao_evento"], 1)
+        self.assertNotIn("senha", str(eventos[1].payload).lower())
+        self.assertNotIn("private", str(eventos[1].payload).lower())
+
+    def test_sync_worker_retry_processado_duplicado_conflito_e_processando_antigo(self):
+        venda = self.venda_finalizada()
+        enfileirar_venda_finalizada(venda)
+        evento = EventoSyncHub.objects.get()
+
+        class ClientErro:
+            def sync_push(self, **kwargs):
+                raise Exception("nao deveria")
+
+        class ClientRetaguardaIndisponivel:
+            def sync_push(self, **kwargs):
+                from integracao.services.retaguarda import RetaguardaError
+                raise RetaguardaError("offline")
+
+        resultado = sincronizar_eventos_pendentes(self.hub, client=ClientRetaguardaIndisponivel())
+        evento.refresh_from_db()
+        self.assertEqual(resultado["erros"], 1)
+        self.assertEqual(evento.status, EventoSyncHub.STATUS_ERRO)
+
+        evento.proxima_tentativa_em = timezone.now() - timedelta(minutes=10)
+        evento.status = EventoSyncHub.STATUS_PROCESSANDO
+        evento.save(update_fields=["proxima_tentativa_em", "status"])
+
+        class ClientOk:
+            def __init__(self, status):
+                self.status = status
+
+            def sync_push(self, **kwargs):
+                return {"resultados": [{"chave_idempotencia": evento.chave_idempotencia, "status": self.status}]}
+
+        sincronizar_eventos_pendentes(self.hub, client=ClientOk("PROCESSADO"))
+        evento.refresh_from_db()
+        self.assertEqual(evento.status, EventoSyncHub.STATUS_SINCRONIZADO)
+
+        enfileirar_venda_finalizada(venda)
+        evento.refresh_from_db()
+        evento.proxima_tentativa_em = None
+        evento.save(update_fields=["proxima_tentativa_em"])
+        sincronizar_eventos_pendentes(self.hub, client=ClientOk("CONFLITO"))
+        evento.refresh_from_db()
+        self.assertEqual(evento.status, EventoSyncHub.STATUS_CONFLITO)
+
+    def test_sync_nfce_nova_versao_mantem_uuid_e_muda_chave(self):
+        venda = self.venda_finalizada()
+        nfce = self.gerar_nfce(venda)
+        enfileirar_nfce_atualizada(nfce)
+        primeira = EventoSyncHub.objects.get(tipo="NFCE_ATUALIZADA")
+        nfce.status = NFCeHub.STATUS_CONTINGENCIA
+        nfce.sync_versao = 2
+        nfce.save(update_fields=["status", "sync_versao"])
+
+        enfileirar_nfce_atualizada(nfce)
+
+        eventos = EventoSyncHub.objects.filter(tipo="NFCE_ATUALIZADA").order_by("chave_idempotencia")
+        self.assertEqual(eventos.count(), 2)
+        self.assertEqual({e.payload["nfce_uuid"] for e in eventos}, {str(nfce.nfce_uuid)})
+        self.assertNotEqual(eventos[0].chave_idempotencia, eventos[1].chave_idempotencia)
+        self.assertIn(":V:2", eventos[1].chave_idempotencia)
+
+    def test_provider_a1_carrega_pfx_e_erros_controlados(self):
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.serialization import pkcs12
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "A1 Teste")]))
+            .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "A1 Teste")]))
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.utcnow() - timedelta(days=1))
+            .not_valid_after(datetime.utcnow() + timedelta(days=1))
+            .sign(key, hashes.SHA256())
+        )
+        data = pkcs12.serialize_key_and_certificates(
+            b"sysvar",
+            key,
+            cert,
+            None,
+            serialization.BestAvailableEncryption(b"1234"),
+        )
+        path = Path("data") / "test-a1.p12"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        try:
+            material = NFCeMaterialProviderA1(path=str(path), password="1234").obter()
+            self.assertIn(b"PRIVATE KEY", material.private_key_pem)
+            with self.assertRaises(NFCeErroDominio) as erro:
+                NFCeMaterialProviderA1(path=str(path), password="errada").obter()
+            self.assertEqual(erro.exception.codigo, "A1_SENHA_INVALIDA")
+        finally:
+            path.unlink(missing_ok=True)
+        with self.assertRaises(NFCeErroDominio) as ausente:
+            NFCeMaterialProviderA1(path="C:/nao/existe/cert.p12", password="1234").obter()
+        self.assertEqual(ausente.exception.codigo, "A1_ARQUIVO_NAO_ENCONTRADO")
+
+    def test_retransmissao_contingencia_usa_mesmo_documento_e_autoriza(self):
+        venda = self.venda_finalizada()
+        nfce = gerar_nfce_local(
+            venda,
+            material_assinatura=self.material,
+            qr_config=self.qr,
+            codigo_numerico="12345678",
+            tipo_emissao="9",
+            justificativa_contingencia="SEFAZ indisponivel em teste",
+        )
+        numero = nfce.numero
+
+        class ClientAutorizado:
+            def transmitir(self, nfce):
+                return ResultadoSefazNFCe(
+                    status=SefazNFCeClient.AUTORIZADA,
+                    codigo="100",
+                    mensagem="Autorizado",
+                    protocolo="135",
+                    autorizada_em=timezone.now(),
+                    xml_protocolo="<procNFe />",
+                )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            retransmitir_nfces_pendentes(self.hub, sefaz_client=ClientAutorizado())
+
+        nfce.refresh_from_db()
+        self.assertEqual(nfce.status, NFCeHub.STATUS_AUTORIZADA)
+        self.assertEqual(nfce.numero, numero)
+        self.assertEqual(nfce.protocolo, "135")
+        self.assertTrue(EventoSyncHub.objects.filter(tipo="NFCE_ATUALIZADA").exists())
 
     def _digest_inf_nfe(self, xml, chave):
         root = etree.fromstring(xml.encode("utf-8"), parser=etree.XMLParser(remove_blank_text=True))

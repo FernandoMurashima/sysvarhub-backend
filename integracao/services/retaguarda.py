@@ -163,6 +163,15 @@ class RetaguardaClient:
             headers={"Authorization": f"Hub {token}"},
         )
 
+    def sync_push(self, *, token, eventos):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._post_json(
+            "api/hub/sync/push/",
+            {"versao": 1, "eventos": eventos},
+            headers={"Authorization": f"Hub {token}"},
+        )
+
     def _post_json(self, path, payload, headers=None):
         return self._request_json(path, method="POST", payload=payload, headers=headers)
 
