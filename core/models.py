@@ -283,6 +283,9 @@ class CatalogoItemHub(models.Model):
     retaguarda_sku_id = models.PositiveBigIntegerField()
 
     tipo_produto = models.CharField(max_length=30)
+    colecao_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    grupo_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    subgrupo_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
     referencia = models.CharField(max_length=80, blank=True, default="")
     descricao = models.CharField(max_length=200)
     descricao_reduzida = models.CharField(max_length=120, blank=True, default="")
@@ -1487,17 +1490,27 @@ class ValeTrocaMovimentoHub(models.Model):
 
 
 class PromocaoHub(models.Model):
-    TIPO_PERCENTUAL = "PERCENTUAL"
-    TIPO_VALOR_FIXO = "VALOR_FIXO"
+    TIPO_PERCENTUAL = "DESCONTO_PERCENTUAL"
+    TIPO_VALOR_FIXO = "DESCONTO_VALOR"
     TIPO_PRECO_FIXO = "PRECO_FIXO"
+    ESCOPO_TODOS = "TODOS"
+    ESCOPO_PRODUTO = "PRODUTO"
+    ESCOPO_COLECAO = "COLECAO"
+    ESCOPO_GRUPO = "GRUPO"
+    ESCOPO_SUBGRUPO = "SUBGRUPO"
 
     hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="promocoes")
     retaguarda_id = models.PositiveBigIntegerField()
     nome = models.CharField(max_length=120)
     tipo = models.CharField(max_length=30)
     valor = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    escopo = models.CharField(max_length=15, default=ESCOPO_TODOS)
     produto_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
     sku_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True, db_index=True)
+    produto_ids = models.JSONField(default=list, blank=True)
+    colecao_ids = models.JSONField(default=list, blank=True)
+    grupo_ids = models.JSONField(default=list, blank=True)
+    subgrupo_ids = models.JSONField(default=list, blank=True)
     ativo = models.BooleanField(default=True)
     acumula_cashback = models.BooleanField(default=True)
     prioridade = models.PositiveIntegerField(default=0)

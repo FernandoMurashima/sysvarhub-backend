@@ -256,6 +256,97 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
         self.assertTrue(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_DEBITO).exists())
         self.assertTrue(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_CREDITO).exists())
 
+    def test_cashback_respeita_limite_percentual_e_nao_gera_troco(self):
+        cliente = self.criar_cliente()
+        CashbackConfigHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=2,
+            ativo=True,
+            percentual=Decimal("0.0000"),
+            limite_uso_percentual=Decimal("50.0000"),
+            sincronizado_em=timezone.now(),
+        )
+        CashbackMovimentoHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            tipo=CashbackMovimentoHub.TIPO_CREDITO,
+            valor=Decimal("500.00"),
+        )
+        cashback = self.criar_forma("CB2", "CASHBACK")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+
+        limite = self.pagar(venda_uuid, cashback, "120.00")
+        self.assertEqual(limite.status_code, 409)
+        permitido = self.pagar(venda_uuid, cashback, "99.95")
+        self.assertEqual(permitido.status_code, 201)
+        troco = self.pagar(venda_uuid, cashback, "100.00")
+        self.assertEqual(troco.status_code, 409)
+
+    def test_cashback_credito_usa_base_parcial_de_itens_que_acumulam(self):
+        cliente = self.criar_cliente()
+        CashbackConfigHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=3,
+            ativo=True,
+            percentual=Decimal("10.0000"),
+            sincronizado_em=timezone.now(),
+        )
+        PromocaoHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=88,
+            nome="Sem cashback",
+            tipo=PromocaoHub.TIPO_VALOR_FIXO,
+            valor=Decimal("0.0000"),
+            escopo=PromocaoHub.ESCOPO_PRODUTO,
+            produto_ids=[self.catalogo_item.retaguarda_produto_id],
+            acumula_cashback=False,
+            sincronizado_em=timezone.now(),
+        )
+        outro = self.criar_catalogo_item(10826, retaguarda_produto_id=2051, ean13="7892701000014")
+        venda_uuid = self.criar_venda_com_item()
+        self.post_item({"sku_id": outro.retaguarda_sku_id})
+        self.put_cliente(cliente)
+        self.assertEqual(self.pagar(venda_uuid, self.dinheiro, "399.80").status_code, 201)
+        self.assertEqual(self.finalizar(venda_uuid).status_code, 200)
+
+        credito = CashbackMovimentoHub.objects.get(tipo=CashbackMovimentoHub.TIPO_CREDITO)
+        self.assertEqual(credito.valor, Decimal("19.99"))
+
+    def test_promocao_aplica_escopos_todos_produto_colecao_grupo_subgrupo(self):
+        casos = [
+            (PromocaoHub.ESCOPO_TODOS, {}),
+            (PromocaoHub.ESCOPO_PRODUTO, {"produto_ids": [self.catalogo_item.retaguarda_produto_id]}),
+            (PromocaoHub.ESCOPO_COLECAO, {"colecao_ids": [10], "catalogo": {"colecao_retaguarda_id": 10}}),
+            (PromocaoHub.ESCOPO_GRUPO, {"grupo_ids": [20], "catalogo": {"grupo_retaguarda_id": 20}}),
+            (PromocaoHub.ESCOPO_SUBGRUPO, {"subgrupo_ids": [30], "catalogo": {"subgrupo_retaguarda_id": 30}}),
+        ]
+        for indice, (escopo, extra) in enumerate(casos, start=1):
+            VendaEventoHub.objects.all().delete()
+            VendaItemHub.objects.all().delete()
+            VendaHub.objects.all().delete()
+            PromocaoHub.objects.all().delete()
+            for campo, valor in extra.get("catalogo", {}).items():
+                setattr(self.catalogo_item, campo, valor)
+            self.catalogo_item.save()
+            PromocaoHub.objects.create(
+                hub=self.hub,
+                retaguarda_id=200 + indice,
+                nome=f"Promo {escopo}",
+                tipo=PromocaoHub.TIPO_PERCENTUAL,
+                valor=Decimal("10.0000"),
+                escopo=escopo,
+                produto_ids=extra.get("produto_ids", []),
+                colecao_ids=extra.get("colecao_ids", []),
+                grupo_ids=extra.get("grupo_ids", []),
+                subgrupo_ids=extra.get("subgrupo_ids", []),
+                sincronizado_em=timezone.now(),
+            )
+            resposta = self.post_item()
+            self.assertEqual(resposta.status_code, 200)
+            self.assertEqual(VendaItemHub.objects.get().desconto, Decimal("19.99"))
+
     def test_devolucao_gera_vale_local_e_evento_sync(self):
         cliente = self.criar_cliente()
         venda_uuid = self.criar_venda_com_item()

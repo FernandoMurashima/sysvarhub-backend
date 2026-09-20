@@ -4,7 +4,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 
-from core.models import ClienteHub
+from core.models import ClienteHub, ValeTrocaHub
 
 
 CLIENTES_VERSOES_SUPORTADAS = {1}
@@ -27,6 +27,7 @@ def sincronizar_clientes(hub, resposta):
         reconciliados = 0
 
         for cliente_payload in dados["clientes"]:
+            vales_troca = cliente_payload.pop("vales_troca", [])
             retaguarda_id = cliente_payload["retaguarda_id"]
             ids_recebidos.add(retaguarda_id)
             cliente = (
@@ -55,6 +56,7 @@ def sincronizar_clientes(hub, resposta):
             cliente.presente_retaguarda = True
             cliente.sincronizado_em = sincronizado_em
             cliente.save()
+            _sincronizar_vales_cliente(hub, cliente, vales_troca, sincronizado_em)
 
             if cliente.ativo:
                 clientes_ativos += 1
@@ -247,7 +249,54 @@ def _validar_cliente(item):
         "consentimento_em": _datetime_opcional(item["consentimento_em"], "consentimento_em"),
         "origem_consentimento": _texto_opcional(item["origem_consentimento"], "origem_consentimento", max_length=80) or "",
         "ativo": item["ativo"],
+        "vales_troca": _validar_vales(item.get("vales_troca") or []),
     }
+
+
+def _validar_vales(vales):
+    if not isinstance(vales, list):
+        raise ClientesValidationError("Clientes retornou vales_troca inválido.")
+    validados = []
+    for vale in vales:
+        if not isinstance(vale, dict):
+            raise ClientesValidationError("Clientes retornou vale_troca inválido.")
+        validados.append(
+            {
+                "retaguarda_id": _inteiro_positivo(vale["id"], "vale.id"),
+                "documento": _texto_obrigatorio(vale["documento"], "vale.documento", max_length=80),
+                "valor_original": vale.get("valor_original") or vale.get("saldo") or 0,
+                "saldo": vale.get("saldo") or 0,
+                "validade": _data(vale.get("validade"), "vale.validade") if vale.get("validade") else None,
+                "status": vale.get("status") or ValeTrocaHub.STATUS_ABERTO,
+            }
+        )
+    return validados
+
+
+def _sincronizar_vales_cliente(hub, cliente, vales, sincronizado_em):
+    recebidos = set()
+    for vale in vales:
+        recebidos.add(vale["retaguarda_id"])
+        ValeTrocaHub.objects.update_or_create(
+            hub=hub,
+            retaguarda_id=vale["retaguarda_id"],
+            defaults={
+                "cliente_uuid": cliente.cliente_uuid,
+                "cliente_retaguarda_id": cliente.retaguarda_id,
+                "documento": vale["documento"],
+                "valor_original": vale["valor_original"],
+                "saldo": vale["saldo"],
+                "status": vale["status"],
+                "validade": vale["validade"],
+                "sincronizado_em": sincronizado_em,
+            },
+        )
+    ValeTrocaHub.objects.filter(
+        hub=hub,
+        cliente_retaguarda_id=cliente.retaguarda_id,
+        retaguarda_id__isnull=False,
+        status=ValeTrocaHub.STATUS_ABERTO,
+    ).exclude(retaguarda_id__in=recebidos).update(status=ValeTrocaHub.STATUS_CANCELADO, sincronizado_em=sincronizado_em)
 
 
 def _documento(valor):

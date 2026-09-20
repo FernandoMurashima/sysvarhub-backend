@@ -80,8 +80,16 @@ def validar_cashback(venda, valor):
         raise ValueError("Cashback exige cliente identificado.")
     if money(valor) > saldo_cashback(venda):
         raise ValueError("O cashback informado é maior que o saldo disponível do cliente.")
+    if money(valor) > money(venda.total):
+        raise ValueError("O cashback não pode ser maior que o total da venda.")
+    outros = _total_pago_outros(venda, "CASHBACK")
+    if money(valor) > money(max(ZERO, venda.total - outros)):
+        raise ValueError("Cashback não pode gerar troco; use apenas o saldo pendente da venda.")
     if config.valor_minimo_uso and money(valor) < money(config.valor_minimo_uso):
         raise ValueError("O valor de cashback usado é menor que o mínimo configurado.")
+    limite = money(venda.total * Decimal(config.limite_uso_percentual or 0) / Decimal("100"))
+    if money(valor) > limite:
+        raise ValueError("O cashback usado ultrapassa o limite permitido para a venda.")
 
 
 def validar_vale_troca(venda, valor, autorizacao=""):
@@ -89,6 +97,9 @@ def validar_vale_troca(venda, valor, autorizacao=""):
         raise ValueError("Troca exige cliente identificado.")
     if money(valor) > saldo_vale_troca(venda):
         raise ValueError("O valor de troca informado é maior que o saldo disponível do cliente.")
+    outros = _total_pago_outros(venda, "TROCA", "VALE_TROCA")
+    if money(valor) > money(max(ZERO, venda.total - outros)):
+        raise ValueError("Troca não pode gerar troco; use apenas o saldo pendente da venda.")
     if autorizacao:
         vale = vales_abertos(venda).filter(documento=autorizacao.strip()).first()
         if not vale:
@@ -99,17 +110,16 @@ def validar_vale_troca(venda, valor, autorizacao=""):
 
 def aplicar_promocao(catalogo_item, quantidade):
     agora = timezone.now()
-    promocao = (
+    candidatas = (
         PromocaoHub.objects.filter(
             hub=catalogo_item.hub,
             ativo=True,
         )
-        .filter(models.Q(sku_retaguarda_id=catalogo_item.retaguarda_sku_id) | models.Q(produto_retaguarda_id=catalogo_item.retaguarda_produto_id))
         .filter(models.Q(inicio__isnull=True) | models.Q(inicio__lte=agora))
         .filter(models.Q(fim__isnull=True) | models.Q(fim__gte=agora))
         .order_by("prioridade", "retaguarda_id")
-        .first()
     )
+    promocao = next((p for p in candidatas if _promocao_aplica(p, catalogo_item)), None)
     preco = Decimal(catalogo_item.preco_venda)
     desconto = ZERO
     if not promocao:
@@ -152,10 +162,12 @@ def _gerar_cashback(venda, pagamentos):
     config = cashback_config_ativa(venda.hub)
     if not config or (cliente_padrao(venda) and not config.consumidor_final_participa):
         return
-    if not all(item.promocao_acumula_cashback for item in venda.itens.all()):
-        return
     usado = sum((p.valor for p in pagamentos if (p.tipo or "").upper() == "CASHBACK"), ZERO)
-    base = money(venda.total - usado)
+    base_itens = sum(
+        (item.total_item for item in venda.itens.all() if item.promocao_acumula_cashback),
+        ZERO,
+    )
+    base = money(max(ZERO, base_itens - usado))
     if base < money(config.valor_minimo_geracao):
         return
     credito = money(base * Decimal(config.percentual or 0) / Decimal("100"))
@@ -203,3 +215,60 @@ def _filtrar_cliente(qs, venda):
     if venda.cliente_retaguarda_id:
         return qs.filter(cliente_retaguarda_id=venda.cliente_retaguarda_id)
     return qs.filter(cliente_uuid=venda.cliente_uuid)
+
+
+def _total_pago_outros(venda, *tipos_excluidos):
+    tipos = {tipo.upper() for tipo in tipos_excluidos}
+    return money(
+        venda.pagamentos.filter(status="ATIVO")
+        .exclude(tipo__in=tipos)
+        .aggregate(total=models.Sum("valor"))
+        .get("total")
+        or ZERO
+    )
+
+
+def _promocao_aplica(promocao, item):
+    if promocao.escopo == PromocaoHub.ESCOPO_TODOS:
+        return True
+    if promocao.escopo == PromocaoHub.ESCOPO_PRODUTO:
+        return item.retaguarda_produto_id in set(promocao.produto_ids or []) or promocao.produto_retaguarda_id == item.retaguarda_produto_id
+    if promocao.escopo == PromocaoHub.ESCOPO_COLECAO:
+        return bool(item.colecao_retaguarda_id and item.colecao_retaguarda_id in set(promocao.colecao_ids or []))
+    if promocao.escopo == PromocaoHub.ESCOPO_GRUPO:
+        return bool(item.grupo_retaguarda_id and item.grupo_retaguarda_id in set(promocao.grupo_ids or []))
+    if promocao.escopo == PromocaoHub.ESCOPO_SUBGRUPO:
+        return bool(item.subgrupo_retaguarda_id and item.subgrupo_retaguarda_id in set(promocao.subgrupo_ids or []))
+    return False
+
+
+def consultar_beneficios_cliente(hub, cliente_uuid):
+    from core.models import ClienteHub
+
+    cliente = ClienteHub.objects.filter(hub=hub, cliente_uuid=cliente_uuid, ativo=True, bloqueio=False).first()
+    if not cliente:
+        return {"cashback": {"saldo": "0.00", "limite_uso_percentual": "0.0000"}, "vales_troca": []}
+    base = type("VendaCliente", (), {
+        "hub": hub,
+        "cliente_uuid": cliente.cliente_uuid,
+        "cliente_retaguarda_id": cliente.retaguarda_id,
+        "cliente_padrao": cliente.cliente_padrao,
+        "cliente_documento": cliente.documento,
+    })()
+    config = cashback_config_ativa(hub)
+    vales = vales_abertos(base)
+    return {
+        "cashback": {
+            "saldo": f"{saldo_cashback(base):.2f}",
+            "limite_uso_percentual": f"{config.limite_uso_percentual:.4f}" if config else "0.0000",
+            "valor_minimo_uso": f"{config.valor_minimo_uso:.2f}" if config else "0.00",
+        },
+        "vales_troca": [
+            {
+                "documento": vale.documento,
+                "saldo": f"{vale.saldo:.2f}",
+                "validade": vale.validade.isoformat() if vale.validade else None,
+            }
+            for vale in vales
+        ],
+    }

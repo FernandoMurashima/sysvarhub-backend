@@ -23,6 +23,7 @@ from core.services.caixa import (
     fechar_caixa,
     serializar_sessao_caixa,
 )
+from core.services.beneficios import consultar_beneficios_cliente
 from core.services.fechamento_dia import (
     FechamentoDiaConflictError,
     FechamentoDiaConsistencyError,
@@ -620,6 +621,14 @@ class TerminalClientesView(APIView):
                 "clientes": [_serializar_cliente(cliente) for cliente in clientes],
             }
         )
+
+
+class TerminalClienteBeneficiosView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request, cliente_uuid):
+        return Response(consultar_beneficios_cliente(request.sysvar_terminal.hub, cliente_uuid))
 
     def post(self, request):
         try:

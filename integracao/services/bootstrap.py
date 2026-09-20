@@ -1,7 +1,7 @@
 from django.db import transaction
 from django.utils import timezone
 
-from core.models import CaixaHub, ConfiguracaoFiscalHub
+from core.models import CaixaHub, CashbackConfigHub, ConfiguracaoFiscalHub
 
 
 BOOTSTRAP_VERSOES_SUPORTADAS = {1}
@@ -46,6 +46,7 @@ def sincronizar_bootstrap(hub, resposta):
         empresa = resposta["empresa"]
         loja = resposta["loja"]
         fiscal_atualizada = _sincronizar_fiscal(hub, loja.get("fiscal"), sincronizado_em)
+        _sincronizar_cashback(hub, resposta.get("cashback_config"), sincronizado_em)
         hub.empresa_nome = empresa.get("nome") or ""
         hub.loja_nome = loja.get("nome_loja") or ""
         hub.loja_apelido = loja.get("apelido_loja") or ""
@@ -114,6 +115,9 @@ def _validar_bootstrap(hub, resposta):
     fiscal = loja_payload.get("fiscal")
     if fiscal is not None:
         _validar_fiscal(fiscal)
+    cashback = resposta.get("cashback_config")
+    if cashback is not None and not isinstance(cashback, dict):
+        raise BootstrapValidationError("Bootstrap retornou cashback_config inválido.")
 
 
 def _sincronizar_fiscal(hub, fiscal, sincronizado_em):
@@ -174,6 +178,29 @@ def _validar_fiscal(fiscal):
     for campo in ("ambiente_fiscal", "regime_tributario", "razao_social", "cnpj"):
         if not isinstance(fiscal[campo], str) or not fiscal[campo].strip():
             raise BootstrapValidationError("Bootstrap retornou fiscal incompleto.")
+
+
+def _sincronizar_cashback(hub, config, sincronizado_em):
+    if not config:
+        CashbackConfigHub.objects.filter(hub=hub, ativo=True).update(ativo=False, sincronizado_em=sincronizado_em)
+        return False
+    defaults = {
+        "nome": config.get("nome") or "Regra padrão",
+        "ativo": bool(config.get("ativo")),
+        "percentual": config.get("percentual") or 0,
+        "validade_dias": int(config.get("validade_dias") or 0),
+        "valor_minimo_geracao": config.get("valor_minimo_geracao") or 0,
+        "valor_minimo_uso": config.get("valor_minimo_uso") or 0,
+        "limite_uso_percentual": config.get("limite_uso_percentual") or 0,
+        "consumidor_final_participa": bool(config.get("consumidor_final_participa")),
+        "sincronizado_em": sincronizado_em,
+    }
+    CashbackConfigHub.objects.update_or_create(
+        hub=hub,
+        retaguarda_id=config["retaguarda_id"],
+        defaults=defaults,
+    )
+    return True
 
 
 def _exigir_campos(payload, campos):

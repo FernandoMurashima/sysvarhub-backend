@@ -108,6 +108,10 @@ def finalizar_devolucao(terminal, operador, *, venda_uuid, itens, motivo=""):
 
 
 def serializar_venda_devolucao(venda):
+    devolvidos = {
+        item["venda_item_id"]: item["qtd"]
+        for item in VendaDevolucaoItemHub.objects.filter(devolucao__venda_origem=venda).values("venda_item_id").annotate(qtd=models.Sum("quantidade"))
+    }
     return {
         "uuid": str(venda.venda_uuid),
         "cliente": {"id": venda.cliente_retaguarda_id, "uuid": str(venda.cliente_uuid) if venda.cliente_uuid else None, "nome": venda.cliente_nome},
@@ -118,6 +122,8 @@ def serializar_venda_devolucao(venda):
                 "sku_id": item.retaguarda_sku_id,
                 "descricao": item.descricao,
                 "quantidade": item.quantidade,
+                "quantidade_devolvida": int(devolvidos.get(item.id) or 0),
+                "quantidade_disponivel": max(0, int(item.quantidade) - int(devolvidos.get(item.id) or 0)),
                 "preco_unitario": f"{item.preco_unitario:.4f}",
                 "total_item": f"{item.total_item:.2f}",
             }

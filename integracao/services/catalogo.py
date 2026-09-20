@@ -6,9 +6,9 @@ from pathlib import Path
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
-from django.utils.dateparse import parse_datetime
+from django.utils.dateparse import parse_date, parse_datetime
 
-from core.models import CatalogoItemHub
+from core.models import CatalogoItemHub, PromocaoHub
 from integracao.services.retaguarda import RetaguardaError
 
 
@@ -59,6 +59,7 @@ def sincronizar_catalogo(hub, resposta, client=None):
             .exclude(retaguarda_sku_id__in=sku_ids_recebidos)
             .update(ativo=False, vendavel=False, sincronizado_em=sincronizado_em)
         )
+        _sincronizar_promocoes(hub, dados["promocoes"], sincronizado_em)
 
     if client and hub.retaguarda_token:
         _sincronizar_imagens(hub, dados["itens"], client, imagens_cache)
@@ -155,6 +156,7 @@ def _validar_catalogo(hub, resposta):
         "loja_nome": loja_payload.get("nome") or loja_payload.get("apelido") or hub.loja_nome or hub.loja_id,
         "tabela_preco": tabela_preco,
         "itens": itens_validados,
+        "promocoes": _validar_promocoes(resposta.get("promocoes") or []),
     }
 
 
@@ -231,6 +233,9 @@ def _validar_item(item, indice):
         "retaguarda_produto_id": _inteiro_obrigatorio(item["produto_id"], "produto_id"),
         "retaguarda_sku_id": _inteiro_obrigatorio(item["sku_id"], "sku_id"),
         "tipo_produto": str(item["tipo_produto"]),
+        "colecao_retaguarda_id": _inteiro_opcional(item.get("colecao_id"), "colecao_id"),
+        "grupo_retaguarda_id": _inteiro_opcional(item.get("grupo_id"), "grupo_id"),
+        "subgrupo_retaguarda_id": _inteiro_opcional(item.get("subgrupo_id"), "subgrupo_id"),
         "referencia": str(item.get("referencia") or ""),
         "descricao": str(item["descricao"]),
         "descricao_reduzida": str(item.get("descricao_reduzida") or ""),
@@ -254,6 +259,50 @@ def _validar_item(item, indice):
         "fiscal": item["fiscal"],
         "imagem": _validar_imagem(item.get("imagem")),
     }
+
+
+def _validar_promocoes(promocoes):
+    if not isinstance(promocoes, list):
+        raise CatalogoValidationError("Catálogo retornou promoções inválidas.")
+    validadas = []
+    for promocao in promocoes:
+        if not isinstance(promocao, dict):
+            raise CatalogoValidationError("Catálogo retornou promoção inválida.")
+        _exigir_campos(promocao, ("id", "nome", "tipo", "valor", "escopo", "prioridade", "acumula_cashback"))
+        validadas.append(
+            {
+                "retaguarda_id": _inteiro_obrigatorio(promocao["id"], "promocao.id"),
+                "nome": str(promocao["nome"])[:120],
+                "tipo": str(promocao["tipo"]),
+                "valor": _decimal_obrigatorio(promocao["valor"], "promocao.valor"),
+                "escopo": str(promocao["escopo"]),
+                "prioridade": _inteiro_obrigatorio(promocao["prioridade"], "promocao.prioridade"),
+                "acumula_cashback": bool(promocao["acumula_cashback"]),
+                "ativo": bool(promocao.get("ativo", True)),
+                "inicio": _date_to_datetime(promocao.get("data_inicio")),
+                "fim": _date_to_datetime(promocao.get("data_fim"), fim=True),
+                "produto_ids": _lista_ids(promocao.get("produto_ids")),
+                "colecao_ids": _lista_ids(promocao.get("colecao_ids")),
+                "grupo_ids": _lista_ids(promocao.get("grupo_ids")),
+                "subgrupo_ids": _lista_ids(promocao.get("subgrupo_ids")),
+            }
+        )
+    return validadas
+
+
+def _sincronizar_promocoes(hub, promocoes, sincronizado_em):
+    recebidas = set()
+    for promocao in promocoes:
+        recebidas.add(promocao["retaguarda_id"])
+        PromocaoHub.objects.update_or_create(
+            hub=hub,
+            retaguarda_id=promocao["retaguarda_id"],
+            defaults={**promocao, "sincronizado_em": sincronizado_em},
+        )
+    PromocaoHub.objects.filter(hub=hub, ativo=True).exclude(retaguarda_id__in=recebidas).update(
+        ativo=False,
+        sincronizado_em=sincronizado_em,
+    )
 
 
 def _validar_imagem(imagem):
@@ -479,6 +528,31 @@ def _inteiro_obrigatorio(valor, campo):
     if not isinstance(valor, int):
         raise CatalogoValidationError(f"Catálogo retornou {campo} inválido.")
     return valor
+
+
+def _inteiro_opcional(valor, campo):
+    if valor in (None, ""):
+        return None
+    return _inteiro_obrigatorio(valor, campo)
+
+
+def _lista_ids(valor):
+    if not valor:
+        return []
+    if not isinstance(valor, list) or not all(isinstance(item, int) for item in valor):
+        raise CatalogoValidationError("Catálogo retornou lista de IDs inválida.")
+    return valor
+
+
+def _date_to_datetime(valor, fim=False):
+    if not valor:
+        return None
+    data = parse_date(str(valor))
+    if not data:
+        raise CatalogoValidationError("Catálogo retornou vigência de promoção inválida.")
+    hora = "23:59:59" if fim else "00:00:00"
+    parsed = parse_datetime(f"{data.isoformat()}T{hora}")
+    return timezone.make_aware(parsed, timezone.get_current_timezone())
 
 
 def _exigir_campos(payload, campos):
