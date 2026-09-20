@@ -1,8 +1,9 @@
 import uuid
 from decimal import Decimal
+from unittest.mock import patch
 
-from django.db import connection
-from django.test import TestCase, override_settings
+from django.db import connection, transaction
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
@@ -379,7 +380,7 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(cancelar.status_code, 409)
 
 
-class VendaFinalizacaoTests(PagamentoHubTestMixin, TestCase):
+class VendaFinalizacaoTests(PagamentoHubTestMixin, TransactionTestCase):
     def habilitar_nfce(self):
         self.catalogo_item.fiscal = FISCAL_ITEM_NFCE.copy()
         self.catalogo_item.save(update_fields=["fiscal"])
@@ -466,11 +467,21 @@ class VendaFinalizacaoTests(PagamentoHubTestMixin, TestCase):
         self.habilitar_nfce()
         venda_uuid = self.criar_venda_com_item()
         self.pagar(venda_uuid, self.dinheiro)
+        chamadas = []
 
-        resposta = self.finalizar(venda_uuid)
+        def transmitir_fora_de_atomic(client, nfce):
+            chamadas.append(transaction.get_connection().in_atomic_block)
+            return original_transmitir(client, nfce)
+
+        from core.services.nfce import SefazNFCeClientDesenvolvimento
+
+        original_transmitir = SefazNFCeClientDesenvolvimento.transmitir
+        with patch.object(SefazNFCeClientDesenvolvimento, "transmitir", transmitir_fora_de_atomic):
+            resposta = self.finalizar(venda_uuid)
         nfce = NFCeHub.objects.get()
 
         self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(chamadas, [False])
         self.assertEqual(nfce.status, NFCeHub.STATUS_GERADA)
         self.assertEqual(nfce.tipo_emissao, "1")
         self.assertEqual(nfce.protocolo, "")
@@ -558,6 +569,65 @@ class VendaFinalizacaoTests(PagamentoHubTestMixin, TestCase):
         self.assertIn(f"?p={nfce.chave_acesso}|3|2|", nfce.qr_code_payload)
         self.assertNotIn("cHashQRCode", nfce.qr_code_payload)
         self.assertEqual(resposta.data["venda"]["fiscal"]["contingencia"], True)
+
+    @override_settings(
+        SYSVARHUB_NFCE_MATERIAL_MODE="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_CLIENT="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_DESENVOLVIMENTO_RESULTADO="REJEITADA",
+        SYSVARHUB_NFCE_QRCODE_URL="https://sefaz.test/qrcode",
+        SYSVARHUB_NFCE_URL_CHAVE="https://sefaz.test/consulta",
+    )
+    def test_rejeicao_pos_commit_mantem_venda_finalizada_e_nao_duplica_retry(self):
+        config = self.habilitar_nfce()
+        venda_uuid = self.criar_venda_com_item()
+        self.pagar(venda_uuid, self.dinheiro)
+
+        resposta = self.finalizar(venda_uuid)
+        retry = self.finalizar(venda_uuid)
+        venda = VendaHub.objects.get()
+        nfce = NFCeHub.objects.get()
+        config.refresh_from_db()
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(venda.status, VendaHub.STATUS_FINALIZADA)
+        self.assertEqual(nfce.status, NFCeHub.STATUS_REJEITADA)
+        self.assertIn("SIMULACAO_SEFAZ_REJEITADA", nfce.mensagem_retorno)
+        self.assertEqual(resposta.data["venda"]["fiscal"]["status"], NFCeHub.STATUS_REJEITADA)
+        self.assertEqual(NFCeHub.objects.count(), 1)
+        self.assertEqual(config.proximo_numero_nfce, 11)
+        self.assertEqual(EstoqueMovimentoHub.objects.count(), 1)
+        self.assertEqual(VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_VENDA_FINALIZADA).count(), 1)
+
+    @override_settings(
+        SYSVARHUB_NFCE_MATERIAL_MODE="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_CLIENT="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_DESENVOLVIMENTO_RESULTADO="AUTORIZADA",
+        SYSVARHUB_NFCE_QRCODE_URL="https://sefaz.test/qrcode",
+        SYSVARHUB_NFCE_URL_CHAVE="https://sefaz.test/consulta",
+    )
+    def test_erro_pos_reserva_mantem_nfce_rastreavel_e_retry_nao_duplica(self):
+        config = self.habilitar_nfce()
+        venda_uuid = self.criar_venda_com_item()
+        self.pagar(venda_uuid, self.dinheiro)
+
+        with patch("core.services.nfce.assinar_xml_nfce", side_effect=RuntimeError("falha controlada")):
+            resposta = self.finalizar(venda_uuid)
+        retry = self.finalizar(venda_uuid)
+        venda = VendaHub.objects.get()
+        nfce = NFCeHub.objects.get()
+        config.refresh_from_db()
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(venda.status, VendaHub.STATUS_FINALIZADA)
+        self.assertEqual(nfce.status, NFCeHub.STATUS_ERRO_GERACAO)
+        self.assertEqual(nfce.mensagem_retorno, "DADOS_FISCAIS_INSUFICIENTES")
+        self.assertEqual(resposta.data["venda"]["fiscal"]["status"], NFCeHub.STATUS_ERRO_GERACAO)
+        self.assertEqual(NFCeHub.objects.count(), 1)
+        self.assertEqual(config.proximo_numero_nfce, 11)
+        self.assertEqual(EstoqueMovimentoHub.objects.count(), 1)
+        self.assertEqual(VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_VENDA_FINALIZADA).count(), 1)
 
     def test_um_movimento_por_item_e_catalogo_bruto_nao_alterado(self):
         venda_uuid = self.criar_venda_com_item()

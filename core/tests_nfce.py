@@ -21,6 +21,7 @@ from core.services.nfce import (
     gerar_chave_acesso,
     gerar_nfce_local,
     listar_nfces_pendentes_transmissao,
+    preparar_nfce_para_venda_finalizada,
     verificar_assinatura_nfce,
 )
 from core.tests_pagamentos import PagamentoHubTestMixin
@@ -354,6 +355,14 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(partes[5], "")
         self.assertEqual(partes[6], "")
         self._verificar_assinatura_qr_offline(partes, self.material)
+
+    def test_nfce_pendente_transmissao_eh_listavel_para_retomada(self):
+        venda = self.venda_finalizada()
+
+        nfce = preparar_nfce_para_venda_finalizada(venda, codigo_numerico="12345678")
+
+        self.assertEqual(nfce.status, NFCeHub.STATUS_PENDENTE_TRANSMISSAO)
+        self.assertIn(nfce, list(listar_nfces_pendentes_transmissao(self.hub)))
 
     def _digest_inf_nfe(self, xml, chave):
         root = etree.fromstring(xml.encode("utf-8"), parser=etree.XMLParser(remove_blank_text=True))

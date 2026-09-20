@@ -27,8 +27,9 @@ from core.services.caixa import obter_caixa_terminal, obter_sessao_caixa_aberta
 from core.services.operadores import serializar_operador
 from core.services.nfce import (
     NFCeErroDominio,
-    emitir_nfce_para_venda_finalizada,
     nfce_habilitada_para_hub,
+    preparar_nfce_para_venda_finalizada,
+    processar_nfce_preparada,
     validar_nfce_para_finalizacao,
 )
 
@@ -598,6 +599,7 @@ def remover_pagamento(terminal, operador, sessao_operador, *, pagamento_uuid):
 
 def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
     venda_uuid = validar_uuid_obrigatorio(venda_uuid, "Venda inválida.")
+    nfce_para_processar = None
     with transaction.atomic():
         terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
         venda = obter_venda_terminal_por_uuid_bloqueada(terminal_bloqueado, venda_uuid)
@@ -707,11 +709,11 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
                 },
             )
         if emitir_nfce:
-            try:
-                emitir_nfce_para_venda_finalizada(venda)
-            except NFCeErroDominio as exc:
-                raise VendaConflictError(exc.codigo) from exc
+            nfce_para_processar = preparar_nfce_para_venda_finalizada(venda)
 
+    if nfce_para_processar is not None:
+        processar_nfce_preparada(nfce_para_processar)
+        venda = VendaHub.objects.get(pk=venda.pk)
     return venda
 
 
