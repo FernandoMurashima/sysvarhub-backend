@@ -14,6 +14,8 @@ from core.models import (
     CaixaHub,
     CatalogoItemHub,
     ClienteHub,
+    ConfiguracaoFiscalHub,
+    FormaPagamentoFiscalMapHub,
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
     HubConfig,
@@ -720,6 +722,31 @@ class BootstrapHubServiceTests(TestCase):
         payload.update(overrides)
         return payload
 
+    def fiscal(self, **overrides):
+        payload = {
+            "emite_nfce": True,
+            "ambiente_fiscal": "HOMOLOGACAO",
+            "regime_tributario": "SIMPLES",
+            "inscricao_estadual": "110042490114",
+            "serie_nfce": 7,
+            "proximo_numero_nfce": 10,
+            "razao_social": "Empresa Teste Ltda",
+            "nome_fantasia": "Empresa Teste",
+            "cnpj": "12345678000199",
+            "logradouro": "Rua",
+            "endereco": "Rua Teste",
+            "numero": "123",
+            "complemento": "",
+            "bairro": "Centro",
+            "cidade": "Sao Paulo",
+            "estado": "SP",
+            "uf": "SP",
+            "cep": "01001000",
+            "codigo_municipio_ibge": "3550308",
+        }
+        payload.update(overrides)
+        return payload
+
     def test_bootstrap_versao_1_e_aceito_e_atualiza_config(self):
         sincronizar_bootstrap(self.hub, self.resposta())
 
@@ -731,6 +758,53 @@ class BootstrapHubServiceTests(TestCase):
         self.assertEqual(self.hub.loja_cnpj, "12345678000199")
         self.assertEqual(self.hub.loja_estado, "SP")
         self.assertIsNotNone(self.hub.ultima_sincronizacao_em)
+
+    def test_fiscal_presente_persiste_snapshot(self):
+        resposta = self.resposta()
+        resposta["loja"]["fiscal"] = self.fiscal()
+
+        resultado = sincronizar_bootstrap(self.hub, resposta)
+
+        fiscal = ConfiguracaoFiscalHub.objects.get(hub=self.hub)
+        self.assertTrue(resultado["configuracao_fiscal_atualizada"])
+        self.assertTrue(fiscal.emite_nfce)
+        self.assertEqual(fiscal.serie_nfce, 7)
+        self.assertEqual(fiscal.proximo_numero_nfce, 10)
+        self.assertEqual(fiscal.codigo_municipio_ibge, "3550308")
+
+    def test_bootstrap_sem_fiscal_mantem_config_anterior(self):
+        ConfiguracaoFiscalHub.objects.create(
+            hub=self.hub,
+            emite_nfce=True,
+            ambiente_fiscal="HOMOLOGACAO",
+            regime_tributario="SIMPLES",
+            serie_nfce=1,
+            proximo_numero_nfce=50,
+            razao_social="Anterior",
+            cnpj="12345678000199",
+            sincronizado_em=timezone.now(),
+        )
+
+        resultado = sincronizar_bootstrap(self.hub, self.resposta())
+
+        fiscal = ConfiguracaoFiscalHub.objects.get(hub=self.hub)
+        self.assertFalse(resultado["configuracao_fiscal_atualizada"])
+        self.assertEqual(fiscal.proximo_numero_nfce, 50)
+
+    def test_fiscal_nao_retrocede_numero_e_mudanca_serie_usa_seed(self):
+        resposta = self.resposta()
+        resposta["loja"]["fiscal"] = self.fiscal(proximo_numero_nfce=20)
+        sincronizar_bootstrap(self.hub, resposta)
+        ConfiguracaoFiscalHub.objects.filter(hub=self.hub).update(proximo_numero_nfce=25)
+        resposta["loja"]["fiscal"] = self.fiscal(proximo_numero_nfce=12)
+        sincronizar_bootstrap(self.hub, resposta)
+        self.assertEqual(ConfiguracaoFiscalHub.objects.get(hub=self.hub).proximo_numero_nfce, 25)
+
+        resposta["loja"]["fiscal"] = self.fiscal(serie_nfce=8, proximo_numero_nfce=3)
+        sincronizar_bootstrap(self.hub, resposta)
+        fiscal = ConfiguracaoFiscalHub.objects.get(hub=self.hub)
+        self.assertEqual(fiscal.serie_nfce, 8)
+        self.assertEqual(fiscal.proximo_numero_nfce, 3)
 
     def test_versao_nao_suportada_e_rejeitada(self):
         with self.assertRaises(BootstrapValidationError):
@@ -1429,6 +1503,7 @@ class FormasPagamentoHubServiceTests(TestCase):
             "empresa": {"id": 11},
             "loja": {"id": 41},
             "formas_pagamento": formas,
+            "mapas_fiscais": [],
         }
         payload.update(overrides)
         return payload
@@ -1612,6 +1687,35 @@ class FormasPagamentoHubServiceTests(TestCase):
 
         self.hub.refresh_from_db()
         self.assertIsNone(self.hub.formas_pagamento_versao)
+
+    def test_mapas_fiscais_sincroniza_preserva_multiplos_e_remove_ausentes(self):
+        resposta = self.resposta(
+            [self.forma(id=10, codigo="DIN")],
+            mapas_fiscais=[
+                {"forma_pagamento_id": 10, "codigo_tpag": "01", "descricao_fiscal": "Dinheiro"},
+                {"forma_pagamento_id": 10, "codigo_tpag": "17", "descricao_fiscal": "PIX"},
+            ],
+        )
+        sincronizar_formas_pagamento(self.hub, resposta)
+        self.assertEqual(FormaPagamentoFiscalMapHub.objects.count(), 2)
+
+        resposta["mapas_fiscais"] = [
+            {"forma_pagamento_id": 10, "codigo_tpag": "01", "descricao_fiscal": "Dinheiro"},
+        ]
+        resultado = sincronizar_formas_pagamento(self.hub, resposta)
+
+        self.assertEqual(resultado["mapas_fiscais_ausentes_removidos"], 1)
+        self.assertEqual(list(FormaPagamentoFiscalMapHub.objects.values_list("codigo_tpag", flat=True)), ["01"])
+
+    def test_mapa_fiscal_para_forma_desconhecida_rejeita(self):
+        self.assert_rejeita(
+            self.resposta(
+                [self.forma(id=10, codigo="DIN")],
+                mapas_fiscais=[
+                    {"forma_pagamento_id": 99, "codigo_tpag": "01", "descricao_fiscal": "Dinheiro"},
+                ],
+            )
+        )
 
 
 class SincronizarFormasPagamentoHubCommandTests(TestCase):

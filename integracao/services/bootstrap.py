@@ -1,7 +1,7 @@
 from django.db import transaction
 from django.utils import timezone
 
-from core.models import CaixaHub
+from core.models import CaixaHub, ConfiguracaoFiscalHub
 
 
 BOOTSTRAP_VERSOES_SUPORTADAS = {1}
@@ -45,6 +45,7 @@ def sincronizar_bootstrap(hub, resposta):
 
         empresa = resposta["empresa"]
         loja = resposta["loja"]
+        fiscal_atualizada = _sincronizar_fiscal(hub, loja.get("fiscal"), sincronizado_em)
         hub.empresa_nome = empresa.get("nome") or ""
         hub.loja_nome = loja.get("nome_loja") or ""
         hub.loja_apelido = loja.get("apelido_loja") or ""
@@ -70,6 +71,7 @@ def sincronizar_bootstrap(hub, resposta):
         "loja": hub.loja_nome or hub.loja_id,
         "caixas_ativos": caixas_ativos,
         "caixas_inativados": caixas_inativados,
+        "configuracao_fiscal_atualizada": fiscal_atualizada,
     }
 
 
@@ -108,6 +110,70 @@ def _validar_bootstrap(hub, resposta):
         if not isinstance(caixa, dict):
             raise BootstrapValidationError("Resposta de bootstrap inválida: caixa inválido.")
         _exigir_campos(caixa, ("id", "codigo", "ativo"))
+
+    fiscal = loja_payload.get("fiscal")
+    if fiscal is not None:
+        _validar_fiscal(fiscal)
+
+
+def _sincronizar_fiscal(hub, fiscal, sincronizado_em):
+    if fiscal is None:
+        return False
+    atual = ConfiguracaoFiscalHub.objects.select_for_update().filter(hub=hub).first()
+    serie_recebida = fiscal["serie_nfce"]
+    numero_recebido = fiscal["proximo_numero_nfce"]
+    if atual and atual.serie_nfce == serie_recebida:
+        proximo_numero = max(atual.proximo_numero_nfce, numero_recebido)
+    else:
+        proximo_numero = numero_recebido
+    defaults = {
+        "emite_nfce": fiscal["emite_nfce"],
+        "ambiente_fiscal": fiscal["ambiente_fiscal"],
+        "regime_tributario": fiscal["regime_tributario"],
+        "inscricao_estadual": fiscal.get("inscricao_estadual") or "",
+        "serie_nfce": serie_recebida,
+        "proximo_numero_nfce": proximo_numero,
+        "razao_social": fiscal["razao_social"],
+        "nome_fantasia": fiscal.get("nome_fantasia") or "",
+        "cnpj": fiscal["cnpj"],
+        "logradouro": fiscal.get("logradouro") or "",
+        "endereco": fiscal.get("endereco") or "",
+        "numero": fiscal.get("numero") or "",
+        "complemento": fiscal.get("complemento") or "",
+        "bairro": fiscal.get("bairro") or "",
+        "cidade": fiscal.get("cidade") or "",
+        "uf": fiscal.get("uf") or fiscal.get("estado") or "",
+        "cep": fiscal.get("cep") or "",
+        "codigo_municipio_ibge": fiscal.get("codigo_municipio_ibge") or "",
+        "sincronizado_em": sincronizado_em,
+    }
+    ConfiguracaoFiscalHub.objects.update_or_create(hub=hub, defaults=defaults)
+    return True
+
+
+def _validar_fiscal(fiscal):
+    if not isinstance(fiscal, dict):
+        raise BootstrapValidationError("Bootstrap retornou fiscal inválido.")
+    _exigir_campos(
+        fiscal,
+        (
+            "emite_nfce",
+            "ambiente_fiscal",
+            "regime_tributario",
+            "serie_nfce",
+            "proximo_numero_nfce",
+            "razao_social",
+            "cnpj",
+        ),
+    )
+    if not isinstance(fiscal["emite_nfce"], bool):
+        raise BootstrapValidationError("Bootstrap retornou fiscal.emite_nfce inválido.")
+    for campo in ("serie_nfce", "proximo_numero_nfce"):
+        if isinstance(fiscal[campo], bool) or not isinstance(fiscal[campo], int) or fiscal[campo] <= 0:
+            raise BootstrapValidationError("Bootstrap retornou numeração fiscal inválida.")
+    for campo in ("ambiente_fiscal", "regime_tributario", "razao_social", "cnpj"):
+        if not isinstance(fiscal[campo], str) or not fiscal[campo].strip():
+            raise BootstrapValidationError("Bootstrap retornou fiscal incompleto.")
 
 
 def _exigir_campos(payload, campos):

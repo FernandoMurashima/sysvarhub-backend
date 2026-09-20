@@ -1,5 +1,6 @@
 import re
 import uuid
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from django.db import IntegrityError, transaction
@@ -1061,6 +1062,7 @@ def criar_item_venda(venda, catalogo_item, quantidade, operador, sessao_operador
         preco_unitario=catalogo_item.preco_venda,
         desconto=ZERO_2,
         total_item=calcular_total_item(quantidade, catalogo_item.preco_venda, ZERO_2),
+        fiscal=deepcopy(catalogo_item.fiscal or {}),
         operador_inclusao=operador,
         sessao_operador_inclusao=sessao_operador,
         terminal_inclusao=terminal,

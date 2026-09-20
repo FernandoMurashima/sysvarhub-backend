@@ -5,7 +5,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-from core.models import FormaPagamentoHub, FormaPagamentoParcelaHub
+from core.models import FormaPagamentoFiscalMapHub, FormaPagamentoHub, FormaPagamentoParcelaHub
 
 
 FORMAS_PAGAMENTO_VERSOES_SUPORTADAS = {1}
@@ -24,6 +24,7 @@ def sincronizar_formas_pagamento(hub, resposta):
         formas_ativas = 0
         formas_inativas = 0
         total_parcelas = 0
+        mapas_recebidos = set()
 
         for forma_payload in dados["formas_pagamento"]:
             ids_recebidos.add(forma_payload["retaguarda_id"])
@@ -56,6 +57,25 @@ def sincronizar_formas_pagamento(hub, resposta):
 
             forma.parcelas.exclude(ordem__in=ordens_recebidas).delete()
 
+        for mapa in dados["mapas_fiscais"]:
+            mapas_recebidos.add((mapa["forma_pagamento_retaguarda_id"], mapa["codigo_tpag"]))
+            FormaPagamentoFiscalMapHub.objects.update_or_create(
+                hub=hub,
+                forma_pagamento_retaguarda_id=mapa["forma_pagamento_retaguarda_id"],
+                codigo_tpag=mapa["codigo_tpag"],
+                defaults={
+                    "descricao_fiscal": mapa["descricao_fiscal"],
+                    "sincronizado_em": sincronizado_em,
+                },
+            )
+
+        mapas_ausentes_removidos = 0
+        for mapa in FormaPagamentoFiscalMapHub.objects.filter(hub=hub):
+            chave = (mapa.forma_pagamento_retaguarda_id, mapa.codigo_tpag)
+            if chave not in mapas_recebidos:
+                mapa.delete()
+                mapas_ausentes_removidos += 1
+
         formas_ausentes_inativadas = (
             FormaPagamentoHub.objects.filter(hub=hub, ativo=True)
             .exclude(retaguarda_id__in=ids_recebidos)
@@ -83,6 +103,8 @@ def sincronizar_formas_pagamento(hub, resposta):
         "formas_inativas": formas_inativas,
         "formas_ausentes_inativadas": formas_ausentes_inativadas,
         "parcelas": total_parcelas,
+        "mapas_fiscais": len(dados["mapas_fiscais"]),
+        "mapas_fiscais_ausentes_removidos": mapas_ausentes_removidos,
     }
 
 
@@ -107,6 +129,7 @@ def _validar_formas_pagamento(hub, resposta):
     empresa_payload = resposta["empresa"]
     loja_payload = resposta["loja"]
     formas = resposta["formas_pagamento"]
+    mapas = resposta.get("mapas_fiscais") or []
     if (
         not isinstance(hub_payload, dict)
         or not isinstance(empresa_payload, dict)
@@ -115,6 +138,8 @@ def _validar_formas_pagamento(hub, resposta):
         raise FormasPagamentoValidationError("Resposta de formas de pagamento inválida.")
     if not isinstance(formas, list):
         raise FormasPagamentoValidationError("Resposta de formas de pagamento inválida: formas_pagamento deve ser lista.")
+    if not isinstance(mapas, list):
+        raise FormasPagamentoValidationError("Resposta de formas de pagamento inválida: mapas_fiscais deve ser lista.")
 
     _exigir_campos(hub_payload, ("id", "hub_uuid"))
     _exigir_campos(empresa_payload, ("id",))
@@ -137,11 +162,24 @@ def _validar_formas_pagamento(hub, resposta):
         codigos.add(validado["codigo"])
         formas_validadas.append(validado)
 
+    mapas_validados = []
+    mapas_chaves = set()
+    for item in mapas:
+        validado = _validar_mapa_fiscal(item)
+        if validado["forma_pagamento_retaguarda_id"] not in ids:
+            raise FormasPagamentoValidationError("Mapa fiscal retornou forma_pagamento_id desconhecido.")
+        chave = (validado["forma_pagamento_retaguarda_id"], validado["codigo_tpag"])
+        if chave in mapas_chaves:
+            raise FormasPagamentoValidationError("Mapa fiscal duplicado.")
+        mapas_chaves.add(chave)
+        mapas_validados.append(validado)
+
     return {
         "gerado_em": gerado_em,
         "empresa_id": empresa_payload["id"],
         "loja_id": loja_payload["id"],
         "formas_pagamento": formas_validadas,
+        "mapas_fiscais": mapas_validados,
     }
 
 
@@ -253,6 +291,20 @@ def _validar_parcela(parcela):
         "dias": _inteiro_nao_negativo(parcela["dias"], "parcela.dias"),
         "percentual": _decimal_string_opcional(parcela["percentual"], "parcela.percentual", 6),
         "valor_fixo": _decimal_string_opcional(parcela["valor_fixo"], "parcela.valor_fixo", 2),
+    }
+
+
+def _validar_mapa_fiscal(item):
+    if not isinstance(item, dict):
+        raise FormasPagamentoValidationError("Mapa fiscal inválido.")
+    _exigir_campos(item, ("forma_pagamento_id", "codigo_tpag", "descricao_fiscal"), permitir_vazios={"descricao_fiscal"})
+    codigo = _texto_obrigatorio(item["codigo_tpag"], "codigo_tpag", max_length=2)
+    if not codigo.isdigit() or len(codigo) != 2:
+        raise FormasPagamentoValidationError("Mapa fiscal retornou codigo_tpag inválido.")
+    return {
+        "forma_pagamento_retaguarda_id": _inteiro_positivo(item["forma_pagamento_id"], "forma_pagamento_id"),
+        "codigo_tpag": codigo,
+        "descricao_fiscal": _texto_opcional(item["descricao_fiscal"], "descricao_fiscal", max_length=80) or "",
     }
 
 

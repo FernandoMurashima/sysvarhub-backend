@@ -22,6 +22,7 @@ hiddenimports = [
     "drf_yasg",
     "waitress",
     "whitenoise",
+    "cryptography",
     "MySQLdb",
     "win32timezone",
 ]

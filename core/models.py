@@ -491,6 +491,73 @@ class FormaPagamentoParcelaHub(models.Model):
         return f"{self.forma.codigo} - {self.ordem}"
 
 
+class FormaPagamentoFiscalMapHub(models.Model):
+    hub = models.ForeignKey(
+        HubConfig,
+        on_delete=models.PROTECT,
+        related_name="formas_pagamento_fiscais",
+    )
+    forma_pagamento_retaguarda_id = models.PositiveBigIntegerField()
+    codigo_tpag = models.CharField(max_length=2)
+    descricao_fiscal = models.CharField(max_length=80, blank=True, default="")
+    sincronizado_em = models.DateTimeField()
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Mapa fiscal de forma de pagamento do Hub"
+        verbose_name_plural = "Mapas fiscais de formas de pagamento do Hub"
+        ordering = ("forma_pagamento_retaguarda_id", "codigo_tpag", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["hub", "forma_pagamento_retaguarda_id", "codigo_tpag"],
+                name="uniq_fpg_fiscal_hub_forma_tpag",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "forma_pagamento_retaguarda_id"], name="idx_fpg_fiscal_hub_forma"),
+        ]
+
+    def __str__(self):
+        return f"{self.forma_pagamento_retaguarda_id} - tPag {self.codigo_tpag}"
+
+
+class ConfiguracaoFiscalHub(models.Model):
+    hub = models.OneToOneField(
+        HubConfig,
+        on_delete=models.PROTECT,
+        related_name="configuracao_fiscal",
+    )
+    emite_nfce = models.BooleanField(default=False)
+    ambiente_fiscal = models.CharField(max_length=12, blank=True, default="")
+    regime_tributario = models.CharField(max_length=20, blank=True, default="")
+    inscricao_estadual = models.CharField(max_length=20, blank=True, default="")
+    serie_nfce = models.PositiveIntegerField(default=1)
+    proximo_numero_nfce = models.PositiveIntegerField(default=1)
+    razao_social = models.CharField(max_length=120, blank=True, default="")
+    nome_fantasia = models.CharField(max_length=120, blank=True, default="")
+    cnpj = models.CharField(max_length=18, blank=True, default="")
+    logradouro = models.CharField(max_length=50, blank=True, default="")
+    endereco = models.CharField(max_length=80, blank=True, default="")
+    numero = models.CharField(max_length=10, blank=True, default="")
+    complemento = models.CharField(max_length=100, blank=True, default="")
+    bairro = models.CharField(max_length=40, blank=True, default="")
+    cidade = models.CharField(max_length=50, blank=True, default="")
+    uf = models.CharField(max_length=2, blank=True, default="")
+    cep = models.CharField(max_length=10, blank=True, default="")
+    codigo_municipio_ibge = models.CharField(max_length=7, blank=True, default="")
+    sincronizado_em = models.DateTimeField()
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Configuração fiscal do Hub"
+        verbose_name_plural = "Configurações fiscais do Hub"
+
+    def __str__(self):
+        return f"{self.hub_id} - NFC-e série {self.serie_nfce}"
+
+
 class ClienteHub(models.Model):
     ORIGEM_RETAGUARDA = "RETAGUARDA"
     ORIGEM_LOCAL = "LOCAL"
@@ -1151,6 +1218,7 @@ class VendaItemHub(models.Model):
     preco_unitario = models.DecimalField(max_digits=18, decimal_places=4)
     desconto = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     total_item = models.DecimalField(max_digits=18, decimal_places=2)
+    fiscal = models.JSONField(default=dict, blank=True)
     criado_em = models.DateTimeField(auto_now_add=True)
     atualizado_em = models.DateTimeField(auto_now=True)
     operador_inclusao = models.ForeignKey(
@@ -1347,6 +1415,61 @@ class VendaPagamentoParcelaHub(models.Model):
 
     def __str__(self):
         return f"{self.pagamento_id} - {self.ordem}"
+
+
+class NFCeHub(models.Model):
+    STATUS_GERANDO = "GERANDO"
+    STATUS_GERADA = "GERADA"
+    STATUS_ERRO_GERACAO = "ERRO_GERACAO"
+    STATUS_PENDENTE_TRANSMISSAO = "PENDENTE_TRANSMISSAO"
+    STATUS_AUTORIZADA = "AUTORIZADA"
+    STATUS_REJEITADA = "REJEITADA"
+    STATUS_CONTINGENCIA = "CONTINGENCIA"
+    STATUS_CANCELADA = "CANCELADA"
+    STATUS_CHOICES = [
+        (STATUS_GERANDO, "Gerando"),
+        (STATUS_GERADA, "Gerada"),
+        (STATUS_ERRO_GERACAO, "Erro de geração"),
+        (STATUS_PENDENTE_TRANSMISSAO, "Pendente transmissão"),
+        (STATUS_AUTORIZADA, "Autorizada"),
+        (STATUS_REJEITADA, "Rejeitada"),
+        (STATUS_CONTINGENCIA, "Contingência"),
+        (STATUS_CANCELADA, "Cancelada"),
+    ]
+
+    nfce_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="nfces")
+    venda = models.OneToOneField(VendaHub, on_delete=models.PROTECT, related_name="nfce")
+    modelo = models.CharField(max_length=2, default="65")
+    ambiente = models.CharField(max_length=12)
+    serie = models.PositiveIntegerField()
+    numero = models.PositiveIntegerField()
+    codigo_numerico = models.CharField(max_length=8)
+    digito_verificador = models.CharField(max_length=1)
+    chave_acesso = models.CharField(max_length=44, unique=True, db_index=True)
+    tipo_emissao = models.CharField(max_length=1, default="1")
+    status = models.CharField(max_length=24, choices=STATUS_CHOICES, default=STATUS_GERANDO, db_index=True)
+    xml_sem_assinatura = models.TextField(blank=True, default="")
+    xml_assinado = models.TextField(blank=True, default="")
+    qr_code_payload = models.TextField(blank=True, default="")
+    protocolo = models.CharField(max_length=60, blank=True, default="")
+    codigo_retorno = models.CharField(max_length=10, blank=True, default="")
+    mensagem_retorno = models.CharField(max_length=255, blank=True, default="")
+    emitida_em = models.DateTimeField()
+    autorizada_em = models.DateTimeField(null=True, blank=True)
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "NFC-e do Hub"
+        verbose_name_plural = "NFC-es do Hub"
+        ordering = ("-emitida_em", "-id")
+        constraints = [
+            models.UniqueConstraint(fields=["hub", "serie", "numero"], name="uniq_nfce_hub_serie_numero"),
+        ]
+
+    def __str__(self):
+        return f"NFC-e {self.serie}/{self.numero} - {self.status}"
 
 
 class FechamentoDiaHub(models.Model):
