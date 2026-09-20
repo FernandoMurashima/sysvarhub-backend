@@ -27,6 +27,7 @@ from core.models import (
     NFCeHub,
     PromocaoHub,
     ValeTrocaHub,
+    ValeTrocaMovimentoHub,
     VendaDevolucaoHub,
 )
 from core.services.caixa import fechar_caixa
@@ -277,6 +278,68 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(vale.saldo, Decimal("0.00"))
         self.assertTrue(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_DEBITO).exists())
         self.assertTrue(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_CREDITO).exists())
+
+    def test_vale_troca_exige_autorizacao_documento(self):
+        cliente = self.criar_cliente()
+        ValeTrocaHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            documento="VT-OBRIGATORIO",
+            valor_original=Decimal("40.00"),
+            saldo=Decimal("40.00"),
+            status=ValeTrocaHub.STATUS_ABERTO,
+        )
+        troca = self.criar_forma("TRO", "TROCA")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+
+        resposta = self.client.post(
+            "/api/terminal/venda/pagamento/",
+            {
+                "venda_uuid": venda_uuid,
+                "operacao_uuid": str(uuid.uuid4()),
+                "forma_pagamento_id": troca.id,
+                "valor": "10.00",
+                "autorizacao": "",
+            },
+            format="json",
+        )
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(resposta.data["detail"], "Selecione um cupom de troca válido para o pagamento.")
+
+    def test_vale_troca_nao_consumo_automatico_de_outro_cupom(self):
+        cliente = self.criar_cliente()
+        vale = ValeTrocaHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            documento="VT-CORRETO",
+            valor_original=Decimal("40.00"),
+            saldo=Decimal("40.00"),
+            status=ValeTrocaHub.STATUS_ABERTO,
+        )
+        troca = self.criar_forma("TRO", "TROCA")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+
+        resposta = self.client.post(
+            "/api/terminal/venda/pagamento/",
+            {
+                "venda_uuid": venda_uuid,
+                "operacao_uuid": str(uuid.uuid4()),
+                "forma_pagamento_id": troca.id,
+                "valor": "10.00",
+                "autorizacao": "VT-INEXISTENTE",
+            },
+            format="json",
+        )
+        vale.refresh_from_db()
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(vale.saldo, Decimal("40.00"))
+        self.assertFalse(ValeTrocaMovimentoHub.objects.exists())
 
     def test_cashback_respeita_limite_percentual_e_nao_gera_troco(self):
         cliente = self.criar_cliente()

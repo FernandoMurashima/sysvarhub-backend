@@ -107,17 +107,17 @@ def validar_cashback(venda, valor):
 def validar_vale_troca(venda, valor, autorizacao=""):
     if cliente_padrao(venda):
         raise ValueError("Troca exige cliente identificado.")
-    if money(valor) > saldo_vale_troca(venda):
-        raise ValueError("O valor de troca informado é maior que o saldo disponível do cliente.")
+    documento = str(autorizacao or "").strip()
+    if not documento:
+        raise ValueError("Selecione um cupom de troca válido para o pagamento.")
+    vale = vales_abertos(venda, bloquear=True, apenas_utilizaveis_offline=True).filter(documento=documento).first()
+    if not vale:
+        raise ValueError("Cupom de troca inválido para este cliente.")
+    if money(valor) > money(vale.saldo):
+        raise ValueError("O valor informado é maior que o saldo do cupom de troca selecionado.")
     outros = _total_pago_outros(venda, "TROCA", "VALE_TROCA")
     if money(valor) > money(max(ZERO, venda.total - outros)):
         raise ValueError("Troca não pode gerar troco; use apenas o saldo pendente da venda.")
-    if autorizacao:
-        vale = vales_abertos(venda, bloquear=True, apenas_utilizaveis_offline=True).filter(documento=autorizacao.strip()).first()
-        if not vale:
-            raise ValueError("Cupom de troca inválido para este cliente.")
-        if money(valor) > money(vale.saldo):
-            raise ValueError("O valor informado é maior que o saldo do cupom de troca selecionado.")
 
 
 def aplicar_promocao(catalogo_item, quantidade):
@@ -199,28 +199,26 @@ def _gerar_cashback(venda, pagamentos):
 
 def _consumir_vale(venda, pagamento):
     restante = money(pagamento.valor)
-    qs = vales_abertos(venda, bloquear=True, apenas_utilizaveis_offline=True)
-    if pagamento.vale_troca_documento:
-        qs = qs.filter(documento=pagamento.vale_troca_documento)
-    for vale in qs:
-        if restante <= ZERO:
-            break
-        uso = money(min(vale.saldo, restante))
-        vale.saldo = money(vale.saldo - uso)
-        if vale.saldo <= ZERO:
-            vale.status = ValeTrocaHub.STATUS_USADO
-        vale.save(update_fields=["saldo", "status", "atualizado_em"])
-        ValeTrocaMovimentoHub.objects.create(
-            vale=vale,
-            venda=venda,
-            tipo=ValeTrocaMovimentoHub.TIPO_USO,
-            valor=uso,
-            saldo_apos=vale.saldo,
-            observacao=f"Uso na venda Hub {venda.venda_uuid}",
-        )
-        restante = money(restante - uso)
-    if restante > ZERO:
+    documento = str(pagamento.vale_troca_documento or pagamento.autorizacao or "").strip()
+    if not documento:
+        raise ValueError("Selecione um cupom de troca válido para o pagamento.")
+    vale = vales_abertos(venda, bloquear=True, apenas_utilizaveis_offline=True).filter(documento=documento).first()
+    if not vale:
+        raise ValueError("Cupom de troca inválido para este cliente.")
+    if restante > money(vale.saldo):
         raise ValueError("Saldo de troca insuficiente para concluir a venda.")
+    vale.saldo = money(vale.saldo - restante)
+    if vale.saldo <= ZERO:
+        vale.status = ValeTrocaHub.STATUS_USADO
+    vale.save(update_fields=["saldo", "status", "atualizado_em"])
+    ValeTrocaMovimentoHub.objects.create(
+        vale=vale,
+        venda=venda,
+        tipo=ValeTrocaMovimentoHub.TIPO_USO,
+        valor=restante,
+        saldo_apos=vale.saldo,
+        observacao=f"Uso na venda Hub {venda.venda_uuid}",
+    )
 
 
 def _filtrar_cliente(qs, venda):
