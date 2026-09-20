@@ -1,6 +1,5 @@
 import base64
 import hashlib
-import hmac
 import random
 import re
 from dataclasses import dataclass
@@ -22,6 +21,10 @@ from core.models import (
 
 NFE_NS = "http://www.portalfiscal.inf.br/nfe"
 DS_NS = "http://www.w3.org/2000/09/xmldsig#"
+CANONICALIZATION_ALGORITHM = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
+SIGNATURE_ALGORITHM = "http://www.w3.org/2000/09/xmldsig#rsa-sha1"
+DIGEST_ALGORITHM = "http://www.w3.org/2000/09/xmldsig#sha1"
+ENVELOPED_SIGNATURE_ALGORITHM = "http://www.w3.org/2000/09/xmldsig#enveloped-signature"
 ET.register_namespace("", NFE_NS)
 ET.register_namespace("ds", DS_NS)
 
@@ -47,9 +50,11 @@ class MaterialAssinatura:
 
 @dataclass(frozen=True)
 class ConfigQRCodeDesenvolvimento:
-    url_consulta: str
-    csc_id: str
-    csc: str
+    url_qrcode: str
+    url_chave: str
+    versao: int = 3
+    csc_id: str = ""
+    csc: str = ""
 
 
 def gerar_nfce_local(venda, *, material_assinatura, qr_config, codigo_numerico=None):
@@ -93,9 +98,9 @@ def gerar_nfce_local(venda, *, material_assinatura, qr_config, codigo_numerico=N
         )
 
         try:
-            xml = montar_xml_nfce(nfce, config)
-            xml_assinado = assinar_xml_nfce(xml, material_assinatura)
             qr_payload = gerar_qr_code_payload(nfce, config, qr_config)
+            xml = montar_xml_nfce(nfce, config, qr_payload, qr_config.url_chave)
+            xml_assinado = assinar_xml_nfce(xml, material_assinatura)
         except NFCeErroDominio as exc:
             nfce.status = NFCeHub.STATUS_ERRO_GERACAO
             nfce.mensagem_retorno = exc.codigo
@@ -200,7 +205,7 @@ def calcular_dv_chave(base43):
     return "0" if dv >= 10 else str(dv)
 
 
-def montar_xml_nfce(nfce, config):
+def montar_xml_nfce(nfce, config, qr_code_payload, url_chave):
     venda = (
         VendaHub.objects
         .prefetch_related("itens", "pagamentos")
@@ -212,17 +217,25 @@ def montar_xml_nfce(nfce, config):
         raise NFCeErroDominio("DADOS_FISCAIS_INSUFICIENTES")
     if not pagamentos:
         raise NFCeErroDominio("PAGAMENTO_SEM_TPAG")
+    if Decimal(venda.desconto_geral or 0) != Decimal("0"):
+        raise NFCeErroDominio("DESCONTO_GERAL_FISCAL_NAO_SUPORTADO")
 
     root = ET.Element(q("NFe"))
     inf = ET.SubElement(root, q("infNFe"), {"versao": "4.00", "Id": f"NFe{nfce.chave_acesso}"})
     _montar_ide(inf, nfce, config)
     _montar_emit(inf, config)
     _montar_dest(inf, venda)
+    totais = _totais_zerados()
     for indice, item in enumerate(itens, start=1):
-        _montar_det(inf, item, indice, config.uf)
-    _montar_total(inf, venda)
+        item_totais = _montar_det(inf, item, indice, config)
+        for chave, valor in item_totais.items():
+            totais[chave] += valor
+    _montar_total(inf, venda, totais)
     ET.SubElement(inf, q("transp")).append(_el("modFrete", "9"))
-    _montar_pag(inf, pagamentos, nfce.hub)
+    _montar_pag(inf, pagamentos, nfce.hub, venda)
+    supl = ET.SubElement(root, q("infNFeSupl"))
+    supl.append(_el("qrCode", qr_code_payload))
+    supl.append(_el("urlChave", url_chave))
     return ET.tostring(root, encoding="unicode", short_empty_elements=False)
 
 
@@ -286,9 +299,12 @@ def _montar_dest(inf, venda):
     dest.append(_el("indIEDest", "9"))
 
 
-def _montar_det(inf, item, indice, uf):
+def _montar_det(inf, item, indice, config):
     fiscal = item.fiscal or {}
     _validar_fiscal_item(fiscal)
+    v_prod = money(Decimal(item.quantidade) * Decimal(item.preco_unitario))
+    v_desc = money(item.desconto)
+    v_bc = money(v_prod - v_desc)
     det = ET.SubElement(inf, q("det"), {"nItem": str(indice)})
     prod = ET.SubElement(det, q("prod"))
     cfop = fiscal.get("cfop_venda_dentro") or fiscal.get("cfop_venda_fora")
@@ -301,28 +317,28 @@ def _montar_det(inf, item, indice, uf):
         ("uCom", item.unidade_codigo or "UN"),
         ("qCom", dec(item.quantidade, 4)),
         ("vUnCom", dec(item.preco_unitario, 10)),
-        ("vProd", dec(item.total_item, 2)),
+        ("vProd", dec(v_prod, 2)),
         ("cEANTrib", item.ean13 or "SEM GTIN"),
         ("uTrib", item.unidade_codigo or "UN"),
         ("qTrib", dec(item.quantidade, 4)),
         ("vUnTrib", dec(item.preco_unitario, 10)),
-        ("indTot", "1"),
     ):
         prod.append(_el(tag, valor))
+    if v_desc > Decimal("0"):
+        prod.append(_el("vDesc", dec(v_desc, 2)))
+    prod.append(_el("indTot", "1"))
     imposto = ET.SubElement(det, q("imposto"))
-    icms = ET.SubElement(ET.SubElement(imposto, q("ICMS")), q("ICMSSN102"))
-    icms.append(_el("orig", str(fiscal.get("origem_mercadoria", 0))))
-    icms.append(_el("CSOSN", str(fiscal.get("csosn_ou_cst_icms"))))
-    pis = ET.SubElement(ET.SubElement(imposto, q("PIS")), q("PISAliq"))
-    pis.append(_el("CST", fiscal.get("cst_pis")))
-    pis.append(_el("vBC", dec(item.total_item, 2)))
-    pis.append(_el("pPIS", dec(Decimal(str(fiscal.get("aliq_pis") or "0")), 4)))
-    pis.append(_el("vPIS", "0.00"))
-    cofins = ET.SubElement(ET.SubElement(imposto, q("COFINS")), q("COFINSAliq"))
-    cofins.append(_el("CST", fiscal.get("cst_cofins")))
-    cofins.append(_el("vBC", dec(item.total_item, 2)))
-    cofins.append(_el("pCOFINS", dec(Decimal(str(fiscal.get("aliq_cofins") or "0")), 4)))
-    cofins.append(_el("vCOFINS", "0.00"))
+    v_icms, v_bc_icms = _montar_icms(imposto, fiscal, config, v_bc)
+    v_pis = _montar_pis(imposto, fiscal, v_bc)
+    v_cofins = _montar_cofins(imposto, fiscal, v_bc)
+    return {
+        "vBC": v_bc_icms,
+        "vICMS": v_icms,
+        "vProd": v_prod,
+        "vDesc": v_desc,
+        "vPIS": v_pis,
+        "vCOFINS": v_cofins,
+    }
 
 
 def _validar_fiscal_item(fiscal):
@@ -335,21 +351,107 @@ def _validar_fiscal_item(fiscal):
             raise NFCeErroDominio("PRODUTO_SEM_TRIBUTACAO")
 
 
-def _montar_total(inf, venda):
+def _montar_icms(imposto, fiscal, config, v_bc):
+    icms_container = ET.SubElement(imposto, q("ICMS"))
+    origem = str(fiscal.get("origem_mercadoria", 0))
+    codigo = str(fiscal.get("csosn_ou_cst_icms") or "").strip()
+    if config.regime_tributario == "SIMPLES":
+        if codigo not in {"102", "103", "300", "400"}:
+            raise NFCeErroDominio("TRIBUTACAO_ICMS_NAO_SUPORTADA")
+        icms = ET.SubElement(icms_container, q("ICMSSN102"))
+        icms.append(_el("orig", origem))
+        icms.append(_el("CSOSN", codigo))
+        return Decimal("0.00"), Decimal("0.00")
+    if config.regime_tributario not in {"LUCRO_REAL", "LUCRO_PRESUMIDO"}:
+        raise NFCeErroDominio("TRIBUTACAO_ICMS_NAO_SUPORTADA")
+    cst = _normalizar_cst_icms(codigo, origem)
+    if cst != "00":
+        raise NFCeErroDominio("TRIBUTACAO_ICMS_NAO_SUPORTADA")
+    aliquota = Decimal(str(fiscal.get("aliquota_icms") or "0"))
+    v_icms = money(v_bc * aliquota / Decimal("100"))
+    icms = ET.SubElement(icms_container, q("ICMS00"))
+    for tag, valor in (
+        ("orig", origem),
+        ("CST", cst),
+        ("modBC", "3"),
+        ("vBC", dec(v_bc, 2)),
+        ("pICMS", dec(aliquota, 4)),
+        ("vICMS", dec(v_icms, 2)),
+    ):
+        icms.append(_el(tag, valor))
+    return v_icms, v_bc
+
+
+def _normalizar_cst_icms(codigo, origem):
+    if codigo == "00":
+        return "00"
+    if len(codigo) == 3 and codigo[0] == origem:
+        return codigo[1:]
+    raise NFCeErroDominio("TRIBUTACAO_ICMS_NAO_SUPORTADA")
+
+
+def _montar_pis(imposto, fiscal, v_bc):
+    cst = str(fiscal.get("cst_pis") or "").zfill(2)
+    aliquota = Decimal(str(fiscal.get("aliq_pis") or "0"))
+    v_pis = money(v_bc * aliquota / Decimal("100"))
+    if cst in {"01", "02"}:
+        grupo = "PISAliq"
+    elif cst == "49":
+        grupo = "PISOutr"
+    else:
+        raise NFCeErroDominio("TRIBUTACAO_PIS_NAO_SUPORTADA")
+    pis = ET.SubElement(ET.SubElement(imposto, q("PIS")), q(grupo))
+    pis.append(_el("CST", cst))
+    pis.append(_el("vBC", dec(v_bc, 2)))
+    pis.append(_el("pPIS", dec(aliquota, 4)))
+    pis.append(_el("vPIS", dec(v_pis, 2)))
+    return v_pis
+
+
+def _montar_cofins(imposto, fiscal, v_bc):
+    cst = str(fiscal.get("cst_cofins") or "").zfill(2)
+    aliquota = Decimal(str(fiscal.get("aliq_cofins") or "0"))
+    v_cofins = money(v_bc * aliquota / Decimal("100"))
+    if cst in {"01", "02"}:
+        grupo = "COFINSAliq"
+    elif cst == "49":
+        grupo = "COFINSOutr"
+    else:
+        raise NFCeErroDominio("TRIBUTACAO_COFINS_NAO_SUPORTADA")
+    cofins = ET.SubElement(ET.SubElement(imposto, q("COFINS")), q(grupo))
+    cofins.append(_el("CST", cst))
+    cofins.append(_el("vBC", dec(v_bc, 2)))
+    cofins.append(_el("pCOFINS", dec(aliquota, 4)))
+    cofins.append(_el("vCOFINS", dec(v_cofins, 2)))
+    return v_cofins
+
+
+def _totais_zerados():
+    return {
+        "vBC": Decimal("0.00"),
+        "vICMS": Decimal("0.00"),
+        "vProd": Decimal("0.00"),
+        "vDesc": Decimal("0.00"),
+        "vPIS": Decimal("0.00"),
+        "vCOFINS": Decimal("0.00"),
+    }
+
+
+def _montar_total(inf, venda, totais):
     total = ET.SubElement(inf, q("total"))
     icms_tot = ET.SubElement(total, q("ICMSTot"))
     for tag, valor in (
-        ("vBC", "0.00"), ("vICMS", "0.00"), ("vICMSDeson", "0.00"), ("vFCP", "0.00"),
+        ("vBC", dec(totais["vBC"], 2)), ("vICMS", dec(totais["vICMS"], 2)), ("vICMSDeson", "0.00"), ("vFCP", "0.00"),
         ("vBCST", "0.00"), ("vST", "0.00"), ("vFCPST", "0.00"), ("vFCPSTRet", "0.00"),
-        ("vProd", dec(venda.subtotal, 2)), ("vFrete", "0.00"), ("vSeg", "0.00"),
-        ("vDesc", dec(venda.desconto_itens + venda.desconto_geral, 2)), ("vII", "0.00"),
-        ("vIPI", "0.00"), ("vIPIDevol", "0.00"), ("vPIS", "0.00"), ("vCOFINS", "0.00"),
+        ("vProd", dec(totais["vProd"], 2)), ("vFrete", "0.00"), ("vSeg", "0.00"),
+        ("vDesc", dec(totais["vDesc"], 2)), ("vII", "0.00"),
+        ("vIPI", "0.00"), ("vIPIDevol", "0.00"), ("vPIS", dec(totais["vPIS"], 2)), ("vCOFINS", dec(totais["vCOFINS"], 2)),
         ("vOutro", "0.00"), ("vNF", dec(venda.total, 2)),
     ):
         icms_tot.append(_el(tag, valor))
 
 
-def _montar_pag(inf, pagamentos, hub):
+def _montar_pag(inf, pagamentos, hub, venda):
     pag = ET.SubElement(inf, q("pag"))
     for pagamento in pagamentos:
         mapas = list(
@@ -365,6 +467,8 @@ def _montar_pag(inf, pagamentos, hub):
         det = ET.SubElement(pag, q("detPag"))
         det.append(_el("tPag", mapas[0].codigo_tpag))
         det.append(_el("vPag", dec(pagamento.valor, 2)))
+    if Decimal(venda.troco or 0) > Decimal("0"):
+        pag.append(_el("vTroco", dec(venda.troco, 2)))
 
 
 def assinar_xml_nfce(xml, material):
@@ -372,29 +476,38 @@ def assinar_xml_nfce(xml, material):
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import padding
+        from lxml import etree
     except ImportError as exc:
         raise NFCeErroDominio("DADOS_FISCAIS_INSUFICIENTES") from exc
-    root = ET.fromstring(xml)
+    root = etree.fromstring(xml.encode("utf-8"), parser=_xml_parser())
     inf = root.find(f"{{{NFE_NS}}}infNFe")
     if inf is None:
         raise NFCeErroDominio("DADOS_FISCAIS_INSUFICIENTES")
     referencia = "#" + inf.attrib["Id"]
-    inf_bytes = ET.tostring(inf, encoding="utf-8")
+    inf_bytes = _canonicalizar(inf)
+    digest_value = base64.b64encode(hashlib.sha1(inf_bytes).digest()).decode("ascii")
     key = serialization.load_pem_private_key(material.private_key_pem, password=None)
-    assinatura = key.sign(inf_bytes, padding.PKCS1v15(), hashes.SHA256())
     cert = x509.load_pem_x509_certificate(material.certificate_pem)
-    signature = ET.SubElement(root, qds("Signature"))
-    signed_info = ET.SubElement(signature, qds("SignedInfo"))
-    signed_info.append(_elds("CanonicalizationMethod", attrs={"Algorithm": "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"}))
-    signed_info.append(_elds("SignatureMethod", attrs={"Algorithm": "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"}))
-    ref = ET.SubElement(signed_info, qds("Reference"), {"URI": referencia})
-    ref.append(_elds("DigestMethod", attrs={"Algorithm": "http://www.w3.org/2001/04/xmlenc#sha256"}))
-    ref.append(_elds("DigestValue", base64.b64encode(hashlib.sha256(inf_bytes).digest()).decode("ascii")))
-    signature.append(_elds("SignatureValue", base64.b64encode(assinatura).decode("ascii")))
-    key_info = ET.SubElement(signature, qds("KeyInfo"))
-    x509_data = ET.SubElement(key_info, qds("X509Data"))
-    x509_data.append(_elds("X509Certificate", base64.b64encode(cert.public_bytes(serialization.Encoding.DER)).decode("ascii")))
-    return ET.tostring(root, encoding="unicode", short_empty_elements=False)
+    signature = etree.Element(qds("Signature"), nsmap={"ds": DS_NS})
+    signed_info = etree.SubElement(signature, qds("SignedInfo"))
+    etree.SubElement(signed_info, qds("CanonicalizationMethod"), Algorithm=CANONICALIZATION_ALGORITHM)
+    etree.SubElement(signed_info, qds("SignatureMethod"), Algorithm=SIGNATURE_ALGORITHM)
+    ref = etree.SubElement(signed_info, qds("Reference"), URI=referencia)
+    transforms = etree.SubElement(ref, qds("Transforms"))
+    etree.SubElement(transforms, qds("Transform"), Algorithm=ENVELOPED_SIGNATURE_ALGORITHM)
+    etree.SubElement(transforms, qds("Transform"), Algorithm=CANONICALIZATION_ALGORITHM)
+    etree.SubElement(ref, qds("DigestMethod"), Algorithm=DIGEST_ALGORITHM)
+    digest = etree.SubElement(ref, qds("DigestValue"))
+    digest.text = digest_value
+    root.append(signature)
+    assinatura = key.sign(_canonicalizar(signed_info), padding.PKCS1v15(), hashes.SHA1())
+    signature_value = etree.SubElement(signature, qds("SignatureValue"))
+    signature_value.text = base64.b64encode(assinatura).decode("ascii")
+    key_info = etree.SubElement(signature, qds("KeyInfo"))
+    x509_data = etree.SubElement(key_info, qds("X509Data"))
+    x509_certificate = etree.SubElement(x509_data, qds("X509Certificate"))
+    x509_certificate.text = base64.b64encode(cert.public_bytes(serialization.Encoding.DER)).decode("ascii")
+    return etree.tostring(root, encoding="unicode", pretty_print=False)
 
 
 def verificar_assinatura_nfce(xml_assinado):
@@ -402,22 +515,46 @@ def verificar_assinatura_nfce(xml_assinado):
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding
+        from lxml import etree
     except ImportError as exc:
         raise NFCeErroDominio("DADOS_FISCAIS_INSUFICIENTES") from exc
-    root = ET.fromstring(xml_assinado)
-    inf = root.find(f"{{{NFE_NS}}}infNFe")
-    sig = root.find(f"{{{DS_NS}}}Signature")
-    assinatura = base64.b64decode(sig.findtext(f"{{{DS_NS}}}SignatureValue"))
-    cert_der = base64.b64decode(sig.find(f"{{{DS_NS}}}KeyInfo/{{{DS_NS}}}X509Data/{{{DS_NS}}}X509Certificate").text)
-    cert = x509.load_der_x509_certificate(cert_der)
-    cert.public_key().verify(assinatura, ET.tostring(inf, encoding="utf-8"), padding.PKCS1v15(), hashes.SHA256())
-    return True
+    try:
+        root = etree.fromstring(xml_assinado.encode("utf-8"), parser=_xml_parser())
+        sig = root.find(f"{{{DS_NS}}}Signature")
+        signed_info = sig.find(f"{{{DS_NS}}}SignedInfo")
+        ref = signed_info.find(f"{{{DS_NS}}}Reference")
+        uri = ref.attrib["URI"]
+        if not uri.startswith("#"):
+            return False
+        transforms = [
+            t.attrib.get("Algorithm")
+            for t in ref.findall(f"{{{DS_NS}}}Transforms/{{{DS_NS}}}Transform")
+        ]
+        if transforms != [ENVELOPED_SIGNATURE_ALGORITHM, CANONICALIZATION_ALGORITHM]:
+            return False
+        digest_method = ref.find(f"{{{DS_NS}}}DigestMethod").attrib.get("Algorithm")
+        signature_method = signed_info.find(f"{{{DS_NS}}}SignatureMethod").attrib.get("Algorithm")
+        if digest_method != DIGEST_ALGORITHM or signature_method != SIGNATURE_ALGORITHM:
+            return False
+        inf = root.xpath("//*[@Id=$id]", id=uri[1:])
+        if len(inf) != 1:
+            return False
+        digest_calculado = base64.b64encode(hashlib.sha1(_canonicalizar(inf[0])).digest()).decode("ascii")
+        if digest_calculado != ref.findtext(f"{{{DS_NS}}}DigestValue"):
+            return False
+        assinatura = base64.b64decode(sig.findtext(f"{{{DS_NS}}}SignatureValue"))
+        cert_der = base64.b64decode(sig.find(f"{{{DS_NS}}}KeyInfo/{{{DS_NS}}}X509Data/{{{DS_NS}}}X509Certificate").text)
+        cert = x509.load_der_x509_certificate(cert_der)
+        cert.public_key().verify(assinatura, _canonicalizar(signed_info), padding.PKCS1v15(), hashes.SHA1())
+        return True
+    except Exception:
+        return False
 
 
 def gerar_qr_code_payload(nfce, config, qr_config):
-    base = f"{qr_config.url_consulta}?chNFe={nfce.chave_acesso}&nVersao=100&tpAmb={_tp_amb(config.ambiente_fiscal)}&cIdToken={qr_config.csc_id}"
-    digest = hmac.new(qr_config.csc.encode("utf-8"), base.encode("utf-8"), hashlib.sha1).hexdigest().upper()
-    return f"{base}&cHashQRCode={digest}"
+    if qr_config.versao != 3:
+        raise NFCeErroDominio("QR_CODE_VERSAO_NAO_SUPORTADA")
+    return f"{qr_config.url_qrcode}?p={nfce.chave_acesso}|3|{_tp_amb(config.ambiente_fiscal)}"
 
 
 def q(tag):
@@ -447,6 +584,22 @@ def somente_digitos(valor):
 
 def dec(valor, casas):
     return f"{Decimal(valor).quantize(Decimal(1).scaleb(-casas), rounding=ROUND_HALF_UP):.{casas}f}"
+
+
+def money(valor):
+    return Decimal(valor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _xml_parser():
+    from lxml import etree
+
+    return etree.XMLParser(remove_blank_text=True)
+
+
+def _canonicalizar(element):
+    from lxml import etree
+
+    return etree.tostring(element, method="c14n", exclusive=False, with_comments=False)
 
 
 def _tp_amb(ambiente):

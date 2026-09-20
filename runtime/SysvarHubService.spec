@@ -23,6 +23,7 @@ hiddenimports = [
     "waitress",
     "whitenoise",
     "cryptography",
+    "lxml",
     "MySQLdb",
     "win32timezone",
 ]
@@ -34,6 +35,7 @@ hiddenimports += collect_submodules("django_filters", filter=lambda name: ".test
 hiddenimports += collect_submodules("drf_yasg", filter=lambda name: ".tests" not in name)
 hiddenimports += collect_submodules("corsheaders", filter=lambda name: ".tests" not in name)
 hiddenimports += collect_submodules("whitenoise", filter=lambda name: ".tests" not in name)
+hiddenimports += collect_submodules("lxml")
 datas = collect_data_files("coreschema")
 
 a = Analysis(
