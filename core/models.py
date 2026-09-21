@@ -204,6 +204,27 @@ class HubConfig(models.Model):
         blank=True,
     )
 
+    primeira_carga_concluida_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    ultima_carga_central_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    ultima_carga_central_status = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+    )
+
+    ultima_carga_central_erro = models.TextField(
+        blank=True,
+        default="",
+    )
+
     criado_em = models.DateTimeField(
         auto_now_add=True,
     )
@@ -1696,6 +1717,42 @@ class EventoSyncHub(models.Model):
 
     def __str__(self):
         return f"{self.tipo} - {self.status}"
+
+
+class SincronizacaoRecebidaHub(models.Model):
+    STATUS_PENDENTE = "PENDENTE"
+    STATUS_PROCESSANDO = "PROCESSANDO"
+    STATUS_CONCLUIDA = "CONCLUIDA"
+    STATUS_ERRO = "ERRO"
+    STATUS_CHOICES = [
+        (STATUS_PENDENTE, "Pendente"),
+        (STATUS_PROCESSANDO, "Processando"),
+        (STATUS_CONCLUIDA, "Concluída"),
+        (STATUS_ERRO, "Erro"),
+    ]
+
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="sincronizacoes_recebidas")
+    retaguarda_solicitacao_id = models.PositiveBigIntegerField()
+    tipo = models.CharField(max_length=20)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDENTE, db_index=True)
+    etapa_atual = models.CharField(max_length=80, blank=True, default="")
+    mensagem_erro = models.TextField(blank=True, default="")
+    recebido_em = models.DateTimeField(auto_now_add=True)
+    iniciado_em = models.DateTimeField(null=True, blank=True)
+    concluido_em = models.DateTimeField(null=True, blank=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("-recebido_em", "-id")
+        constraints = [
+            models.UniqueConstraint(fields=["hub", "retaguarda_solicitacao_id"], name="uniq_sync_recebida_hub_ret"),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "status"], name="idx_sync_rec_hub_status"),
+        ]
+
+    def __str__(self):
+        return f"{self.hub_id} - {self.retaguarda_solicitacao_id} - {self.status}"
 
 
 class FechamentoDiaHub(models.Model):

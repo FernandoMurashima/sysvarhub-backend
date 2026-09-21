@@ -4,7 +4,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
 from core.models import HubConfig
-from core.services.sync import sincronizar_eventos_pendentes
+from integracao.services.sincronizacao import executar_sincronizacao_comando
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 from sysvarhub.version import VERSION
 
@@ -17,7 +17,7 @@ class Command(BaseCommand):
         client = RetaguardaClient(hub.retaguarda_url)
 
         try:
-            client.heartbeat(
+            resposta = client.heartbeat(
                 token=hub.retaguarda_token,
                 hostname=socket.gethostname(),
                 versao=VERSION,
@@ -27,7 +27,9 @@ class Command(BaseCommand):
 
         hub.ultimo_heartbeat_em = timezone.now()
         hub.save(update_fields=["ultimo_heartbeat_em", "atualizado_em"])
-        sincronizar_eventos_pendentes(hub, client=client)
+        comando = resposta.get("comando_sincronizacao")
+        if comando:
+            executar_sincronizacao_comando(hub, comando, client=client)
 
         self.stdout.write(self.style.SUCCESS("Heartbeat enviado com sucesso."))
 

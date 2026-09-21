@@ -19,6 +19,8 @@ class HubWaitressRuntime:
         self.application_factory = application_factory
         self.server_factory = server_factory
         self.server = None
+        self.worker_stop_event = threading.Event()
+        self.worker_thread = None
         self._lock = threading.RLock()
 
     def run(self):
@@ -26,6 +28,7 @@ class HubWaitressRuntime:
         import django
         from django.core.wsgi import get_wsgi_application
         from waitress.server import create_server
+        from runtime.sync_worker import start_worker_thread
 
         django.setup()
         host = os.environ.get("HUB_BIND_HOST", "0.0.0.0")
@@ -35,21 +38,30 @@ class HubWaitressRuntime:
         server = server_factory(application_factory(), host=host, port=port)
         with self._lock:
             self.server = server
+            if self.worker_thread is None:
+                _worker, self.worker_thread = start_worker_thread(self.worker_stop_event)
         try:
             server.run()
         finally:
             self.stop()
 
     def stop(self):
+        self.worker_stop_event.set()
         with self._lock:
             server = self.server
             self.server = None
+            worker_thread = self.worker_thread
+            self.worker_thread = None
         if server is None:
+            if worker_thread is not None:
+                worker_thread.join(timeout=5)
             return
         dispatcher = getattr(server, "task_dispatcher", None)
         if dispatcher is not None:
             dispatcher.shutdown()
         server.close()
+        if worker_thread is not None:
+            worker_thread.join(timeout=5)
 
 
 def run_console(runtime=None):

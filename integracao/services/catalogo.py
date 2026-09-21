@@ -8,7 +8,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 
-from core.models import CatalogoItemHub, PromocaoHub
+from core.models import CatalogoItemHub, EventoSyncHub, PromocaoHub
 from integracao.services.retaguarda import RetaguardaError
 
 
@@ -33,11 +33,14 @@ def sincronizar_catalogo(hub, resposta, client=None):
         sku_ids_recebidos = set()
         vendaveis = 0
         nao_vendaveis = 0
+        preservar_saldo = _existe_evento_estoque_pendente(hub)
 
         for item in dados["itens"]:
             sku_ids_recebidos.add(item["retaguarda_sku_id"])
             imagem = item["imagem"]
             item_catalogo = {chave: valor for chave, valor in item.items() if chave != "imagem"}
+            if preservar_saldo:
+                item_catalogo = _preservar_saldo_local_se_existente(hub, item_catalogo)
             imagem_defaults = _imagem_defaults_para_item(hub, item["retaguarda_produto_id"], imagem)
             CatalogoItemHub.objects.update_or_create(
                 hub=hub,
@@ -49,7 +52,7 @@ def sincronizar_catalogo(hub, resposta, client=None):
                     "sincronizado_em": sincronizado_em,
                 },
             )
-            if item["vendavel"]:
+            if item_catalogo["vendavel"]:
                 vendaveis += 1
             else:
                 nao_vendaveis += 1
@@ -158,6 +161,40 @@ def _validar_catalogo(hub, resposta):
         "itens": itens_validados,
         "promocoes": _validar_promocoes(resposta.get("promocoes") or []),
     }
+
+
+def _existe_evento_estoque_pendente(hub):
+    return EventoSyncHub.objects.filter(
+        hub=hub,
+        status__in=[
+            EventoSyncHub.STATUS_PENDENTE,
+            EventoSyncHub.STATUS_PROCESSANDO,
+            EventoSyncHub.STATUS_ERRO,
+        ],
+        tipo__in=["VENDA_FINALIZADA", "DEVOLUCAO_FINALIZADA"],
+    ).exists()
+
+
+def _preservar_saldo_local_se_existente(hub, item_catalogo):
+    existente = CatalogoItemHub.objects.filter(
+        hub=hub,
+        retaguarda_sku_id=item_catalogo["retaguarda_sku_id"],
+    ).first()
+    if not existente:
+        return item_catalogo
+    item_catalogo = dict(item_catalogo)
+    item_catalogo["estoque_fisico"] = existente.estoque_fisico
+    item_catalogo["reserva"] = existente.reserva
+    item_catalogo["estoque_disponivel"] = existente.estoque_disponivel
+    motivos = []
+    preco_venda = item_catalogo.get("preco_venda")
+    if preco_venda is None or preco_venda <= 0:
+        motivos.append("SEM_PRECO")
+    if existente.estoque_disponivel <= 0:
+        motivos.append("SEM_ESTOQUE")
+    item_catalogo["motivos_bloqueio"] = motivos
+    item_catalogo["vendavel"] = not motivos
+    return item_catalogo
 
 
 def _validar_tabela_preco(tabela_preco):
