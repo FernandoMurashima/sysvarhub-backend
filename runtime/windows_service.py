@@ -25,21 +25,28 @@ class HubWaitressRuntime:
 
     def run(self):
         bootstrap()
+
         import django
         from django.core.wsgi import get_wsgi_application
         from waitress.server import create_server
-        from runtime.sync_worker import start_worker_thread
 
         django.setup()
+
+        from runtime.sync_worker import start_worker_thread
+
         host = os.environ.get("HUB_BIND_HOST", "0.0.0.0")
         port = int(os.environ.get("HUB_PORT", "8000"))
         application_factory = self.application_factory or get_wsgi_application
         server_factory = self.server_factory or create_server
         server = server_factory(application_factory(), host=host, port=port)
+
         with self._lock:
             self.server = server
             if self.worker_thread is None:
-                _worker, self.worker_thread = start_worker_thread(self.worker_stop_event)
+                _worker, self.worker_thread = start_worker_thread(
+                    self.worker_stop_event
+                )
+
         try:
             server.run()
         finally:
@@ -47,19 +54,24 @@ class HubWaitressRuntime:
 
     def stop(self):
         self.worker_stop_event.set()
+
         with self._lock:
             server = self.server
             self.server = None
             worker_thread = self.worker_thread
             self.worker_thread = None
+
         if server is None:
             if worker_thread is not None:
                 worker_thread.join(timeout=5)
             return
+
         dispatcher = getattr(server, "task_dispatcher", None)
         if dispatcher is not None:
             dispatcher.shutdown()
+
         server.close()
+
         if worker_thread is not None:
             worker_thread.join(timeout=5)
 
@@ -75,6 +87,7 @@ def stop_runtime(runtime):
 
 def run_manage(argv):
     bootstrap()
+
     from django.core.management import execute_from_command_line
 
     execute_from_command_line(["SysvarHubService.exe", *argv])
@@ -82,7 +95,10 @@ def run_manage(argv):
 
 def run_service_dispatcher(service_class=None):
     if servicemanager is None:
-        raise RuntimeError("pywin32 nao esta disponivel para executar servico Windows.")
+        raise RuntimeError(
+            "pywin32 nao esta disponivel para executar servico Windows."
+        )
+
     service_class = service_class or SysvarHubService
     servicemanager.Initialize()
     servicemanager.PrepareToHostSingle(service_class)
@@ -99,6 +115,7 @@ except ImportError:
 
 
 if win32serviceutil is not None:
+
     class SysvarHubService(win32serviceutil.ServiceFramework):
         _svc_name_ = "SysvarHub"
         _svc_display_name_ = "Sysvar Hub"
@@ -117,6 +134,7 @@ if win32serviceutil is not None:
         def SvcDoRun(self):
             self.ReportServiceStatus(win32service.SERVICE_RUNNING)
             servicemanager.LogInfoMsg("Sysvar Hub iniciando.")
+
             try:
                 run_console(self.runtime)
             except Exception as exc:
@@ -132,14 +150,20 @@ def main():
         return
 
     command = sys.argv[1]
+
     if command == "console":
         run_console()
         return
+
     if command == "manage":
         run_manage(sys.argv[2:])
         return
+
     if win32serviceutil is None:
-        raise RuntimeError("pywin32 nao esta disponivel para registrar/executar servico Windows.")
+        raise RuntimeError(
+            "pywin32 nao esta disponivel para registrar/executar servico Windows."
+        )
+
     win32serviceutil.HandleCommandLine(SysvarHubService)
 
 
