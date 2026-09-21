@@ -195,6 +195,7 @@ class RetaguardaClient:
             body = json.dumps(payload).encode("utf-8")
         req_headers = {
             "Accept": "application/json",
+             "User-Agent": "SysvarHub/1.0",
         }
         if body is not None:
             req_headers["Content-Type"] = "application/json"
