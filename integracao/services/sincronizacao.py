@@ -39,7 +39,10 @@ def executar_sincronizacao_comando(hub, comando, client=None):
         defaults={"tipo": comando.get("tipo") or "COMPLETA"},
     )
     if sincronizacao.status == SincronizacaoRecebidaHub.STATUS_CONCLUIDA:
-        _informar(client, hub, sincronizacao, SincronizacaoRecebidaHub.STATUS_CONCLUIDA)
+        try:
+            _informar(client, hub, sincronizacao, SincronizacaoRecebidaHub.STATUS_CONCLUIDA)
+        except RetaguardaError:
+            logger.warning("Falha ao reenviar conclusão da sincronização à Central.", exc_info=True)
         return sincronizacao
     if sincronizacao.status == SincronizacaoRecebidaHub.STATUS_ERRO:
         _informar(client, hub, sincronizacao, SincronizacaoRecebidaHub.STATUS_ERRO, sincronizacao.mensagem_erro)
@@ -57,7 +60,10 @@ def executar_sincronizacao_comando(hub, comando, client=None):
             else:
                 funcao(hub, resposta)
         _marcar_concluida(hub, sincronizacao)
-        _informar(client, hub, sincronizacao, SincronizacaoRecebidaHub.STATUS_CONCLUIDA)
+        try:
+            _informar(client, hub, sincronizacao, SincronizacaoRecebidaHub.STATUS_CONCLUIDA)
+        except RetaguardaError:
+            logger.warning("Carga concluída localmente, mas falhou ao informar conclusão à Central.", exc_info=True)
         return sincronizacao
     except Exception as exc:
         mensagem = _mensagem_controlada(exc)
