@@ -270,6 +270,38 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
             self.gerar_nfce(outra, codigo_numerico="66666666")
         self.assertEqual(ctx.exception.codigo, "PAGAMENTO_TPAG_AMBIGUO")
 
+    def test_nfce_rejeita_codigo_municipio_ibge_ausente(self):
+        venda = self.venda_finalizada()
+        self.config.codigo_municipio_ibge = ""
+        self.config.save(update_fields=["codigo_municipio_ibge"])
+
+        with self.assertRaises(NFCeErroDominio) as ctx:
+            self.gerar_nfce(venda, codigo_numerico="77777777")
+
+        self.assertEqual(ctx.exception.codigo, "MUNICIPIO_IBGE_AUSENTE")
+
+    def test_nfce_rejeita_codigo_municipio_ibge_invalido(self):
+        venda = self.venda_finalizada()
+        self.config.codigo_municipio_ibge = "355A308"
+        self.config.save(update_fields=["codigo_municipio_ibge"])
+
+        with self.assertRaises(NFCeErroDominio) as ctx:
+            self.gerar_nfce(venda, codigo_numerico="88888888")
+
+        self.assertEqual(ctx.exception.codigo, "MUNICIPIO_IBGE_INVALIDO")
+
+    def test_nfce_aceita_codigo_municipio_ibge_valido(self):
+        venda = self.venda_finalizada()
+        self.config.codigo_municipio_ibge = "3550308"
+        self.config.save(update_fields=["codigo_municipio_ibge"])
+
+        nfce = self.gerar_nfce(venda, codigo_numerico="99999999")
+
+        root = ET.fromstring(nfce.xml_assinado)
+        ns = {"n": "http://www.portalfiscal.inf.br/nfe"}
+        self.assertEqual(root.find("n:infNFe/n:ide/n:cMunFG", ns).text, "3550308")
+        self.assertEqual(root.find("n:infNFe/n:emit/n:enderEmit/n:cMun", ns).text, "3550308")
+
     def test_assinatura_falha_quando_inf_nfe_e_alterado(self):
         nfce = self.gerar_nfce(self.venda_finalizada())
         xml = nfce.xml_assinado.replace("<vNF>199.90</vNF>", "<vNF>198.90</vNF>", 1)

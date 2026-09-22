@@ -1,5 +1,6 @@
 from django.db import transaction
 from django.utils import timezone
+import re
 
 from core.models import CaixaHub, CashbackConfigHub, ConfiguracaoFiscalHub
 
@@ -178,6 +179,25 @@ def _validar_fiscal(fiscal):
     for campo in ("ambiente_fiscal", "regime_tributario", "razao_social", "cnpj"):
         if not isinstance(fiscal[campo], str) or not fiscal[campo].strip():
             raise BootstrapValidationError("Bootstrap retornou fiscal incompleto.")
+
+    codigo_municipio_ibge = fiscal.get("codigo_municipio_ibge")
+
+    if codigo_municipio_ibge is None:
+        codigo_preenchido = ""
+    elif not isinstance(codigo_municipio_ibge, str):
+        raise BootstrapValidationError(
+            "Bootstrap retornou fiscal.codigo_municipio_ibge inválido."
+         )
+    else:
+        codigo_preenchido = codigo_municipio_ibge.strip()
+
+
+    if fiscal["emite_nfce"] is True and not codigo_preenchido:
+        raise BootstrapValidationError(
+            "Bootstrap retornou fiscal.codigo_municipio_ibge ausente para NFC-e."
+        )
+    if codigo_preenchido and not re.fullmatch(r"\d{7}", codigo_preenchido):
+        raise BootstrapValidationError("Bootstrap retornou fiscal.codigo_municipio_ibge inválido.")
 
 
 def _sincronizar_cashback(hub, config, sincronizado_em):

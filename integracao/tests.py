@@ -838,6 +838,32 @@ class BootstrapHubServiceTests(TestCase):
         self.assertEqual(fiscal.proximo_numero_nfce, 10)
         self.assertEqual(fiscal.codigo_municipio_ibge, "3550308")
 
+    def test_fiscal_nfce_desligada_aceita_codigo_municipio_ibge_vazio(self):
+        resposta = self.resposta()
+        resposta["loja"]["fiscal"] = self.fiscal(emite_nfce=False, codigo_municipio_ibge="")
+
+        sincronizar_bootstrap(self.hub, resposta)
+
+        fiscal = ConfiguracaoFiscalHub.objects.get(hub=self.hub)
+        self.assertFalse(fiscal.emite_nfce)
+        self.assertEqual(fiscal.codigo_municipio_ibge, "")
+
+    def test_fiscal_nfce_ligada_rejeita_codigo_municipio_ibge_ausente_ou_invalido(self):
+        casos = (
+            ("", "Bootstrap retornou fiscal.codigo_municipio_ibge ausente para NFC-e."),
+            (None, "Bootstrap retornou fiscal.codigo_municipio_ibge ausente para NFC-e."),
+            ("355030", "Bootstrap retornou fiscal.codigo_municipio_ibge inválido."),
+            ("35503088", "Bootstrap retornou fiscal.codigo_municipio_ibge inválido."),
+            ("355A308", "Bootstrap retornou fiscal.codigo_municipio_ibge inválido."),
+        )
+        for codigo, mensagem in casos:
+            resposta = self.resposta()
+            resposta["loja"]["fiscal"] = self.fiscal(codigo_municipio_ibge=codigo)
+
+            with self.assertRaises(BootstrapValidationError) as ctx:
+                sincronizar_bootstrap(self.hub, resposta)
+            self.assertEqual(str(ctx.exception), mensagem)
+
     def test_bootstrap_sem_fiscal_mantem_config_anterior(self):
         ConfiguracaoFiscalHub.objects.create(
             hub=self.hub,

@@ -613,6 +613,8 @@ def _validar_config_basica(config):
         raise NFCeErroDominio("IE_AUSENTE")
     if not (config.codigo_municipio_ibge or "").strip():
         raise NFCeErroDominio("MUNICIPIO_IBGE_AUSENTE")
+    if not re.fullmatch(r"\d{7}", (config.codigo_municipio_ibge or "").strip()):
+        raise NFCeErroDominio("MUNICIPIO_IBGE_INVALIDO")
     if int(config.serie_nfce or 0) <= 0:
         raise NFCeErroDominio("SERIE_INVALIDA")
     if config.uf not in UF_CODIGOS:
