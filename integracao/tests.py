@@ -1601,6 +1601,8 @@ class FormasPagamentoHubServiceTests(TestCase):
             "ativo": True,
             "prazo_pagamento": None,
             "adquirente": None,
+            "adquirente_id": None,
+            "condicao_adquirente_id": None,
             "conta_liquidacao_id": None,
             "gera_recebivel_bancario": False,
             "prazo_credito_dias": 0,
@@ -1673,6 +1675,33 @@ class FormasPagamentoHubServiceTests(TestCase):
         forma = FormaPagamentoHub.objects.get()
         self.assertEqual(forma.codigo, "DIN")
         self.assertEqual(forma.tipo, "DINHEIRO")
+
+    def test_forma_aceita_payload_atual_do_central(self):
+        forma_payload = self.forma(
+            num_parcelas=None,
+            prazo_pagamento=self.prazo(num_parcelas=2),
+            adquirente="Rede",
+            adquirente_id=3,
+            condicao_adquirente_id=9,
+            taxa_percentual="2.5000",
+            taxa_fixa="1.20",
+            parcelas=[
+                {"ordem": 1, "dias": 30, "percentual": "50.000000"},
+                {"ordem": 2, "dias": 60, "percentual": "50.000000"},
+            ],
+        )
+        forma_payload.pop("num_parcelas")
+
+        sincronizar_formas_pagamento(self.hub, self.resposta([forma_payload]))
+
+        forma = FormaPagamentoHub.objects.get()
+        self.assertEqual(forma.num_parcelas, 2)
+        self.assertEqual(forma.adquirente_retaguarda_id, 3)
+        self.assertEqual(forma.condicao_adquirente_retaguarda_id, 9)
+        self.assertEqual(FormaPagamentoParcelaHub.objects.get(ordem=1).valor_fixo, None)
+
+    def test_tipo_legado_rejeitado(self):
+        self.assert_rejeita(self.resposta([self.forma(tipo="VOUCHER")]))
 
     def test_segunda_sincronizacao_atualiza_sem_duplicar(self):
         sincronizar_formas_pagamento(self.hub, self.resposta())

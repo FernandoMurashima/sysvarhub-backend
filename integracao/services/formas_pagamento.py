@@ -9,6 +9,15 @@ from core.models import FormaPagamentoFiscalMapHub, FormaPagamentoHub, FormaPaga
 
 
 FORMAS_PAGAMENTO_VERSOES_SUPORTADAS = {1}
+TIPOS_FORMA_PAGAMENTO_SUPORTADOS = {
+    "DINHEIRO",
+    "PIX",
+    "DEBITO",
+    "CREDITO",
+    "BOLETO",
+    "TRANSFERENCIA",
+    "OUTRO",
+}
 
 
 class FormasPagamentoValidationError(Exception):
@@ -193,10 +202,11 @@ def _validar_forma(item):
             "codigo",
             "descricao",
             "tipo",
-            "num_parcelas",
             "ativo",
             "prazo_pagamento",
             "adquirente",
+            "adquirente_id",
+            "condicao_adquirente_id",
             "conta_liquidacao_id",
             "gera_recebivel_bancario",
             "prazo_credito_dias",
@@ -208,7 +218,13 @@ def _validar_forma(item):
             "tef_terminal_logico",
             "parcelas",
         ),
-        permitir_nulos={"prazo_pagamento", "adquirente", "conta_liquidacao_id"},
+        permitir_nulos={
+            "prazo_pagamento",
+            "adquirente",
+            "adquirente_id",
+            "condicao_adquirente_id",
+            "conta_liquidacao_id",
+        },
         permitir_vazios={
             "tef_modalidade",
             "tef_adquirente_codigo",
@@ -225,6 +241,10 @@ def _validar_forma(item):
         raise FormasPagamentoValidationError("Formas de pagamento retornou parcelas inválidas.")
 
     prazo = _validar_prazo(item["prazo_pagamento"])
+    tipo = _texto_obrigatorio(item["tipo"], "tipo", max_length=24)
+    if tipo not in TIPOS_FORMA_PAGAMENTO_SUPORTADOS:
+        raise FormasPagamentoValidationError("Formas de pagamento retornou tipo inválido.")
+    num_parcelas = _num_parcelas_forma(item, prazo)
     parcelas = []
     ordens = set()
     for parcela in item["parcelas"]:
@@ -238,8 +258,8 @@ def _validar_forma(item):
         "retaguarda_id": _inteiro_positivo(item["id"], "id"),
         "codigo": _texto_obrigatorio(item["codigo"], "codigo", max_length=10),
         "descricao": _texto_obrigatorio(item["descricao"], "descricao", max_length=120),
-        "tipo": _texto_obrigatorio(item["tipo"], "tipo", max_length=24),
-        "num_parcelas": _inteiro_positivo(item["num_parcelas"], "num_parcelas"),
+        "tipo": tipo,
+        "num_parcelas": num_parcelas,
         "ativo": item["ativo"],
         "prazo_retaguarda_id": prazo["id"] if prazo else None,
         "prazo_codigo": prazo["codigo"] if prazo else "",
@@ -247,6 +267,11 @@ def _validar_forma(item):
         "prazo_num_parcelas": prazo["num_parcelas"] if prazo else None,
         "prazo_intervalo_dias": prazo["intervalo_dias"] if prazo else None,
         "adquirente": _texto_opcional(item["adquirente"], "adquirente", max_length=80),
+        "adquirente_retaguarda_id": _inteiro_positivo_opcional(item["adquirente_id"], "adquirente_id"),
+        "condicao_adquirente_retaguarda_id": _inteiro_positivo_opcional(
+            item["condicao_adquirente_id"],
+            "condicao_adquirente_id",
+        ),
         "conta_liquidacao_retaguarda_id": _inteiro_positivo_opcional(
             item["conta_liquidacao_id"],
             "conta_liquidacao_id",
@@ -283,15 +308,23 @@ def _validar_parcela(parcela):
         raise FormasPagamentoValidationError("Formas de pagamento retornou parcela inválida.")
     _exigir_campos(
         parcela,
-        ("ordem", "dias", "percentual", "valor_fixo"),
-        permitir_nulos={"percentual", "valor_fixo"},
+        ("ordem", "dias", "percentual"),
+        permitir_nulos={"percentual"},
     )
     return {
         "ordem": _inteiro_positivo(parcela["ordem"], "parcela.ordem"),
         "dias": _inteiro_nao_negativo(parcela["dias"], "parcela.dias"),
         "percentual": _decimal_string_opcional(parcela["percentual"], "parcela.percentual", 6),
-        "valor_fixo": _decimal_string_opcional(parcela["valor_fixo"], "parcela.valor_fixo", 2),
+        "valor_fixo": _decimal_string_opcional(parcela.get("valor_fixo"), "parcela.valor_fixo", 2),
     }
+
+
+def _num_parcelas_forma(item, prazo):
+    if prazo:
+        return prazo["num_parcelas"]
+    if "num_parcelas" in item and item["num_parcelas"] is not None:
+        return _inteiro_positivo(item["num_parcelas"], "num_parcelas")
+    return 1
 
 
 def _validar_mapa_fiscal(item):

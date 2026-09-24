@@ -439,6 +439,8 @@ class FormaPagamentoHub(models.Model):
     prazo_intervalo_dias = models.PositiveIntegerField(null=True, blank=True)
 
     adquirente = models.CharField(max_length=80, null=True, blank=True)
+    adquirente_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    condicao_adquirente_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
     conta_liquidacao_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
     gera_recebivel_bancario = models.BooleanField(default=False)
     prazo_credito_dias = models.PositiveIntegerField(default=0)
