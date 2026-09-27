@@ -1,4 +1,6 @@
 import os
+import socket
+import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -663,27 +665,87 @@ class WindowsInstallerReinstallTests(SimpleTestCase):
 
 
 class WindowsServiceLifecycleTests(SimpleTestCase):
+    def _wsgi_app(self):
+        def app(environ, start_response):
+            body = b"ok"
+            start_response("200 OK", [("Content-Length", str(len(body)))])
+            return [body]
+
+        return app
+
+    def _porta_livre(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        return port
+
+    def _worker_fake(self, stop_event):
+        thread = threading.Thread(target=stop_event.wait, name="SyncWorkerTeste")
+        thread.start()
+        return Mock(), thread
+
     def test_runtime_armazena_servidor_controlavel(self):
         server = Mock()
         runtime = HubWaitressRuntime(application_factory=Mock(return_value=object()), server_factory=Mock(return_value=server))
 
-        with patch("runtime.windows_service.bootstrap"), patch("django.setup"):
+        with patch("runtime.windows_service.bootstrap"), patch("django.setup"), \
+                patch("runtime.sync_worker.start_worker_thread", side_effect=self._worker_fake):
             runtime.run()
 
         server.run.assert_called_once()
         server.close.assert_called_once()
         self.assertIsNone(runtime.server)
+        self.assertTrue(runtime.stopped_event.is_set())
 
-    def test_stop_encerra_dispatcher_e_waitress(self):
+    def test_stop_encerra_dispatcher_waitress_worker_e_e_idempotente(self):
         server = Mock()
-        runtime = HubWaitressRuntime()
+        stop_event = threading.Event()
+        worker_thread = threading.Thread(target=stop_event.wait, name="SyncWorkerTeste")
+        worker_thread.start()
+        runtime = HubWaitressRuntime(shutdown_timeout=1)
         runtime.server = server
+        runtime.worker_stop_event = stop_event
+        runtime.worker_thread = worker_thread
 
         runtime.stop()
+        runtime.stop()
 
-        server.task_dispatcher.shutdown.assert_called_once()
+        server.task_dispatcher.shutdown.assert_called_once_with(timeout=1)
         server.close.assert_called_once()
         self.assertIsNone(runtime.server)
+        self.assertIsNone(runtime.worker_thread)
+        self.assertFalse(worker_thread.is_alive())
+
+    def test_runtime_waitress_real_para_thread_e_libera_porta(self):
+        port = self._porta_livre()
+        runtime = HubWaitressRuntime(application_factory=self._wsgi_app, shutdown_timeout=2)
+
+        with patch.dict(os.environ, {"HUB_BIND_HOST": "127.0.0.1", "HUB_PORT": str(port)}), \
+                patch("runtime.windows_service.bootstrap"), patch("django.setup"), \
+                patch("runtime.sync_worker.start_worker_thread", side_effect=self._worker_fake):
+            runtime.start()
+            self.assertTrue(runtime.wait_started(timeout=3))
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                pass
+            runtime.stop()
+            self.assertTrue(runtime.join(timeout=3))
+
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", port), timeout=0.3)
+
+    def test_runtime_waitress_real_pode_iniciar_parar_e_reiniciar(self):
+        port = self._porta_livre()
+
+        for _ in range(2):
+            runtime = HubWaitressRuntime(application_factory=self._wsgi_app, shutdown_timeout=2)
+            with patch.dict(os.environ, {"HUB_BIND_HOST": "127.0.0.1", "HUB_PORT": str(port)}), \
+                    patch("runtime.windows_service.bootstrap"), patch("django.setup"), \
+                    patch("runtime.sync_worker.start_worker_thread", side_effect=self._worker_fake):
+                runtime.start()
+                self.assertTrue(runtime.wait_started(timeout=3))
+                runtime.stop()
+                self.assertTrue(runtime.join(timeout=3))
 
     def test_stop_runtime_ignora_runtime_ausente(self):
         stop_runtime(None)

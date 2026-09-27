@@ -15,13 +15,44 @@ def bootstrap():
 
 
 class HubWaitressRuntime:
-    def __init__(self, application_factory=None, server_factory=None):
+    def __init__(self, application_factory=None, server_factory=None, shutdown_timeout=10):
         self.application_factory = application_factory
         self.server_factory = server_factory
+        self.shutdown_timeout = shutdown_timeout
         self.server = None
         self.worker_stop_event = threading.Event()
         self.worker_thread = None
+        self.runtime_thread = None
+        self.runtime_error = None
+        self.ready_event = threading.Event()
+        self.stopped_event = threading.Event()
+        self.stop_requested = threading.Event()
         self._lock = threading.RLock()
+
+    def start(self):
+        with self._lock:
+            if self.runtime_thread and self.runtime_thread.is_alive():
+                return self.runtime_thread
+            self.ready_event.clear()
+            self.stopped_event.clear()
+            self.stop_requested.clear()
+            self.worker_stop_event.clear()
+            self.runtime_error = None
+            self.runtime_thread = threading.Thread(
+                target=self._run_guarded,
+                name="SysvarHubWaitressRuntime",
+                daemon=False,
+            )
+            self.runtime_thread.start()
+            return self.runtime_thread
+
+    def _run_guarded(self):
+        try:
+            self.run()
+        except Exception as exc:
+            self.runtime_error = exc
+            self.stopped_event.set()
+            LOGGER.exception("Runtime do Sysvar Hub falhou.")
 
     def run(self):
         bootstrap()
@@ -42,17 +73,27 @@ class HubWaitressRuntime:
 
         with self._lock:
             self.server = server
+            if self.stop_requested.is_set():
+                LOGGER.info("Parada solicitada antes do inicio do Waitress.")
+                _shutdown_waitress_server(server)
+                self.server = None
+                self.stopped_event.set()
+                return
             if self.worker_thread is None:
                 _worker, self.worker_thread = start_worker_thread(
                     self.worker_stop_event
                 )
+            self.ready_event.set()
 
         try:
+            LOGGER.info("Waitress do Sysvar Hub iniciado em %s:%s.", host, port)
             server.run()
         finally:
             self.stop()
+            self.stopped_event.set()
 
     def stop(self):
+        self.stop_requested.set()
         self.worker_stop_event.set()
 
         with self._lock:
@@ -63,17 +104,72 @@ class HubWaitressRuntime:
 
         if server is None:
             if worker_thread is not None:
-                worker_thread.join(timeout=5)
+                _join_thread(worker_thread, self.shutdown_timeout, "SyncWorker")
             return
 
-        dispatcher = getattr(server, "task_dispatcher", None)
-        if dispatcher is not None:
-            dispatcher.shutdown()
-
-        server.close()
+        LOGGER.info("Encerrando Waitress do Sysvar Hub.")
+        _shutdown_waitress_server(server, timeout=self.shutdown_timeout)
 
         if worker_thread is not None:
-            worker_thread.join(timeout=5)
+            LOGGER.info("Encerrando SyncWorker do Sysvar Hub.")
+            _join_thread(worker_thread, self.shutdown_timeout, "SyncWorker")
+        LOGGER.info("Runtime do Sysvar Hub encerrado.")
+
+    def wait_started(self, timeout=None):
+        return self.ready_event.wait(timeout)
+
+    def wait_stopped(self, timeout=None):
+        return self.stopped_event.wait(timeout)
+
+    def join(self, timeout=None):
+        thread = self.runtime_thread
+        if thread is not None:
+            thread.join(timeout)
+            return not thread.is_alive()
+        return True
+
+
+def _join_thread(thread, timeout, component_name):
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        LOGGER.warning("%s nao encerrou dentro de %.1f segundo(s).", component_name, timeout)
+        return False
+    return True
+
+
+def _shutdown_waitress_server(server, timeout=10):
+    # Waitress 3.0.2: BaseWSGIServer.close() fecha listener/trigger, mas nao
+    # fecha canais keep-alive no mapa. Fechamos o mapa inteiro para acordar
+    # asyncore.loop() e liberar a porta de forma previsivel no servico Windows.
+    try:
+        server.accepting = False
+    except Exception:
+        LOGGER.debug("Nao foi possivel desabilitar accept do Waitress.", exc_info=True)
+
+    try:
+        server.close()
+    except Exception:
+        LOGGER.warning("Falha ao fechar socket principal do Waitress.", exc_info=True)
+
+    server_map = getattr(server, "_map", None) or getattr(server, "map", None)
+    asyncore_module = getattr(server, "asyncore", None)
+    if server_map is not None and asyncore_module is not None and hasattr(asyncore_module, "close_all"):
+        try:
+            asyncore_module.close_all(server_map)
+        except Exception:
+            LOGGER.warning("Falha ao fechar canais ativos do Waitress.", exc_info=True)
+
+    trigger = getattr(server, "trigger", None)
+    if trigger is not None and hasattr(server, "pull_trigger"):
+        try:
+            server.pull_trigger()
+        except Exception:
+            LOGGER.debug("Trigger do Waitress ja estava fechado.", exc_info=True)
+
+    dispatcher = getattr(server, "task_dispatcher", None)
+    if dispatcher is not None:
+        LOGGER.info("Encerrando task dispatcher do Waitress.")
+        dispatcher.shutdown(timeout=timeout)
 
 
 def run_console(runtime=None):
@@ -127,8 +223,8 @@ if win32serviceutil is not None:
             self.runtime = HubWaitressRuntime()
 
         def SvcStop(self):
+            servicemanager.LogInfoMsg("Sysvar Hub recebeu solicitacao de parada.")
             self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
-            stop_runtime(self.runtime)
             win32event.SetEvent(self.stop_event)
 
         def SvcDoRun(self):
@@ -136,7 +232,19 @@ if win32serviceutil is not None:
             servicemanager.LogInfoMsg("Sysvar Hub iniciando.")
 
             try:
-                run_console(self.runtime)
+                self.runtime.start()
+                self.runtime.wait_started(timeout=30)
+                while True:
+                    result = win32event.WaitForSingleObject(self.stop_event, 5000)
+                    if result == win32event.WAIT_OBJECT_0:
+                        break
+                    if self.runtime.stopped_event.is_set():
+                        if self.runtime.runtime_error is not None:
+                            raise self.runtime.runtime_error
+                        break
+                servicemanager.LogInfoMsg("Sysvar Hub encerrando runtime.")
+                stop_runtime(self.runtime)
+                self.runtime.join(timeout=30)
             except Exception as exc:
                 servicemanager.LogErrorMsg(f"Sysvar Hub falhou: {exc}")
                 raise
