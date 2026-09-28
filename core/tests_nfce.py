@@ -87,7 +87,9 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
     def setUp(self):
         super().setUp()
         self.catalogo_item.fiscal = FISCAL_ITEM.copy()
-        self.catalogo_item.save(update_fields=["fiscal"])
+        self.catalogo_item.estoque_fisico = Decimal("50.000")
+        self.catalogo_item.estoque_disponivel = Decimal("50.000")
+        self.catalogo_item.save(update_fields=["fiscal", "estoque_fisico", "estoque_disponivel"])
         self.config = ConfiguracaoFiscalHub.objects.create(
             hub=self.hub,
             emite_nfce=True,
@@ -108,24 +110,28 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
             codigo_municipio_ibge="3550308",
             sincronizado_em=timezone.now(),
         )
-        FormaPagamentoFiscalMapHub.objects.create(
-            hub=self.hub,
-            forma_pagamento_retaguarda_id=self.dinheiro.retaguarda_id,
-            codigo_tpag="01",
-            descricao_fiscal="Dinheiro",
-            sincronizado_em=timezone.now(),
-        )
         self.material = material_teste()
         self.qr = ConfigQRCodeDesenvolvimento(
             url_qrcode="https://sefaz.test/qrcode",
             url_chave="https://sefaz.test/consulta",
         )
 
-    def venda_finalizada(self, valor_pagamento="199.90"):
+    def venda_finalizada(self, valor_pagamento="199.90", forma=None):
         self.config.emite_nfce = False
         self.config.save(update_fields=["emite_nfce"])
         venda_uuid = self.criar_venda_com_item()
-        self.pagar(venda_uuid, self.dinheiro, valor=valor_pagamento)
+        self.pagar(venda_uuid, forma or self.dinheiro, valor=valor_pagamento)
+        self.finalizar(venda_uuid)
+        self.config.emite_nfce = True
+        self.config.save(update_fields=["emite_nfce"])
+        return VendaHub.objects.get(venda_uuid=venda_uuid)
+
+    def venda_finalizada_com_pagamentos(self, pagamentos):
+        self.config.emite_nfce = False
+        self.config.save(update_fields=["emite_nfce"])
+        venda_uuid = self.criar_venda_com_item()
+        for forma, valor in pagamentos:
+            self.pagar(venda_uuid, forma, valor=valor)
         self.finalizar(venda_uuid)
         self.config.emite_nfce = True
         self.config.save(update_fields=["emite_nfce"])
@@ -133,6 +139,11 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
 
     def gerar_nfce(self, venda, codigo_numerico="12345678"):
         return gerar_nfce_local(venda, material_assinatura=self.material, qr_config=self.qr, codigo_numerico=codigo_numerico)
+
+    def tpag_do_xml(self, nfce):
+        root = ET.fromstring(nfce.xml_assinado)
+        ns = {"n": "http://www.portalfiscal.inf.br/nfe"}
+        return [node.text for node in root.findall("n:infNFe/n:pag/n:detPag/n:tPag", ns)]
 
     def ajustar_venda_item(self, venda, *, preco="100.0000", desconto="0.00", fiscal=None):
         item = VendaItemHub.objects.get(venda=venda)
@@ -220,6 +231,74 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
         self.assertNotIn("PRIVATE KEY", nfce.xml_assinado)
         self.assertTrue(verificar_assinatura_nfce(nfce.xml_assinado))
 
+    def test_tpag_usa_tipo_da_forma_sem_mapa_fiscal(self):
+        cenarios = [
+            ("DIN", "DINHEIRO", "01"),
+            ("CRE", "CREDITO", "03"),
+            ("DEB", "DEBITO", "04"),
+            ("PIX2", "PIX", "17"),
+            ("BOL", "BOLETO", "15"),
+            ("TRA", "TRANSFERENCIA", "18"),
+            ("OUT", "OUTRO", "99"),
+        ]
+
+        for indice, (codigo, tipo, tpag) in enumerate(cenarios):
+            with self.subTest(tipo=tipo):
+                forma = self.dinheiro if tipo == "DINHEIRO" else self.criar_forma(codigo, tipo)
+                venda = self.venda_finalizada(forma=forma)
+                nfce = self.gerar_nfce(venda, codigo_numerico=f"{indice + 1:08d}")
+
+                self.assertEqual(self.tpag_do_xml(nfce), [tpag])
+
+    def test_duas_formas_credito_usam_tpag_credito(self):
+        credito_a = self.criar_forma("CR1", "CREDITO")
+        credito_b = self.criar_forma("CR2", "CREDITO")
+
+        nfce_a = self.gerar_nfce(self.venda_finalizada(forma=credito_a), codigo_numerico="11111111")
+        nfce_b = self.gerar_nfce(self.venda_finalizada(forma=credito_b), codigo_numerico="22222222")
+
+        self.assertEqual(self.tpag_do_xml(nfce_a), ["03"])
+        self.assertEqual(self.tpag_do_xml(nfce_b), ["03"])
+
+    def test_mapa_fiscal_ausente_ou_ambiguo_nao_afeta_tpag_quando_tipo_valido(self):
+        FormaPagamentoFiscalMapHub.objects.create(
+            hub=self.hub,
+            forma_pagamento_retaguarda_id=self.dinheiro.retaguarda_id,
+            codigo_tpag="01",
+            descricao_fiscal="Dinheiro",
+            sincronizado_em=timezone.now(),
+        )
+        FormaPagamentoFiscalMapHub.objects.create(
+            hub=self.hub,
+            forma_pagamento_retaguarda_id=self.dinheiro.retaguarda_id,
+            codigo_tpag="17",
+            descricao_fiscal="PIX",
+            sincronizado_em=timezone.now(),
+        )
+
+        nfce = self.gerar_nfce(self.venda_finalizada(), codigo_numerico="33333333")
+
+        self.assertEqual(self.tpag_do_xml(nfce), ["01"])
+
+    def test_tipo_invalido_gera_erro_controlado_tpag(self):
+        forma = self.criar_forma("INV", "VOUCHER")
+        venda = self.venda_finalizada(forma=forma)
+
+        with self.assertRaises(NFCeErroDominio) as ctx:
+            self.gerar_nfce(venda, codigo_numerico="44444444")
+
+        self.assertEqual(ctx.exception.codigo, "PAGAMENTO_TIPO_SEM_TPAG")
+
+    def test_multiplos_pagamentos_geram_detpag_por_tipo(self):
+        venda = self.venda_finalizada_com_pagamentos([
+            (self.dinheiro, "100.00"),
+            (self.pix, "99.90"),
+        ])
+
+        nfce = self.gerar_nfce(venda, codigo_numerico="55555555")
+
+        self.assertEqual(self.tpag_do_xml(nfce), ["01", "17"])
+
     def test_segunda_venda_usa_proximo_numero(self):
         primeira = self.venda_finalizada()
         self.gerar_nfce(primeira, codigo_numerico="11111111")
@@ -230,18 +309,20 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
 
     def test_erro_apos_reserva_nao_reutiliza_numero(self):
         venda = self.venda_finalizada()
-        FormaPagamentoFiscalMapHub.objects.filter(hub=self.hub).delete()
+        pagamento = venda.pagamentos.get(status="ATIVO")
+        pagamento.forma_pagamento.tipo = "VOUCHER"
+        pagamento.forma_pagamento.save(update_fields=["tipo"])
 
         with self.assertRaises(NFCeErroDominio) as ctx:
-            self.gerar_nfce(venda, codigo_numerico="33333333")
+            self.gerar_nfce(venda, codigo_numerico="66666666")
 
-        self.assertEqual(ctx.exception.codigo, "PAGAMENTO_SEM_TPAG")
+        self.assertEqual(ctx.exception.codigo, "PAGAMENTO_TIPO_SEM_TPAG")
         nfce = NFCeHub.objects.get(venda=venda)
         self.assertEqual(nfce.status, NFCeHub.STATUS_ERRO_GERACAO)
         self.config.refresh_from_db()
         self.assertEqual(self.config.proximo_numero_nfce, 11)
 
-    def test_erros_controlados_config_desabilitada_produto_incompleto_e_tpag_ambiguo(self):
+    def test_erros_controlados_config_desabilitada_e_produto_incompleto(self):
         venda = self.venda_finalizada()
         self.config.emite_nfce = False
         self.config.save(update_fields=["emite_nfce"])
@@ -257,18 +338,6 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
         with self.assertRaises(NFCeErroDominio) as ctx:
             self.gerar_nfce(venda, codigo_numerico="55555555")
         self.assertEqual(ctx.exception.codigo, "PRODUTO_SEM_NCM")
-
-        outra = self.venda_finalizada()
-        FormaPagamentoFiscalMapHub.objects.create(
-            hub=self.hub,
-            forma_pagamento_retaguarda_id=self.dinheiro.retaguarda_id,
-            codigo_tpag="17",
-            descricao_fiscal="PIX",
-            sincronizado_em=timezone.now(),
-        )
-        with self.assertRaises(NFCeErroDominio) as ctx:
-            self.gerar_nfce(outra, codigo_numerico="66666666")
-        self.assertEqual(ctx.exception.codigo, "PAGAMENTO_TPAG_AMBIGUO")
 
     def test_nfce_rejeita_codigo_municipio_ibge_ausente(self):
         venda = self.venda_finalizada()

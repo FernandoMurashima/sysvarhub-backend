@@ -17,7 +17,6 @@ from django.utils import timezone
 
 from core.models import (
     ConfiguracaoFiscalHub,
-    FormaPagamentoFiscalMapHub,
     NFCeHub,
     VendaHub,
     VendaItemHub,
@@ -41,6 +40,16 @@ UF_CODIGOS = {
     "SC": "42", "RS": "43", "MS": "50", "MT": "51", "GO": "52", "DF": "53",
 }
 
+TPAG_POR_TIPO_FORMA_PAGAMENTO = {
+    "DINHEIRO": "01",
+    "CREDITO": "03",
+    "DEBITO": "04",
+    "PIX": "17",
+    "BOLETO": "15",
+    "TRANSFERENCIA": "18",
+    "OUTRO": "99",
+}
+
 
 class NFCeErroDominio(Exception):
     def __init__(self, codigo, mensagem=None):
@@ -50,6 +59,14 @@ class NFCeErroDominio(Exception):
 
 class NFCeConfiguracaoErro(NFCeErroDominio):
     pass
+
+
+def _tpag_pagamento(pagamento):
+    tipo = str(pagamento.forma_pagamento.tipo or "").strip().upper()
+    codigo_tpag = TPAG_POR_TIPO_FORMA_PAGAMENTO.get(tipo)
+    if not codigo_tpag:
+        raise NFCeErroDominio("PAGAMENTO_TIPO_SEM_TPAG")
+    return codigo_tpag
 
 
 @dataclass(frozen=True)
@@ -723,16 +740,7 @@ def _validar_conteudo_nfce(venda, config):
         _montar_pis(imposto, fiscal, v_bc)
         _montar_cofins(imposto, fiscal, v_bc)
     for pagamento in pagamentos:
-        mapas = list(
-            FormaPagamentoFiscalMapHub.objects.filter(
-                hub=venda.hub,
-                forma_pagamento_retaguarda_id=pagamento.retaguarda_forma_pagamento_id,
-            ).order_by("codigo_tpag")
-        )
-        if not mapas:
-            raise NFCeErroDominio("PAGAMENTO_SEM_TPAG")
-        if len(mapas) > 1:
-            raise NFCeErroDominio("PAGAMENTO_TPAG_AMBIGUO")
+        _tpag_pagamento(pagamento)
 
 
 def _montar_ide(inf, nfce, config):
@@ -953,18 +961,8 @@ def _montar_total(inf, venda, totais):
 def _montar_pag(inf, pagamentos, hub, venda):
     pag = ET.SubElement(inf, q("pag"))
     for pagamento in pagamentos:
-        mapas = list(
-            FormaPagamentoFiscalMapHub.objects.filter(
-                hub=hub,
-                forma_pagamento_retaguarda_id=pagamento.retaguarda_forma_pagamento_id,
-            ).order_by("codigo_tpag")
-        )
-        if not mapas:
-            raise NFCeErroDominio("PAGAMENTO_SEM_TPAG")
-        if len(mapas) > 1:
-            raise NFCeErroDominio("PAGAMENTO_TPAG_AMBIGUO")
         det = ET.SubElement(pag, q("detPag"))
-        det.append(_el("tPag", mapas[0].codigo_tpag))
+        det.append(_el("tPag", _tpag_pagamento(pagamento)))
         det.append(_el("vPag", dec(pagamento.valor, 2)))
     if Decimal(venda.troco or 0) > Decimal("0"):
         pag.append(_el("vTroco", dec(venda.troco, 2)))
