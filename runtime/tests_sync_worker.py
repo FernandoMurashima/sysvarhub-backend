@@ -32,23 +32,29 @@ class SyncWorkerTests(unittest.TestCase):
         client_factory.assert_not_called()
 
     @patch("runtime.sync_worker.HubConfig")
+    @patch("runtime.sync_worker.montar_snapshot_operacional")
     @patch("runtime.sync_worker.executar_sincronizacao_comando")
-    def test_hub_ativado_envia_heartbeat(self, executar, hub_config):
+    def test_hub_ativado_envia_heartbeat(self, executar, montar_snapshot, hub_config):
         hub = self._hub()
         hub_config.objects.first.return_value = hub
+        montar_snapshot.return_value = {"terminais": []}
         client = Mock()
         client.heartbeat.return_value = {"comando_sincronizacao": None}
 
         SyncWorker(client_factory=Mock(return_value=client)).executar_ciclo()
 
         client.heartbeat.assert_called_once()
+        self.assertEqual(client.heartbeat.call_args.kwargs["snapshot_operacional"], {"terminais": []})
+        montar_snapshot.assert_called_once_with(hub)
         executar.assert_not_called()
 
     @patch("runtime.sync_worker.HubConfig")
+    @patch("runtime.sync_worker.montar_snapshot_operacional")
     @patch("runtime.sync_worker.executar_sincronizacao_comando")
-    def test_heartbeat_com_comando_chama_orquestrador(self, executar, hub_config):
+    def test_heartbeat_com_comando_chama_orquestrador(self, executar, montar_snapshot, hub_config):
         hub = self._hub()
         hub_config.objects.first.return_value = hub
+        montar_snapshot.return_value = {"terminais": []}
         client = Mock()
         comando = {"id": 1}
         client.heartbeat.return_value = {"comando_sincronizacao": comando}
@@ -58,8 +64,10 @@ class SyncWorkerTests(unittest.TestCase):
         executar.assert_called_once_with(hub, comando, client=client)
 
     @patch("runtime.sync_worker.HubConfig")
-    def test_erro_retaguarda_no_heartbeat_nao_morre(self, hub_config):
+    @patch("runtime.sync_worker.montar_snapshot_operacional")
+    def test_erro_retaguarda_no_heartbeat_nao_morre(self, montar_snapshot, hub_config):
         hub_config.objects.first.return_value = self._hub()
+        montar_snapshot.return_value = {"terminais": []}
         client = Mock()
         client.heartbeat.side_effect = RetaguardaError("offline")
 

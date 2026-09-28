@@ -5,6 +5,7 @@ import threading
 from django.utils import timezone
 
 from core.models import HubConfig
+from core.services.snapshot_operacional import montar_snapshot_operacional
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 from integracao.services.sincronizacao import executar_sincronizacao_comando
 from sysvarhub.version import VERSION
@@ -37,6 +38,7 @@ class SyncWorker:
                 token=hub.retaguarda_token,
                 hostname=socket.gethostname(),
                 versao=VERSION,
+                snapshot_operacional=montar_snapshot_operacional(hub),
             )
         except RetaguardaError:
             logger.warning("Heartbeat do Hub falhou.", exc_info=True)

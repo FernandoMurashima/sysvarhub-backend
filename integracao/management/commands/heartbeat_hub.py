@@ -4,6 +4,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
 from core.models import HubConfig
+from core.services.snapshot_operacional import montar_snapshot_operacional
 from integracao.services.sincronizacao import executar_sincronizacao_comando
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 from sysvarhub.version import VERSION
@@ -21,6 +22,7 @@ class Command(BaseCommand):
                 token=hub.retaguarda_token,
                 hostname=socket.gethostname(),
                 versao=VERSION,
+                snapshot_operacional=montar_snapshot_operacional(hub),
             )
         except RetaguardaError as exc:
             raise CommandError(str(exc)) from exc

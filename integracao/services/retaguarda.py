@@ -38,13 +38,15 @@ class RetaguardaClient:
         }
         return self._post_json("api/hub/ativar/", payload)
 
-    def heartbeat(self, *, token, hostname, versao):
+    def heartbeat(self, *, token, hostname, versao, snapshot_operacional=None):
         if not token:
             raise RetaguardaError("Token da retaguarda não informado.")
         payload = {
             "hostname": hostname,
             "versao": versao,
         }
+        if snapshot_operacional is not None:
+            payload["snapshot_operacional"] = snapshot_operacional
         return self._post_json(
             "api/hub/heartbeat/",
             payload,
