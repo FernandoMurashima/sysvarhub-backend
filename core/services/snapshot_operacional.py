@@ -76,6 +76,10 @@ def _serializar_terminal_operacional(terminal, *, agora, caixa, sessoes_abertas_
 
 
 def _terminal_online(terminal, agora):
+    if not terminal.ativo:
+        return False
+    if not terminal.token_hash or not terminal.pareado_em:
+        return False
     if not terminal.ultima_conexao_em:
         return False
     return terminal.ultima_conexao_em >= agora - timedelta(seconds=TERMINAL_ONLINE_TTL_SECONDS)

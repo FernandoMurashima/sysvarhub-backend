@@ -1,9 +1,11 @@
+from datetime import timedelta
+
 from django.contrib.auth.hashers import make_password
 from django.test import TestCase
 from django.utils import timezone
 
 from core.models import CaixaHub, HubConfig, OperadorHub, SessaoCaixaHub, SessaoOperadorHub
-from core.services.snapshot_operacional import montar_snapshot_operacional
+from core.services.snapshot_operacional import TERMINAL_ONLINE_TTL_SECONDS, montar_snapshot_operacional
 from core.services.terminais import configurar_terminal
 
 
@@ -87,3 +89,50 @@ class SnapshotOperacionalTests(TestCase):
         status_por_codigo = {terminal["codigo"]: terminal["caixa_status"] for terminal in snapshot["terminais"]}
         self.assertEqual(status_por_codigo["BALCAO"], "SEM_CAIXA")
         self.assertEqual(status_por_codigo["PDV-02"], "CAIXA_NAO_ENCONTRADO")
+
+    def test_terminal_ativo_pareado_com_conexao_recente_fica_online(self):
+        snapshot = montar_snapshot_operacional(self.hub)
+
+        terminal = self._terminal_por_codigo(snapshot, "PDV-01")
+        self.assertTrue(terminal["online"])
+
+    def test_terminal_inativo_pareado_com_conexao_recente_fica_offline(self):
+        self.terminal.ativo = False
+        self.terminal.save(update_fields=["ativo", "atualizado_em"])
+
+        snapshot = montar_snapshot_operacional(self.hub)
+
+        terminal = self._terminal_por_codigo(snapshot, "PDV-01")
+        self.assertFalse(terminal["online"])
+
+    def test_terminal_ativo_nao_pareado_com_conexao_recente_fica_offline(self):
+        self.terminal.token_hash = ""
+        self.terminal.token_prefixo = ""
+        self.terminal.pareado_em = None
+        self.terminal.save(update_fields=["token_hash", "token_prefixo", "pareado_em", "atualizado_em"])
+
+        snapshot = montar_snapshot_operacional(self.hub)
+
+        terminal = self._terminal_por_codigo(snapshot, "PDV-01")
+        self.assertFalse(terminal["online"])
+
+    def test_terminal_ativo_pareado_com_conexao_antiga_fica_offline(self):
+        self.terminal.ultima_conexao_em = timezone.now() - timedelta(seconds=TERMINAL_ONLINE_TTL_SECONDS + 1)
+        self.terminal.save(update_fields=["ultima_conexao_em", "atualizado_em"])
+
+        snapshot = montar_snapshot_operacional(self.hub)
+
+        terminal = self._terminal_por_codigo(snapshot, "PDV-01")
+        self.assertFalse(terminal["online"])
+
+    def test_terminal_sem_ultima_conexao_fica_offline(self):
+        self.terminal.ultima_conexao_em = None
+        self.terminal.save(update_fields=["ultima_conexao_em", "atualizado_em"])
+
+        snapshot = montar_snapshot_operacional(self.hub)
+
+        terminal = self._terminal_por_codigo(snapshot, "PDV-01")
+        self.assertFalse(terminal["online"])
+
+    def _terminal_por_codigo(self, snapshot, codigo):
+        return next(terminal for terminal in snapshot["terminais"] if terminal["codigo"] == codigo)
