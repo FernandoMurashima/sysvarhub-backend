@@ -6,6 +6,7 @@ from django.utils import timezone
 
 from core.models import HubConfig
 from core.services.snapshot_operacional import montar_snapshot_operacional
+from integracao.services.comandos_administrativos import executar_comando_administrativo, reenviar_resultados_pendentes
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 from integracao.services.sincronizacao import executar_sincronizacao_comando
 from sysvarhub.version import VERSION
@@ -48,6 +49,13 @@ class SyncWorker:
         comando = resposta.get("comando_sincronizacao")
         if comando:
             executar_sincronizacao_comando(hub, comando, client=client)
+        comando_administrativo = resposta.get("comando_administrativo")
+        if comando_administrativo:
+            executar_comando_administrativo(hub, comando_administrativo, client=client)
+        try:
+            reenviar_resultados_pendentes(hub, client=client)
+        except RetaguardaError:
+            logger.warning("Falha ao reenviar resultados administrativos pendentes.", exc_info=True)
 
 
 def start_worker_thread(stop_event=None, interval=10):

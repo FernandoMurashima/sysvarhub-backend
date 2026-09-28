@@ -1757,6 +1757,46 @@ class SincronizacaoRecebidaHub(models.Model):
         return f"{self.hub_id} - {self.retaguarda_solicitacao_id} - {self.status}"
 
 
+class ComandoAdministrativoRecebidoHub(models.Model):
+    TIPO_CONFIGURAR_TERMINAL = "CONFIGURAR_TERMINAL"
+    TIPO_GERAR_PAREAMENTO = "GERAR_PAREAMENTO"
+
+    STATUS_PENDENTE = "PENDENTE"
+    STATUS_PROCESSANDO = "PROCESSANDO"
+    STATUS_CONCLUIDO = "CONCLUIDO"
+    STATUS_ERRO = "ERRO"
+    STATUS_CHOICES = [
+        (STATUS_PENDENTE, "Pendente"),
+        (STATUS_PROCESSANDO, "Processando"),
+        (STATUS_CONCLUIDO, "Concluído"),
+        (STATUS_ERRO, "Erro"),
+    ]
+    STATUS_TERMINAIS = (STATUS_CONCLUIDO, STATUS_ERRO)
+
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="comandos_administrativos_recebidos")
+    retaguarda_comando_id = models.PositiveBigIntegerField()
+    tipo = models.CharField(max_length=40)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDENTE, db_index=True)
+    payload = models.JSONField(default=dict, blank=True)
+    resultado = models.JSONField(default=dict, blank=True)
+    mensagem_erro = models.CharField(max_length=500, blank=True, default="")
+    recebido_em = models.DateTimeField(auto_now_add=True)
+    processado_em = models.DateTimeField(null=True, blank=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("-recebido_em", "-id")
+        constraints = [
+            models.UniqueConstraint(fields=["hub", "retaguarda_comando_id"], name="uniq_cmd_admin_hub_ret"),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "status"], name="idx_cmd_admin_hub_status"),
+        ]
+
+    def __str__(self):
+        return f"{self.hub_id} - {self.retaguarda_comando_id} - {self.status}"
+
+
 class FechamentoDiaHub(models.Model):
     SITUACAO_OK = "OK"
     SITUACAO_DIVERGENTE = "DIVERGENTE"

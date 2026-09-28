@@ -33,8 +33,9 @@ class SyncWorkerTests(unittest.TestCase):
 
     @patch("runtime.sync_worker.HubConfig")
     @patch("runtime.sync_worker.montar_snapshot_operacional")
+    @patch("runtime.sync_worker.reenviar_resultados_pendentes")
     @patch("runtime.sync_worker.executar_sincronizacao_comando")
-    def test_hub_ativado_envia_heartbeat(self, executar, montar_snapshot, hub_config):
+    def test_hub_ativado_envia_heartbeat(self, executar, reenviar, montar_snapshot, hub_config):
         hub = self._hub()
         hub_config.objects.first.return_value = hub
         montar_snapshot.return_value = {"terminais": []}
@@ -46,12 +47,14 @@ class SyncWorkerTests(unittest.TestCase):
         client.heartbeat.assert_called_once()
         self.assertEqual(client.heartbeat.call_args.kwargs["snapshot_operacional"], {"terminais": []})
         montar_snapshot.assert_called_once_with(hub)
+        reenviar.assert_called_once_with(hub, client=client)
         executar.assert_not_called()
 
     @patch("runtime.sync_worker.HubConfig")
     @patch("runtime.sync_worker.montar_snapshot_operacional")
+    @patch("runtime.sync_worker.reenviar_resultados_pendentes")
     @patch("runtime.sync_worker.executar_sincronizacao_comando")
-    def test_heartbeat_com_comando_chama_orquestrador(self, executar, montar_snapshot, hub_config):
+    def test_heartbeat_com_comando_chama_orquestrador(self, executar, reenviar, montar_snapshot, hub_config):
         hub = self._hub()
         hub_config.objects.first.return_value = hub
         montar_snapshot.return_value = {"terminais": []}
@@ -62,6 +65,7 @@ class SyncWorkerTests(unittest.TestCase):
         SyncWorker(client_factory=Mock(return_value=client)).executar_ciclo()
 
         executar.assert_called_once_with(hub, comando, client=client)
+        reenviar.assert_called_once_with(hub, client=client)
 
     @patch("runtime.sync_worker.HubConfig")
     @patch("runtime.sync_worker.montar_snapshot_operacional")

@@ -187,6 +187,19 @@ class RetaguardaClient:
             headers={"Authorization": f"Hub {token}"},
         )
 
+    def atualizar_resultado_comando_administrativo(self, *, token, comando_id, status, resultado=None, mensagem_erro=""):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._post_json(
+            f"api/hub/comandos/{comando_id}/resultado/",
+            {
+                "status": status,
+                "resultado": resultado or {},
+                "mensagem_erro": mensagem_erro,
+            },
+            headers={"Authorization": f"Hub {token}"},
+        )
+
     def _post_json(self, path, payload, headers=None):
         return self._request_json(path, method="POST", payload=payload, headers=headers)
 
