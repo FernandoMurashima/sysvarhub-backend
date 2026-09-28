@@ -27,7 +27,7 @@ Source: "..\staging\config-template\*"; DestDir: "{app}\config-template"; Flags:
 [Icons]
 Name: "{group}\Abrir Sysvar Hub"; Filename: "http://localhost:8000/"
 Name: "{group}\Verificar Status"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\check-hub.ps1"""
-Name: "{group}\Configurar Sysvar Hub"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\configurar-hub.ps1"""
+Name: "{group}\Ativar/Configurar Sysvar Hub"; Filename: "http://localhost:8000/ativacao"
 Name: "{group}\Abrir Logs"; Filename: "{commonappdata}\SysvarHub\logs"
 
 [UninstallDelete]

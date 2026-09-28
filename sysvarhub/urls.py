@@ -45,6 +45,7 @@ def angular_spa(request, path=""):
 urlpatterns = [
     path('admin/', admin.site.urls),
     path("api/health/", health_check, name="health-check"),
+    path("api/hub/", include("integracao.urls")),
     path("api/terminal/", include("core.urls")),
     path("", angular_spa, name="angular-spa-root"),
     path("<path:path>", angular_spa, name="angular-spa"),

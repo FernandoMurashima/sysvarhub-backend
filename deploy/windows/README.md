@@ -34,7 +34,7 @@ Use `sysvarhub.env.example` como modelo e preencha segredo, banco, hosts permiti
 - `prepare-package.ps1`: monta `deploy\windows\staging\` com app, frontend, template e scripts.
 - `build-installer.ps1`: gera o runtime PyInstaller, monta staging com frontend e MySQL e chama o Inno Setup.
 - `install-hub.ps1`: cria configuracao segura, registra os servicos `SysvarHubMySQL` e `SysvarHub`, aplica migrations e libera firewall apenas para TCP 8000.
-- `configurar-hub.ps1`: executa somente `ativar_hub`; depois disso o Hub fica conectado aguardando a primeira sincronizacao comandada pela Central.
+- `configurar-hub.ps1`: ferramenta de manutencao/suporte tecnico para executar `ativar_hub` fora da interface web.
 - `diagnostico.ps1`: mostra estado dos servicos e portas sem exibir segredos.
 - `uninstall-hub.ps1`: remove servicos e binarios preservando `C:\ProgramData\SysvarHub`.
 - `purge-data.ps1`: remove dados preservados somente quando executado explicitamente.
@@ -47,10 +47,21 @@ O instalador usa MySQL Community Server 8.x x64 em ZIP extraido, informado no bu
 
 O build do frontend nao e versionado. O instalador final devera embutir runtime Python, dependencias, app, frontend compilado, scripts e template de configuracao, sem exigir Python, Node.js, Angular CLI, Git ou VS Code na maquina da loja.
 
+## Fluxo normal de ativacao
+
+1. Instalar o Hub.
+2. Abrir o atalho `Ativar/Configurar Sysvar Hub`.
+3. Informar a URL da Central e o codigo temporario gerado no painel da Central.
+4. Concluir a ativacao pela interface local.
+
+## Manutencao
+
+`configurar-hub.ps1` e o management command `ativar_hub` continuam disponiveis apenas para suporte tecnico, desenvolvimento e recuperacao operacional. O fluxo normal do usuario nao exige PowerShell.
+
 ## Fluxo de primeira sincronizacao
 
 1. Instalar o Hub.
-2. Ativar o Hub com a URL da Central e o codigo de ativacao.
+2. Ativar o Hub pela interface local com a URL da Central e o codigo de ativacao.
 3. O servico fica online enviando heartbeat para a Central.
 4. A Central solicita a primeira sincronizacao pelo painel.
 5. O Hub recebe o comando no heartbeat, executa a carga completa e informa o resultado.

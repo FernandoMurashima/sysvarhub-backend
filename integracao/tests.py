@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.test import TestCase
+from django.test import Client, TestCase, override_settings
 from django.utils import timezone
 
 from core.models import (
@@ -25,6 +25,7 @@ from core.models import (
 )
 from integracao.services.bootstrap import BootstrapValidationError, sincronizar_bootstrap
 from integracao.services.catalogo import CatalogoValidationError, sincronizar_catalogo
+from integracao.services.ativacao import AtivacaoHubError, ativar_hub_local, serializar_status_ativacao
 from integracao.services.formas_pagamento import (
     FormasPagamentoValidationError,
     sincronizar_formas_pagamento,
@@ -300,6 +301,259 @@ class RetaguardaClientTests(TestCase):
             self.assertEqual(list(Path(tmp).glob("*")), [])
 
 
+class _AtivacaoClientFake:
+    resposta = None
+    erro = None
+    chamadas = []
+
+    def __init__(self, retaguarda_url):
+        self.retaguarda_url = retaguarda_url
+
+    def ativar_hub(self, **payload):
+        self.__class__.chamadas.append({"url": self.retaguarda_url, "payload": payload})
+        if self.__class__.erro:
+            raise self.__class__.erro
+        return dict(self.__class__.resposta)
+
+
+class HubAtivacaoServiceTests(TestCase):
+    def setUp(self):
+        _AtivacaoClientFake.resposta = None
+        _AtivacaoClientFake.erro = None
+        _AtivacaoClientFake.chamadas = []
+
+    def resposta(self, hub, **overrides):
+        payload = {
+            "token": "TOKEN-NOVO",
+            "hub_uuid": str(hub.hub_uuid),
+            "hub_id": 99,
+            "empresa_id": 11,
+            "empresa_nome": "Empresa Teste",
+            "loja_id": 41,
+            "loja_nome": "Filial 1",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_ativacao_bem_sucedida_persiste_token_vinculo_e_preserva_uuid(self):
+        hub = HubConfig.objects.create(retaguarda_url="http://central-antiga.test", ativo=False)
+        hub_uuid = hub.hub_uuid
+        _AtivacaoClientFake.resposta = self.resposta(hub)
+
+        ativado = ativar_hub_local(" abcd-efgh-ijkl ", "http://central.test/", client_factory=_AtivacaoClientFake)
+
+        ativado.refresh_from_db()
+        self.assertEqual(ativado.hub_uuid, hub_uuid)
+        self.assertTrue(ativado.ativo)
+        self.assertEqual(ativado.retaguarda_token, "TOKEN-NOVO")
+        self.assertEqual(ativado.retaguarda_hub_id, 99)
+        self.assertEqual(ativado.empresa_id, 11)
+        self.assertEqual(ativado.loja_id, 41)
+        self.assertEqual(ativado.retaguarda_url, "http://central.test")
+        self.assertEqual(_AtivacaoClientFake.chamadas[0]["payload"]["codigo"], "ABCD-EFGH-IJKL")
+
+    def test_resposta_incompleta_e_rejeitada_sem_alterar_credencial_antiga(self):
+        hub = HubConfig.objects.create(
+            retaguarda_url="http://central.test",
+            ativo=True,
+            retaguarda_token="TOKEN-ANTIGO",
+            retaguarda_hub_id=7,
+            empresa_id=3,
+            loja_id=5,
+        )
+        _AtivacaoClientFake.resposta = self.resposta(hub, token="")
+
+        with self.assertRaises(AtivacaoHubError):
+            ativar_hub_local("CODIGO", "http://central-nova.test", client_factory=_AtivacaoClientFake)
+
+        hub.refresh_from_db()
+        self.assertEqual(hub.retaguarda_token, "TOKEN-ANTIGO")
+        self.assertEqual(hub.retaguarda_hub_id, 7)
+        self.assertEqual(hub.empresa_id, 3)
+        self.assertEqual(hub.loja_id, 5)
+        self.assertEqual(hub.retaguarda_url, "http://central.test")
+
+    def test_hub_uuid_divergente_e_rejeitado(self):
+        hub = HubConfig.objects.create(retaguarda_url="http://central.test", ativo=False)
+        _AtivacaoClientFake.resposta = self.resposta(hub, hub_uuid=str(uuid.uuid4()))
+
+        with self.assertRaises(AtivacaoHubError):
+            ativar_hub_local("CODIGO", "http://central.test", client_factory=_AtivacaoClientFake)
+
+    def test_mais_de_um_hubconfig_retorna_erro_controlado(self):
+        HubConfig.objects.create(retaguarda_url="http://central-a.test", ativo=False)
+        HubConfig.objects.create(retaguarda_url="http://central-b.test", ativo=False)
+
+        with self.assertRaises(AtivacaoHubError):
+            ativar_hub_local("CODIGO", "http://central.test", client_factory=_AtivacaoClientFake)
+
+    def test_reativacao_valida_substitui_token_e_vinculo(self):
+        hub = HubConfig.objects.create(
+            retaguarda_url="http://central-antiga.test",
+            ativo=True,
+            retaguarda_token="TOKEN-ANTIGO",
+            retaguarda_hub_id=7,
+            empresa_id=3,
+            loja_id=5,
+        )
+        _AtivacaoClientFake.resposta = self.resposta(hub, hub_id=88, empresa_id=12, loja_id=44)
+
+        ativar_hub_local("CODIGO", "http://central-nova.test", client_factory=_AtivacaoClientFake)
+
+        hub.refresh_from_db()
+        self.assertEqual(hub.retaguarda_token, "TOKEN-NOVO")
+        self.assertEqual(hub.retaguarda_hub_id, 88)
+        self.assertEqual(hub.empresa_id, 12)
+        self.assertEqual(hub.loja_id, 44)
+        self.assertEqual(hub.retaguarda_url, "http://central-nova.test")
+
+
+@override_settings(ROOT_URLCONF="sysvarhub.urls")
+class HubAtivacaoApiTests(TestCase):
+    def setUp(self):
+        self.client = Client()
+
+    def test_get_sem_configuracao_nao_expoe_token(self):
+        resp = self.client.get("/api/hub/ativacao/")
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertFalse(data["ativado"])
+        self.assertFalse(data["possui_credencial"])
+        self.assertNotIn("retaguarda_token", data)
+
+    def test_get_configuracao_sem_credencial(self):
+        hub = HubConfig.objects.create(retaguarda_url="http://central.test", ativo=False)
+
+        resp = self.client.get("/api/hub/ativacao/")
+
+        data = resp.json()
+        self.assertFalse(data["ativado"])
+        self.assertFalse(data["possui_credencial"])
+        self.assertEqual(data["hub_uuid"], str(hub.hub_uuid))
+        self.assertEqual(data["retaguarda_url"], "http://central.test")
+
+    def test_get_configuracao_ativada(self):
+        hub = HubConfig.objects.create(
+            retaguarda_url="http://central.test",
+            ativo=True,
+            retaguarda_token="TOKEN-SECRETO",
+            retaguarda_hub_id=9,
+            empresa_id=3,
+            empresa_nome="Empresa",
+            loja_id=7,
+            loja_nome="Loja",
+            ativado_em=timezone.now(),
+        )
+
+        resp = self.client.get("/api/hub/ativacao/")
+
+        data = resp.json()
+        self.assertTrue(data["ativado"])
+        self.assertTrue(data["possui_credencial"])
+        self.assertEqual(data["empresa_nome"], "Empresa")
+        self.assertEqual(data["loja_nome"], "Loja")
+        self.assertEqual(data["hub_uuid"], str(hub.hub_uuid))
+        self.assertNotIn("TOKEN-SECRETO", json.dumps(data))
+
+    def test_post_sucesso_local_nao_retorna_token(self):
+        hub = HubConfig.objects.create(retaguarda_url="http://central.test", ativo=False)
+
+        with patch("integracao.views.ativar_hub_local") as ativar:
+            hub.ativo = True
+            hub.retaguarda_token = "TOKEN-SECRETO"
+            hub.retaguarda_hub_id = 9
+            hub.empresa_id = 3
+            hub.loja_id = 7
+            ativar.return_value = hub
+            resp = self.client.post(
+                "/api/hub/ativacao/",
+                data=json.dumps({"codigo": " codigo ", "retaguarda_url": "http://central.test/"}),
+                content_type="application/json",
+                REMOTE_ADDR="127.0.0.1",
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.content)
+        ativar.assert_called_once_with("codigo", "http://central.test/")
+        self.assertNotIn("TOKEN-SECRETO", resp.content.decode("utf-8"))
+
+    def test_post_codigo_ausente_url_invalida_e_erro_retaguarda_controlados(self):
+        sem_codigo = self.client.post(
+            "/api/hub/ativacao/",
+            data=json.dumps({"retaguarda_url": "http://central.test"}),
+            content_type="application/json",
+            REMOTE_ADDR="127.0.0.1",
+        )
+        self.assertEqual(sem_codigo.status_code, 400)
+
+        url_invalida = self.client.post(
+            "/api/hub/ativacao/",
+            data=json.dumps({"codigo": "CODIGO", "retaguarda_url": "central"}),
+            content_type="application/json",
+            REMOTE_ADDR="127.0.0.1",
+        )
+        self.assertEqual(url_invalida.status_code, 400)
+
+        with patch("integracao.views.ativar_hub_local", side_effect=AtivacaoHubError("Codigo invalido.")):
+            erro = self.client.post(
+                "/api/hub/ativacao/",
+                data=json.dumps({"codigo": "CODIGO", "retaguarda_url": "http://central.test"}),
+                content_type="application/json",
+                REMOTE_ADDR="127.0.0.1",
+            )
+        self.assertEqual(erro.status_code, 400)
+        self.assertEqual(erro.json()["detail"], "Codigo invalido.")
+
+    def test_post_remoto_lan_e_recusado_e_localhost_permitido(self):
+        remoto = self.client.post(
+            "/api/hub/ativacao/",
+            data=json.dumps({"codigo": "CODIGO", "retaguarda_url": "http://central.test"}),
+            content_type="application/json",
+            REMOTE_ADDR="192.168.1.50",
+        )
+        self.assertEqual(remoto.status_code, 403)
+
+        with patch("integracao.views.ativar_hub_local", side_effect=AtivacaoHubError("Falha controlada.")) as ativar:
+            local = self.client.post(
+                "/api/hub/ativacao/",
+                data=json.dumps({"codigo": "CODIGO", "retaguarda_url": "http://central.test"}),
+                content_type="application/json",
+                REMOTE_ADDR="::1",
+            )
+        self.assertEqual(local.status_code, 400)
+        ativar.assert_called_once()
+
+
+class AtivarHubCommandWrapperTests(TestCase):
+    def test_comando_continua_funcionando_sem_imprimir_token(self):
+        hub = HubConfig.objects.create(
+            retaguarda_url="http://central.test",
+            ativo=True,
+            retaguarda_token="TOKEN-SECRETO",
+            retaguarda_hub_id=9,
+            empresa_id=3,
+            empresa_nome="Empresa",
+            loja_id=7,
+            loja_nome="Loja",
+        )
+        out = io.StringIO()
+
+        with patch("integracao.management.commands.ativar_hub.ativar_hub_local", return_value=hub) as ativar:
+            call_command("ativar_hub", "--codigo", "CODIGO", "--url", "http://central.test", stdout=out)
+
+        ativar.assert_called_once_with("CODIGO", "http://central.test")
+        self.assertIn("Sysvar Hub ativado com sucesso.", out.getvalue())
+        self.assertNotIn("TOKEN-SECRETO", out.getvalue())
+
+    def test_comando_propaga_erro_controlado(self):
+        with patch(
+            "integracao.management.commands.ativar_hub.ativar_hub_local",
+            side_effect=AtivacaoHubError("Codigo invalido."),
+        ):
+            with self.assertRaises(CommandError):
+                call_command("ativar_hub", "--codigo", "CODIGO", "--url", "http://central.test", stdout=io.StringIO())
+
+
 class ClientesSyncTests(TestCase):
     def setUp(self):
         self.hub = HubConfig.objects.create(
@@ -570,22 +824,19 @@ class ClientesSyncTests(TestCase):
 
 class AtivarHubCommandTests(TestCase):
     def test_ativacao_salva_dados_sem_imprimir_token(self):
-        hub = HubConfig.objects.create(retaguarda_url="http://old.test", ativo=False)
-        response = {
-            "token": "TOKEN-SECRETO",
-            "hub_uuid": str(hub.hub_uuid),
-            "hub_id": 99,
-            "loja_id": 7,
-            "loja_nome": "Filial 1",
-            "empresa_id": 3,
-            "empresa_nome": "Empresa Teste",
-        }
+        hub = HubConfig.objects.create(
+            retaguarda_url="http://central.test",
+            ativo=True,
+            retaguarda_token="TOKEN-SECRETO",
+            retaguarda_hub_id=99,
+            loja_id=7,
+            loja_nome="Filial 1",
+            empresa_id=3,
+            empresa_nome="Empresa Teste",
+        )
         out = io.StringIO()
 
-        with patch(
-            "integracao.management.commands.ativar_hub.RetaguardaClient.ativar_hub",
-            return_value=response,
-        ):
+        with patch("integracao.management.commands.ativar_hub.ativar_hub_local", return_value=hub) as ativar:
             call_command(
                 "ativar_hub",
                 "--codigo",
@@ -595,15 +846,8 @@ class AtivarHubCommandTests(TestCase):
                 stdout=out,
             )
 
-        hub.refresh_from_db()
-        self.assertEqual(hub.retaguarda_token, "TOKEN-SECRETO")
-        self.assertEqual(hub.retaguarda_hub_id, 99)
-        self.assertEqual(hub.empresa_id, 3)
-        self.assertEqual(hub.empresa_nome, "Empresa Teste")
-        self.assertEqual(hub.loja_id, 7)
-        self.assertEqual(hub.loja_nome, "Filial 1")
-        self.assertIsNotNone(hub.ativado_em)
-        self.assertTrue(hub.ativo)
+        ativar.assert_called_once_with("AAAA-BBBB-CCCC", "http://central.test")
+        self.assertIn("Sysvar Hub ativado com sucesso.", out.getvalue())
         self.assertNotIn("TOKEN-SECRETO", out.getvalue())
 
     def test_hubconfig_aceita_empresa_e_loja_vazias_antes_da_ativacao(self):
@@ -615,22 +859,8 @@ class AtivarHubCommandTests(TestCase):
     def test_reativacao_reutiliza_mesmo_hub_uuid(self):
         hub = HubConfig.objects.create(retaguarda_url="http://old.test", ativo=False)
         original_uuid = hub.hub_uuid
-        captured = {}
 
-        def fake_ativar(self, **payload):
-            captured.update(payload)
-            return {
-                "token": "TOKEN-NOVO",
-                "hub_uuid": str(original_uuid),
-                "hub_id": 100,
-                "loja_id": 8,
-                "empresa_id": 4,
-            }
-
-        with patch(
-            "integracao.management.commands.ativar_hub.RetaguardaClient.ativar_hub",
-            fake_ativar,
-        ):
+        with patch("integracao.management.commands.ativar_hub.ativar_hub_local", return_value=hub) as ativar:
             call_command(
                 "ativar_hub",
                 "--codigo",
@@ -642,7 +872,7 @@ class AtivarHubCommandTests(TestCase):
 
         hub.refresh_from_db()
         self.assertEqual(hub.hub_uuid, original_uuid)
-        self.assertEqual(captured["hub_uuid"], original_uuid)
+        ativar.assert_called_once_with("ZZZZ", "http://central.test")
 
     def test_hub_uuid_diferente_e_rejeitado(self):
         hub = HubConfig.objects.create(
@@ -650,17 +880,9 @@ class AtivarHubCommandTests(TestCase):
             ativo=True,
             retaguarda_token="TOKEN-VALIDO",
         )
-        response = {
-            "token": "TOKEN-NOVO",
-            "hub_uuid": str(uuid.uuid4()),
-            "hub_id": 99,
-            "loja_id": 7,
-            "empresa_id": 3,
-        }
-
         with patch(
-            "integracao.management.commands.ativar_hub.RetaguardaClient.ativar_hub",
-            return_value=response,
+            "integracao.management.commands.ativar_hub.ativar_hub_local",
+            side_effect=AtivacaoHubError("Central retornou hub_uuid diferente do Hub local."),
         ):
             with self.assertRaises(CommandError):
                 call_command(
@@ -684,8 +906,8 @@ class AtivarHubCommandTests(TestCase):
         )
 
         with patch(
-            "integracao.management.commands.ativar_hub.RetaguardaClient.ativar_hub",
-            return_value={"token": "TOKEN-NOVO", "hub_uuid": str(hub.hub_uuid)},
+            "integracao.management.commands.ativar_hub.ativar_hub_local",
+            side_effect=AtivacaoHubError("Resposta de ativacao incompleta da Central."),
         ):
             with self.assertRaises(CommandError):
                 call_command(
@@ -705,15 +927,34 @@ class AtivarHubCommandTests(TestCase):
         HubConfig.objects.create(retaguarda_url="http://one.test")
         HubConfig.objects.create(retaguarda_url="http://two.test")
 
-        with self.assertRaises(CommandError):
-            call_command(
-                "ativar_hub",
-                "--codigo",
-                "AAAA",
-                "--url",
-                "http://central.test",
-                stdout=io.StringIO(),
-            )
+        with patch(
+            "integracao.management.commands.ativar_hub.ativar_hub_local",
+            side_effect=AtivacaoHubError("Existe mais de uma configuracao local do Hub."),
+        ):
+            with self.assertRaises(CommandError):
+                call_command(
+                    "ativar_hub",
+                    "--codigo",
+                    "AAAA",
+                    "--url",
+                    "http://central.test",
+                    stdout=io.StringIO(),
+                )
+
+    def test_comando_propaga_erro_controlado(self):
+        with patch(
+            "integracao.management.commands.ativar_hub.ativar_hub_local",
+            side_effect=AtivacaoHubError("Codigo invalido."),
+        ):
+            with self.assertRaises(CommandError):
+                call_command(
+                    "ativar_hub",
+                    "--codigo",
+                    "AAAA",
+                    "--url",
+                    "http://central.test",
+                    stdout=io.StringIO(),
+                )
 
 
 class HeartbeatHubCommandTests(TestCase):
