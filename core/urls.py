@@ -15,6 +15,7 @@ from core.api import (
     OperadorLoginView,
     OperadorLogoutView,
     ParearTerminalView,
+    RecuperarTerminalLocalView,
     TerminalCatalogoView,
     TerminalCatalogoImagemView,
     TerminalClienteBeneficiosView,
@@ -39,6 +40,7 @@ from core.api import (
 
 urlpatterns = [
     path("parear/", ParearTerminalView.as_view(), name="terminal-parear"),
+    path("recuperar-local/", RecuperarTerminalLocalView.as_view(), name="terminal-recuperar-local"),
     path("contexto/", TerminalContextoView.as_view(), name="terminal-contexto"),
     path("heartbeat/", TerminalHeartbeatView.as_view(), name="terminal-heartbeat"),
     path("catalogo/", TerminalCatalogoView.as_view(), name="terminal-catalogo"),

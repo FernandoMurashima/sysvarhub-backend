@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import secrets
@@ -6,6 +7,7 @@ import uuid
 
 from django.conf import settings
 from django.db import models
+from cryptography.fernet import Fernet, InvalidToken
 
 
 class HubConfig(models.Model):
@@ -805,6 +807,11 @@ class Terminal(models.Model):
         default="",
     )
 
+    token_criptografado = models.TextField(
+        blank=True,
+        default="",
+    )
+
     pareado_em = models.DateTimeField(
         null=True,
         blank=True,
@@ -856,10 +863,30 @@ class Terminal(models.Model):
     def hash_token(token):
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _fernet():
+        digest = hashlib.sha256(settings.SECRET_KEY.encode("utf-8")).digest()
+        return Fernet(base64.urlsafe_b64encode(digest))
+
     def gerar_token(self):
         token = secrets.token_urlsafe(self.TOKEN_BYTES)
+        self.armazenar_token(token)
+        return token
+
+    def armazenar_token(self, token):
         self.token_hash = self.hash_token(token)
         self.token_prefixo = token[:12]
+        self.token_criptografado = self._fernet().encrypt(token.encode("utf-8")).decode("utf-8")
+
+    def recuperar_token(self):
+        if not self.token_criptografado:
+            return None
+        try:
+            token = self._fernet().decrypt(self.token_criptografado.encode("utf-8")).decode("utf-8")
+        except InvalidToken:
+            return None
+        if self.hash_token(token) != self.token_hash:
+            return None
         return token
 
 

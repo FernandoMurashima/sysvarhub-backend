@@ -59,6 +59,8 @@ from core.services.terminais import (
     PareamentoTerminalError,
     parear_terminal,
     registrar_heartbeat_terminal,
+    RecuperacaoTerminalError,
+    recuperar_identidade_terminal_local,
 )
 from core.services.vendas import (
     SaldoInsuficienteError,
@@ -109,6 +111,27 @@ class ParearTerminalView(APIView):
             )
         except PareamentoTerminalError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {
+                "token": token,
+                **_montar_contexto_terminal(terminal, incluir_ativo_terminal=False),
+            }
+        )
+
+
+class RecuperarTerminalLocalView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        try:
+            terminal, token = recuperar_identidade_terminal_local(
+                hostname=request.data.get("hostname") or "",
+                ip=_obter_ip_requisicao(request),
+            )
+        except RecuperacaoTerminalError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
 
         return Response(
             {

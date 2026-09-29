@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.core.cache import cache
 from django.urls import resolve
 from django.test import TestCase
 from django.utils import timezone
@@ -234,6 +235,7 @@ class TerminalServiceTests(TestCase):
 
 class TerminalPareamentoApiTests(TestCase):
     def setUp(self):
+        cache.clear()
         self.client = APIClient()
         self.hub = HubConfig.objects.create(
             retaguarda_url="http://central.test",
@@ -342,6 +344,57 @@ class TerminalPareamentoApiTests(TestCase):
 
         self.assertNotEqual(self.terminal.token_hash, resposta.data["token"])
         self.assertNotIn(resposta.data["token"], self.terminal.token_hash)
+        self.assertNotEqual(self.terminal.token_criptografado, resposta.data["token"])
+        self.assertNotIn(resposta.data["token"], self.terminal.token_criptografado)
+
+    def test_recuperacao_local_retorna_token_de_terminal_pareado(self):
+        token = self.autenticar_terminal()
+        self.client.credentials()
+
+        resposta = self.client.post(
+            "/api/terminal/recuperar-local/",
+            {"hostname": "PDV-BARRA-01"},
+            format="json",
+        )
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(resposta.data["token"], token)
+        self.assertEqual(resposta.data["terminal"]["codigo"], "PDV-01")
+
+    def test_recuperacao_local_sem_terminal_pareado_falha(self):
+        resposta = self.client.post("/api/terminal/recuperar-local/", {}, format="json")
+
+        self.assertEqual(resposta.status_code, 404)
+
+    def test_recuperacao_local_terminal_inativo_falha(self):
+        self.autenticar_terminal()
+        self.terminal.ativo = False
+        self.terminal.save(update_fields=["ativo", "atualizado_em"])
+        self.client.credentials()
+
+        resposta = self.client.post("/api/terminal/recuperar-local/", {}, format="json")
+
+        self.assertEqual(resposta.status_code, 404)
+
+    def test_recuperacao_local_pareamento_revogado_falha(self):
+        self.autenticar_terminal()
+        PareamentoTerminal.objects.filter(terminal=self.terminal).update(revogado_em=timezone.now())
+        self.client.credentials()
+
+        resposta = self.client.post("/api/terminal/recuperar-local/", {}, format="json")
+
+        self.assertEqual(resposta.status_code, 404)
+
+    def test_recuperacao_local_credencial_corrompida_falha(self):
+        self.autenticar_terminal()
+        self.terminal.refresh_from_db()
+        self.terminal.token_criptografado = "credencial-corrompida"
+        self.terminal.save(update_fields=["token_criptografado", "atualizado_em"])
+        self.client.credentials()
+
+        resposta = self.client.post("/api/terminal/recuperar-local/", {}, format="json")
+
+        self.assertEqual(resposta.status_code, 404)
 
     def test_pareamento_atualiza_pareado_em(self):
         _pareamento, codigo = self.gerar_codigo()
@@ -489,6 +542,18 @@ class TerminalPareamentoApiTests(TestCase):
         resposta = self.parear(codigo)
 
         self.assertNotEqual(resposta.data["token"], token_antigo)
+
+    def test_recuperacao_local_apos_repareamento_retorna_token_novo(self):
+        token_antigo = self.autenticar_terminal()
+        self.client.credentials()
+        _pareamento, codigo = self.gerar_codigo()
+        resposta_pareamento = self.parear(codigo)
+
+        resposta = self.client.post("/api/terminal/recuperar-local/", {}, format="json")
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertNotEqual(resposta.data["token"], token_antigo)
+        self.assertEqual(resposta.data["token"], resposta_pareamento.data["token"])
 
     def test_token_anterior_falha_apos_repareamento(self):
         token_antigo = self.autenticar_terminal()

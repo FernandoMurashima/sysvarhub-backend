@@ -57,11 +57,13 @@ def desativar_terminal(hub, codigo):
         terminal.ativo = False
         terminal.token_hash = ""
         terminal.token_prefixo = ""
+        terminal.token_criptografado = ""
         terminal.save(
             update_fields=[
                 "ativo",
                 "token_hash",
                 "token_prefixo",
+                "token_criptografado",
                 "atualizado_em",
             ]
         )
@@ -95,6 +97,10 @@ def obter_caixa_terminal(hub, caixa_retaguarda_id):
 
 class PareamentoTerminalError(Exception):
     """Erro controlado no pareamento de terminais."""
+
+
+class RecuperacaoTerminalError(Exception):
+    """Erro controlado na recuperacao da identidade local do terminal."""
 
 
 def gerar_pareamento_terminal(terminal, validade_minutos=15):
@@ -165,6 +171,7 @@ def parear_terminal(codigo, hostname="", ip=None):
             update_fields=[
                 "token_hash",
                 "token_prefixo",
+                "token_criptografado",
                 "pareado_em",
                 "hostname",
                 "ultimo_ip",
@@ -176,6 +183,36 @@ def parear_terminal(codigo, hostname="", ip=None):
         pareamento.usado_em = agora
         pareamento.save(update_fields=["usado_em"])
 
+    return terminal, token
+
+
+def recuperar_identidade_terminal_local(hostname="", ip=None):
+    candidatos = (
+        Terminal.objects.select_related("hub")
+        .filter(
+            ativo=True,
+            pareado_em__isnull=False,
+            token_hash__gt="",
+            token_criptografado__gt="",
+            pareamentos__usado_em__isnull=False,
+            pareamentos__revogado_em__isnull=True,
+        )
+        .distinct()
+        .order_by("-ultima_conexao_em", "-pareado_em", "id")
+    )
+    quantidade = candidatos.count()
+    if quantidade == 0:
+        raise RecuperacaoTerminalError("Terminal local nao pareado.")
+    if quantidade > 1:
+        raise RecuperacaoTerminalError("Mais de um terminal local pareado exige identificacao explicita.")
+
+    terminal = candidatos.first()
+    token = terminal.recuperar_token()
+    if token is None:
+        raise RecuperacaoTerminalError("Credencial local do terminal invalida.")
+
+    registrar_heartbeat_terminal(terminal, hostname=hostname, ip=ip)
+    terminal.refresh_from_db()
     return terminal, token
 
 
