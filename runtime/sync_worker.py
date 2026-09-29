@@ -6,6 +6,7 @@ from django.utils import timezone
 
 from core.models import HubConfig
 from core.services.snapshot_operacional import montar_snapshot_operacional
+from core.services.sync import sincronizar_eventos_pendentes
 from integracao.services.comandos_administrativos import executar_comando_administrativo, reenviar_resultados_pendentes
 from integracao.services.ativacao import marcar_credencial_hub_revogada
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaCredencialInvalidaError, RetaguardaError
@@ -57,6 +58,10 @@ class SyncWorker:
         comando_administrativo = resposta.get("comando_administrativo")
         if comando_administrativo:
             executar_comando_administrativo(hub, comando_administrativo, client=client)
+        try:
+            sincronizar_eventos_pendentes(hub, client=client)
+        except Exception:
+            logger.warning("Falha ao sincronizar eventos operacionais pendentes do Hub.", exc_info=True)
         try:
             reenviar_resultados_pendentes(hub, client=client)
         except RetaguardaError:

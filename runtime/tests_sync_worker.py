@@ -34,8 +34,9 @@ class SyncWorkerTests(unittest.TestCase):
     @patch("runtime.sync_worker.HubConfig")
     @patch("runtime.sync_worker.montar_snapshot_operacional")
     @patch("runtime.sync_worker.reenviar_resultados_pendentes")
+    @patch("runtime.sync_worker.sincronizar_eventos_pendentes")
     @patch("runtime.sync_worker.executar_sincronizacao_comando")
-    def test_hub_ativado_envia_heartbeat(self, executar, reenviar, montar_snapshot, hub_config):
+    def test_hub_ativado_envia_heartbeat(self, executar, sincronizar_eventos, reenviar, montar_snapshot, hub_config):
         hub = self._hub()
         hub_config.objects.first.return_value = hub
         montar_snapshot.return_value = {"terminais": []}
@@ -47,14 +48,16 @@ class SyncWorkerTests(unittest.TestCase):
         client.heartbeat.assert_called_once()
         self.assertEqual(client.heartbeat.call_args.kwargs["snapshot_operacional"], {"terminais": []})
         montar_snapshot.assert_called_once_with(hub)
+        sincronizar_eventos.assert_called_once_with(hub, client=client)
         reenviar.assert_called_once_with(hub, client=client)
         executar.assert_not_called()
 
     @patch("runtime.sync_worker.HubConfig")
     @patch("runtime.sync_worker.montar_snapshot_operacional")
     @patch("runtime.sync_worker.reenviar_resultados_pendentes")
+    @patch("runtime.sync_worker.sincronizar_eventos_pendentes")
     @patch("runtime.sync_worker.executar_sincronizacao_comando")
-    def test_heartbeat_com_comando_chama_orquestrador(self, executar, reenviar, montar_snapshot, hub_config):
+    def test_heartbeat_com_comando_chama_orquestrador(self, executar, sincronizar_eventos, reenviar, montar_snapshot, hub_config):
         hub = self._hub()
         hub_config.objects.first.return_value = hub
         montar_snapshot.return_value = {"terminais": []}
@@ -65,6 +68,7 @@ class SyncWorkerTests(unittest.TestCase):
         SyncWorker(client_factory=Mock(return_value=client)).executar_ciclo()
 
         executar.assert_called_once_with(hub, comando, client=client)
+        sincronizar_eventos.assert_called_once_with(hub, client=client)
         reenviar.assert_called_once_with(hub, client=client)
 
     @patch("runtime.sync_worker.HubConfig")
@@ -85,12 +89,14 @@ class SyncWorkerTests(unittest.TestCase):
     @patch("runtime.sync_worker.montar_snapshot_operacional")
     @patch("runtime.sync_worker.reenviar_resultados_pendentes")
     @patch("runtime.sync_worker.executar_sincronizacao_comando")
+    @patch("runtime.sync_worker.sincronizar_eventos_pendentes")
     @patch("runtime.sync_worker.executar_comando_administrativo")
     @patch("runtime.sync_worker.marcar_credencial_hub_revogada")
     def test_credencial_revogada_no_heartbeat_remove_ativacao_local(
         self,
         marcar_revogada,
         executar_admin,
+        sincronizar_eventos,
         executar_sync,
         reenviar,
         montar_snapshot,
@@ -109,7 +115,64 @@ class SyncWorkerTests(unittest.TestCase):
         hub.save.assert_not_called()
         executar_sync.assert_not_called()
         executar_admin.assert_not_called()
+        sincronizar_eventos.assert_not_called()
         reenviar.assert_not_called()
+
+    @patch("runtime.sync_worker.HubConfig")
+    @patch("runtime.sync_worker.montar_snapshot_operacional")
+    @patch("runtime.sync_worker.reenviar_resultados_pendentes")
+    @patch("runtime.sync_worker.sincronizar_eventos_pendentes")
+    @patch("runtime.sync_worker.executar_comando_administrativo")
+    @patch("runtime.sync_worker.executar_sincronizacao_comando")
+    def test_ciclo_executa_comandos_eventos_e_reenvio_administrativo(
+        self,
+        executar_sync,
+        executar_admin,
+        sincronizar_eventos,
+        reenviar,
+        montar_snapshot,
+        hub_config,
+    ):
+        hub = self._hub()
+        hub_config.objects.first.return_value = hub
+        montar_snapshot.return_value = {"terminais": []}
+        client = Mock()
+        comando_sync = {"id": 1}
+        comando_admin = {"id": 2}
+        client.heartbeat.return_value = {
+            "comando_sincronizacao": comando_sync,
+            "comando_administrativo": comando_admin,
+        }
+
+        SyncWorker(client_factory=Mock(return_value=client)).executar_ciclo()
+
+        executar_sync.assert_called_once_with(hub, comando_sync, client=client)
+        executar_admin.assert_called_once_with(hub, comando_admin, client=client)
+        sincronizar_eventos.assert_called_once_with(hub, client=client)
+        reenviar.assert_called_once_with(hub, client=client)
+
+    @patch("runtime.sync_worker.HubConfig")
+    @patch("runtime.sync_worker.montar_snapshot_operacional")
+    @patch("runtime.sync_worker.reenviar_resultados_pendentes")
+    @patch("runtime.sync_worker.sincronizar_eventos_pendentes")
+    def test_erro_inesperado_no_processamento_de_eventos_nao_interrompe_reenvio(
+        self,
+        sincronizar_eventos,
+        reenviar,
+        montar_snapshot,
+        hub_config,
+    ):
+        hub = self._hub()
+        hub_config.objects.first.return_value = hub
+        montar_snapshot.return_value = {"terminais": []}
+        client = Mock()
+        client.heartbeat.return_value = {}
+        sincronizar_eventos.side_effect = RuntimeError("falha inesperada")
+
+        SyncWorker(client_factory=Mock(return_value=client)).executar_ciclo()
+
+        sincronizar_eventos.assert_called_once_with(hub, client=client)
+        reenviar.assert_called_once_with(hub, client=client)
 
     def test_excecao_no_ciclo_nao_encerra_loop(self):
         stop = Event()
@@ -137,10 +200,10 @@ class SyncWorkerTests(unittest.TestCase):
 
         worker.executar_ciclo.assert_not_called()
 
-    def test_worker_nao_importa_sincronizar_eventos_pendentes(self):
+    def test_worker_importa_sincronizar_eventos_pendentes(self):
         import runtime.sync_worker as sync_worker
 
-        self.assertFalse(hasattr(sync_worker, "sincronizar_eventos_pendentes"))
+        self.assertTrue(hasattr(sync_worker, "sincronizar_eventos_pendentes"))
 
 
 if __name__ == "__main__":
