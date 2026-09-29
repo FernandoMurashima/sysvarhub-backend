@@ -10,7 +10,7 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
 from core.authentication import TerminalOperadorAuthentication, TerminalTokenAuthentication
-from core.models import CaixaHub, CatalogoItemHub, ClienteHub, NFCeHub, TipoDespesaPdvHub, VendaHub, VendedorHub
+from core.models import CaixaHub, CatalogoItemHub, ClienteHub, HubConfig, NFCeHub, TipoDespesaPdvHub, VendaHub, VendedorHub
 from core.permissions import IsOperadorAuthenticated, IsTerminalAuthenticated
 from core.services.caixa import (
     CaixaConflictError,
@@ -24,6 +24,7 @@ from core.services.caixa import (
     serializar_sessao_caixa,
 )
 from core.services.beneficios import consultar_beneficios_cliente
+from core.services.central_status import calcular_status_central
 from core.services.fechamento_dia import (
     FechamentoDiaConflictError,
     FechamentoDiaConsistencyError,
@@ -166,6 +167,15 @@ class TerminalHeartbeatView(APIView):
                 "servidor_em": timezone.now().isoformat(),
             }
         )
+
+
+class TerminalCentralStatusView(APIView):
+    authentication_classes = [TerminalTokenAuthentication]
+    permission_classes = [IsTerminalAuthenticated]
+
+    def get(self, request):
+        hub = HubConfig.objects.filter(pk=request.sysvar_terminal.hub_id).first()
+        return Response(calcular_status_central(hub))
 
 
 class TerminalCatalogoView(APIView):

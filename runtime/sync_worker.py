@@ -36,6 +36,8 @@ class SyncWorker:
         if not hub or not hub.ativo or not hub.retaguarda_token or not hub.retaguarda_url:
             return
         client = self.client_factory(hub.retaguarda_url)
+        hub.ultima_tentativa_central_em = timezone.now()
+        hub.save(update_fields=["ultima_tentativa_central_em", "atualizado_em"])
         try:
             resposta = client.heartbeat(
                 token=hub.retaguarda_token,

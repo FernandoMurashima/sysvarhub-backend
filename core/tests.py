@@ -577,6 +577,77 @@ class TerminalPareamentoApiTests(TestCase):
 
         self.assertEqual(self.terminal.caixa_retaguarda_id, 29)
 
+    def test_status_central_verificando_sem_contato(self):
+        self.autenticar_terminal()
+
+        resposta = self.client.get("/api/terminal/central/status/")
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(resposta.data["status"], "VERIFICANDO")
+        self.assertFalse(resposta.data["online"])
+        self.assertIsNone(resposta.data["ultimo_contato_em"])
+        self.assertIsNone(resposta.data["ultima_tentativa_em"])
+
+    def test_status_central_online_com_heartbeat_recente(self):
+        self.autenticar_terminal()
+        agora = timezone.now()
+        self.hub.ultimo_heartbeat_em = agora
+        self.hub.ultima_tentativa_central_em = agora
+        self.hub.save(update_fields=["ultimo_heartbeat_em", "ultima_tentativa_central_em", "atualizado_em"])
+
+        resposta = self.client.get("/api/terminal/central/status/")
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(resposta.data["status"], "ONLINE")
+        self.assertTrue(resposta.data["online"])
+        self.assertEqual(resposta.data["ultimo_contato_em"], self.hub.ultimo_heartbeat_em.isoformat())
+        self.assertEqual(resposta.data["ultima_tentativa_em"], self.hub.ultima_tentativa_central_em.isoformat())
+
+    def test_status_central_offline_com_ultima_tentativa_sem_sucesso(self):
+        self.autenticar_terminal()
+        self.hub.ultima_tentativa_central_em = timezone.now()
+        self.hub.save(update_fields=["ultima_tentativa_central_em", "atualizado_em"])
+
+        resposta = self.client.get("/api/terminal/central/status/")
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(resposta.data["status"], "OFFLINE")
+        self.assertFalse(resposta.data["online"])
+
+    def test_status_central_offline_com_ultimo_sucesso_expirado(self):
+        self.autenticar_terminal()
+        antigo = timezone.now() - timedelta(minutes=3)
+        self.hub.ultimo_heartbeat_em = antigo
+        self.hub.ultima_tentativa_central_em = timezone.now()
+        self.hub.save(update_fields=["ultimo_heartbeat_em", "ultima_tentativa_central_em", "atualizado_em"])
+
+        resposta = self.client.get("/api/terminal/central/status/")
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(resposta.data["status"], "OFFLINE")
+        self.assertFalse(resposta.data["online"])
+
+    def test_status_central_nao_expoe_segredos(self):
+        self.autenticar_terminal()
+        self.hub.retaguarda_token = "TOKEN-SECRETO"
+        self.hub.save(update_fields=["retaguarda_token", "atualizado_em"])
+
+        resposta = self.client.get("/api/terminal/central/status/")
+        conteudo = str(resposta.data)
+
+        self.assertEqual(resposta.status_code, 200)
+        self.assertNotIn("TOKEN-SECRETO", conteudo)
+        self.assertNotIn("retaguarda_token", conteudo)
+        self.assertNotIn("retaguarda_url", conteudo)
+
+    def test_status_central_sem_sessao_operador(self):
+        token = self.autenticar_terminal()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Terminal {token}")
+
+        resposta = self.client.get("/api/terminal/central/status/")
+
+        self.assertEqual(resposta.status_code, 200)
+
     def test_repareamento_rotaciona_token(self):
         token_antigo = self.autenticar_terminal()
         self.client.credentials()

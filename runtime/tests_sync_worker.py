@@ -19,6 +19,8 @@ class SyncWorkerTests(unittest.TestCase):
         hub.ativo = ativo
         hub.retaguarda_token = "token" if ativo else ""
         hub.retaguarda_url = "http://central.test/" if ativo else ""
+        hub.ultimo_heartbeat_em = None
+        hub.ultima_tentativa_central_em = None
         hub.save = Mock()
         return hub
 
@@ -47,6 +49,8 @@ class SyncWorkerTests(unittest.TestCase):
 
         client.heartbeat.assert_called_once()
         self.assertEqual(client.heartbeat.call_args.kwargs["snapshot_operacional"], {"terminais": []})
+        self.assertIsNotNone(hub.ultima_tentativa_central_em)
+        self.assertIsNotNone(hub.ultimo_heartbeat_em)
         montar_snapshot.assert_called_once_with(hub)
         sincronizar_eventos.assert_called_once_with(hub, client=client)
         reenviar.assert_called_once_with(hub, client=client)
@@ -75,7 +79,8 @@ class SyncWorkerTests(unittest.TestCase):
     @patch("runtime.sync_worker.montar_snapshot_operacional")
     @patch("runtime.sync_worker.marcar_credencial_hub_revogada")
     def test_erro_retaguarda_no_heartbeat_nao_morre(self, marcar_revogada, montar_snapshot, hub_config):
-        hub_config.objects.first.return_value = self._hub()
+        hub = self._hub()
+        hub_config.objects.first.return_value = hub
         montar_snapshot.return_value = {"terminais": []}
         client = Mock()
         client.heartbeat.side_effect = RetaguardaError("offline")
@@ -83,6 +88,8 @@ class SyncWorkerTests(unittest.TestCase):
         SyncWorker(client_factory=Mock(return_value=client)).executar_ciclo()
 
         client.heartbeat.assert_called_once()
+        self.assertIsNotNone(hub.ultima_tentativa_central_em)
+        self.assertIsNone(hub.ultimo_heartbeat_em)
         marcar_revogada.assert_not_called()
 
     @patch("runtime.sync_worker.HubConfig")
@@ -111,8 +118,9 @@ class SyncWorkerTests(unittest.TestCase):
         SyncWorker(client_factory=Mock(return_value=client)).executar_ciclo()
 
         client.heartbeat.assert_called_once()
+        self.assertIsNotNone(hub.ultima_tentativa_central_em)
         marcar_revogada.assert_called_once_with(hub)
-        hub.save.assert_not_called()
+        hub.save.assert_called_once_with(update_fields=["ultima_tentativa_central_em", "atualizado_em"])
         executar_sync.assert_not_called()
         executar_admin.assert_not_called()
         sincronizar_eventos.assert_not_called()

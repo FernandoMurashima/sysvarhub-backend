@@ -206,6 +206,11 @@ class HubConfig(models.Model):
         blank=True,
     )
 
+    ultima_tentativa_central_em = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
     primeira_carga_concluida_em = models.DateTimeField(
         null=True,
         blank=True,
