@@ -63,7 +63,7 @@ def _serializar_terminal_operacional(terminal, *, agora, caixa, sessoes_abertas_
         "codigo": terminal.codigo,
         "nome": terminal.nome,
         "ativo": terminal.ativo,
-        "pareado": bool(terminal.token_hash and terminal.pareado_em),
+        "pareado": bool(terminal.ativo and terminal.token_hash and terminal.pareado_em),
         "pareado_em": terminal.pareado_em.isoformat() if terminal.pareado_em else None,
         "hostname": terminal.hostname,
         "ultimo_ip": str(terminal.ultimo_ip) if terminal.ultimo_ip else None,

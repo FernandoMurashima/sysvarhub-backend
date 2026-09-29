@@ -54,21 +54,43 @@ def desativar_terminal(hub, codigo):
         except Terminal.DoesNotExist as exc:
             raise TerminalValidationError("Terminal nao encontrado.") from exc
 
-        terminal.ativo = False
-        terminal.token_hash = ""
-        terminal.token_prefixo = ""
-        terminal.token_criptografado = ""
-        terminal.save(
-            update_fields=[
-                "ativo",
-                "token_hash",
-                "token_prefixo",
-                "token_criptografado",
-                "atualizado_em",
-            ]
-        )
+        invalidar_identidade_terminal(terminal)
 
     return terminal
+
+
+def invalidar_identidade_terminal(terminal, agora=None):
+    agora = agora or timezone.now()
+    terminal.ativo = False
+    terminal.token_hash = ""
+    terminal.token_prefixo = ""
+    terminal.token_criptografado = ""
+    terminal.pareado_em = None
+    terminal.save(
+        update_fields=[
+            "ativo",
+            "token_hash",
+            "token_prefixo",
+            "token_criptografado",
+            "pareado_em",
+            "atualizado_em",
+        ]
+    )
+    PareamentoTerminal.objects.filter(
+        terminal=terminal,
+        usado_em__isnull=True,
+        revogado_em__isnull=True,
+        expira_em__gt=agora,
+    ).update(revogado_em=agora)
+    return terminal
+
+
+def invalidar_identidades_terminais_hub(hub, agora=None):
+    agora = agora or timezone.now()
+    terminais = list(Terminal.objects.select_for_update().filter(hub=hub))
+    for terminal in terminais:
+        invalidar_identidade_terminal(terminal, agora=agora)
+    return terminais
 
 
 def validar_caixa_terminal(hub, caixa_retaguarda_id):

@@ -1,3 +1,4 @@
+from datetime import timedelta
 from io import StringIO
 from pathlib import Path
 import tempfile
@@ -172,6 +173,38 @@ class TerminalServiceTests(TestCase):
         desativado = desativar_terminal(self.hub, "PDV-01")
 
         self.assertEqual(desativado.caixa_retaguarda_id, 29)
+
+    def test_desativacao_limpa_identidade_operacional_e_revoga_pareamento_pendente(self):
+        terminal = configurar_terminal(self.hub, "PDV-01", "PDV 01", 29)
+        usado = PareamentoTerminal.objects.create(
+            terminal=terminal,
+            codigo_hash=PareamentoTerminal.hash_codigo("USADO-0000-0000"),
+            codigo_prefixo="USAD",
+            expira_em=timezone.now() + timedelta(minutes=15),
+            usado_em=timezone.now(),
+        )
+        pendente = PareamentoTerminal.objects.create(
+            terminal=terminal,
+            codigo_hash=PareamentoTerminal.hash_codigo("PEND-0000-0000"),
+            codigo_prefixo="PEND",
+            expira_em=timezone.now() + timedelta(minutes=15),
+        )
+        terminal.gerar_token()
+        terminal.pareado_em = timezone.now()
+        terminal.save()
+
+        desativado = desativar_terminal(self.hub, "PDV-01")
+
+        pendente.refresh_from_db()
+        usado.refresh_from_db()
+        self.assertFalse(desativado.ativo)
+        self.assertEqual(desativado.token_hash, "")
+        self.assertEqual(desativado.token_prefixo, "")
+        self.assertEqual(desativado.token_criptografado, "")
+        self.assertIsNone(desativado.pareado_em)
+        self.assertIsNotNone(pendente.revogado_em)
+        self.assertIsNotNone(usado.usado_em)
+        self.assertIsNone(usado.revogado_em)
 
     def test_listagem_nao_altera_dados(self):
         terminal = configurar_terminal(self.hub, "PDV-01", "PDV 01", 29)
@@ -396,6 +429,16 @@ class TerminalPareamentoApiTests(TestCase):
 
         self.assertEqual(resposta.status_code, 404)
 
+    def test_recuperacao_local_apos_reset_nao_recupera_token_antigo(self):
+        self.autenticar_terminal()
+        self.terminal.refresh_from_db()
+        desativar_terminal(self.hub, "PDV-01")
+        self.client.credentials()
+
+        resposta = self.client.post("/api/terminal/recuperar-local/", {}, format="json")
+
+        self.assertEqual(resposta.status_code, 404)
+
     def test_pareamento_atualiza_pareado_em(self):
         _pareamento, codigo = self.gerar_codigo()
 
@@ -542,6 +585,40 @@ class TerminalPareamentoApiTests(TestCase):
         resposta = self.parear(codigo)
 
         self.assertNotEqual(resposta.data["token"], token_antigo)
+
+    def test_configurar_terminal_apos_reset_reusa_registro_sem_ressuscitar_pareamento(self):
+        self.autenticar_terminal()
+        self.terminal.refresh_from_db()
+        terminal_uuid = self.terminal.terminal_uuid
+        desativar_terminal(self.hub, "PDV-01")
+
+        atualizado = configurar_terminal(self.hub, "PDV-01", "PDV 01 novo", 29, hostname="PDV-NOVO")
+
+        self.assertEqual(atualizado.pk, self.terminal.pk)
+        self.assertEqual(atualizado.terminal_uuid, terminal_uuid)
+        self.assertEqual(atualizado.nome, "PDV 01 novo")
+        self.assertEqual(atualizado.caixa_retaguarda_id, 29)
+        self.assertEqual(atualizado.hostname, "PDV-NOVO")
+        self.assertTrue(atualizado.ativo)
+        self.assertEqual(atualizado.token_hash, "")
+        self.assertEqual(atualizado.token_prefixo, "")
+        self.assertEqual(atualizado.token_criptografado, "")
+        self.assertIsNone(atualizado.pareado_em)
+
+    def test_configurar_terminal_pareado_preserva_credencial_existente(self):
+        self.autenticar_terminal()
+        self.terminal.refresh_from_db()
+        token_hash = self.terminal.token_hash
+        token_prefixo = self.terminal.token_prefixo
+        token_criptografado = self.terminal.token_criptografado
+        pareado_em = self.terminal.pareado_em
+
+        atualizado = configurar_terminal(self.hub, "PDV-01", "PDV 01 atualizado", 29, hostname="PDV-ATUAL")
+
+        self.assertEqual(atualizado.token_hash, token_hash)
+        self.assertEqual(atualizado.token_prefixo, token_prefixo)
+        self.assertEqual(atualizado.token_criptografado, token_criptografado)
+        self.assertEqual(atualizado.pareado_em, pareado_em)
 
     def test_recuperacao_local_apos_repareamento_retorna_token_novo(self):
         token_antigo = self.autenticar_terminal()

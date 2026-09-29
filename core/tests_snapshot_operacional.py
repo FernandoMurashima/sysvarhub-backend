@@ -104,17 +104,20 @@ class SnapshotOperacionalTests(TestCase):
 
         terminal = self._terminal_por_codigo(snapshot, "PDV-01")
         self.assertFalse(terminal["online"])
+        self.assertFalse(terminal["pareado"])
 
     def test_terminal_ativo_nao_pareado_com_conexao_recente_fica_offline(self):
         self.terminal.token_hash = ""
         self.terminal.token_prefixo = ""
+        self.terminal.token_criptografado = ""
         self.terminal.pareado_em = None
-        self.terminal.save(update_fields=["token_hash", "token_prefixo", "pareado_em", "atualizado_em"])
+        self.terminal.save(update_fields=["token_hash", "token_prefixo", "token_criptografado", "pareado_em", "atualizado_em"])
 
         snapshot = montar_snapshot_operacional(self.hub)
 
         terminal = self._terminal_por_codigo(snapshot, "PDV-01")
         self.assertFalse(terminal["online"])
+        self.assertFalse(terminal["pareado"])
 
     def test_terminal_ativo_pareado_com_conexao_antiga_fica_offline(self):
         self.terminal.ultima_conexao_em = timezone.now() - timedelta(seconds=TERMINAL_ONLINE_TTL_SECONDS + 1)

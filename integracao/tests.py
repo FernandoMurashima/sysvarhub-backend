@@ -22,8 +22,10 @@ from core.models import (
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
     HubConfig,
+    Terminal,
     ValeTrocaHub,
 )
+from core.services.terminais import configurar_terminal, gerar_pareamento_terminal, parear_terminal
 from integracao.services.bootstrap import BootstrapValidationError, sincronizar_bootstrap
 from integracao.services.catalogo import CatalogoValidationError, sincronizar_catalogo
 from integracao.services.ativacao import (
@@ -477,6 +479,55 @@ class HubAtivacaoServiceTests(TestCase):
         self.assertEqual(atualizado.retaguarda_url, "http://central.test")
         self.assertEqual(atualizado.empresa_id, 3)
         self.assertEqual(atualizado.loja_id, 5)
+
+    def test_marcar_credencial_revogada_reseta_terminais_do_ciclo(self):
+        hub = HubConfig.objects.create(
+            retaguarda_url="http://central.test",
+            ativo=True,
+            retaguarda_token="TOKEN-ANTIGO",
+            retaguarda_hub_id=7,
+            empresa_id=3,
+            loja_id=5,
+            ativado_em=timezone.now(),
+        )
+        caixa = CaixaHub.objects.create(
+            hub=hub,
+            retaguarda_id=29,
+            codigo="CX-01",
+            ativo=True,
+            sincronizado_em=timezone.now(),
+        )
+        terminal = configurar_terminal(hub, "PDV-01", "PDV 01", caixa.retaguarda_id, hostname="PDV-ANTIGO")
+        terminal_uuid = terminal.terminal_uuid
+        pareamento_usado, codigo = gerar_pareamento_terminal(terminal)
+        terminal, token_antigo = parear_terminal(codigo, hostname="PDV-ANTIGO")
+        pareamento_pendente, _codigo_pendente = gerar_pareamento_terminal(terminal)
+
+        atualizado = marcar_credencial_hub_revogada(hub)
+
+        atualizado.refresh_from_db()
+        terminal.refresh_from_db()
+        pareamento_usado.refresh_from_db()
+        pareamento_pendente.refresh_from_db()
+        self.assertFalse(atualizado.ativo)
+        self.assertEqual(atualizado.retaguarda_token, "")
+        self.assertIsNone(atualizado.retaguarda_hub_id)
+        self.assertIsNone(atualizado.ativado_em)
+        self.assertFalse(terminal.ativo)
+        self.assertEqual(terminal.terminal_uuid, terminal_uuid)
+        self.assertEqual(terminal.codigo, "PDV-01")
+        self.assertEqual(terminal.nome, "PDV 01")
+        self.assertEqual(terminal.caixa_retaguarda_id, 29)
+        self.assertEqual(terminal.hostname, "PDV-ANTIGO")
+        self.assertEqual(terminal.token_hash, "")
+        self.assertEqual(terminal.token_prefixo, "")
+        self.assertEqual(terminal.token_criptografado, "")
+        self.assertIsNone(terminal.pareado_em)
+        self.assertIsNotNone(pareamento_pendente.revogado_em)
+        self.assertIsNotNone(pareamento_usado.usado_em)
+        self.assertIsNone(pareamento_usado.revogado_em)
+        self.assertIsNone(terminal.recuperar_token())
+        self.assertFalse(Terminal.objects.filter(token_hash=Terminal.hash_token(token_antigo), ativo=True).exists())
 
 
 @override_settings(ROOT_URLCONF="sysvarhub.urls")

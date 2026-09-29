@@ -5,6 +5,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from core.models import HubConfig
+from core.services.terminais import invalidar_identidades_terminais_hub
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 from sysvarhub.version import VERSION
 
@@ -66,6 +67,7 @@ def serializar_status_ativacao(hub):
 def marcar_credencial_hub_revogada(hub):
     with transaction.atomic():
         hub = HubConfig.objects.select_for_update().get(pk=hub.pk)
+        invalidar_identidades_terminais_hub(hub)
         hub.ativo = False
         hub.retaguarda_token = ""
         hub.retaguarda_hub_id = None
