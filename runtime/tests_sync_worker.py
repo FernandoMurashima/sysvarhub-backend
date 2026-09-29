@@ -9,7 +9,7 @@ import django
 
 django.setup()
 
-from integracao.services.retaguarda import RetaguardaError
+from integracao.services.retaguarda import RetaguardaCredencialInvalidaError, RetaguardaError
 from runtime.sync_worker import SyncWorker
 
 
@@ -69,7 +69,8 @@ class SyncWorkerTests(unittest.TestCase):
 
     @patch("runtime.sync_worker.HubConfig")
     @patch("runtime.sync_worker.montar_snapshot_operacional")
-    def test_erro_retaguarda_no_heartbeat_nao_morre(self, montar_snapshot, hub_config):
+    @patch("runtime.sync_worker.marcar_credencial_hub_revogada")
+    def test_erro_retaguarda_no_heartbeat_nao_morre(self, marcar_revogada, montar_snapshot, hub_config):
         hub_config.objects.first.return_value = self._hub()
         montar_snapshot.return_value = {"terminais": []}
         client = Mock()
@@ -78,6 +79,37 @@ class SyncWorkerTests(unittest.TestCase):
         SyncWorker(client_factory=Mock(return_value=client)).executar_ciclo()
 
         client.heartbeat.assert_called_once()
+        marcar_revogada.assert_not_called()
+
+    @patch("runtime.sync_worker.HubConfig")
+    @patch("runtime.sync_worker.montar_snapshot_operacional")
+    @patch("runtime.sync_worker.reenviar_resultados_pendentes")
+    @patch("runtime.sync_worker.executar_sincronizacao_comando")
+    @patch("runtime.sync_worker.executar_comando_administrativo")
+    @patch("runtime.sync_worker.marcar_credencial_hub_revogada")
+    def test_credencial_revogada_no_heartbeat_remove_ativacao_local(
+        self,
+        marcar_revogada,
+        executar_admin,
+        executar_sync,
+        reenviar,
+        montar_snapshot,
+        hub_config,
+    ):
+        hub = self._hub()
+        hub_config.objects.first.return_value = hub
+        montar_snapshot.return_value = {"terminais": []}
+        client = Mock()
+        client.heartbeat.side_effect = RetaguardaCredencialInvalidaError("revogada")
+
+        SyncWorker(client_factory=Mock(return_value=client)).executar_ciclo()
+
+        client.heartbeat.assert_called_once()
+        marcar_revogada.assert_called_once_with(hub)
+        hub.save.assert_not_called()
+        executar_sync.assert_not_called()
+        executar_admin.assert_not_called()
+        reenviar.assert_not_called()
 
     def test_excecao_no_ciclo_nao_encerra_loop(self):
         stop = Event()

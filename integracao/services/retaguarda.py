@@ -9,6 +9,13 @@ class RetaguardaError(Exception):
     """Erro controlado na comunicação com a retaguarda."""
 
 
+class RetaguardaCredencialInvalidaError(RetaguardaError):
+    """Credencial do Hub foi rejeitada pela retaguarda."""
+
+
+HUB_CREDENTIAL_INVALID_CODES = {"HUB_CREDENTIAL_INVALID", "HUB_CREDENTIAL_REVOKED"}
+
+
 CONTENT_TYPE_IMAGEM_EXTENSOES = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
@@ -228,6 +235,8 @@ class RetaguardaClient:
             with request.urlopen(req, timeout=self.timeout) as response:
                 return self._decode_json_response(response)
         except error.HTTPError as exc:
+            if self._erro_credencial_hub(exc):
+                raise RetaguardaCredencialInvalidaError("Credencial do Hub inválida ou revogada.") from exc
             raise RetaguardaError(f"Retaguarda retornou HTTP {exc.code}.") from exc
         except error.URLError as exc:
             reason = getattr(exc, "reason", "indisponível")
@@ -245,3 +254,19 @@ class RetaguardaClient:
         if not data:
             return {}
         return json.loads(data.decode("utf-8"))
+
+    @staticmethod
+    def _erro_credencial_hub(exc):
+        if exc.code not in (401, 403):
+            return False
+        try:
+            data = exc.read()
+        except OSError:
+            return False
+        if not data:
+            return False
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        return payload.get("code") in HUB_CREDENTIAL_INVALID_CODES

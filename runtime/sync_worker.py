@@ -7,7 +7,8 @@ from django.utils import timezone
 from core.models import HubConfig
 from core.services.snapshot_operacional import montar_snapshot_operacional
 from integracao.services.comandos_administrativos import executar_comando_administrativo, reenviar_resultados_pendentes
-from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
+from integracao.services.ativacao import marcar_credencial_hub_revogada
+from integracao.services.retaguarda import RetaguardaClient, RetaguardaCredencialInvalidaError, RetaguardaError
 from integracao.services.sincronizacao import executar_sincronizacao_comando
 from sysvarhub.version import VERSION
 
@@ -41,6 +42,10 @@ class SyncWorker:
                 versao=VERSION,
                 snapshot_operacional=montar_snapshot_operacional(hub),
             )
+        except RetaguardaCredencialInvalidaError:
+            logger.warning("Credencial do Hub foi revogada na retaguarda; ativacao local sera removida.", exc_info=True)
+            marcar_credencial_hub_revogada(hub)
+            return
         except RetaguardaError:
             logger.warning("Heartbeat do Hub falhou.", exc_info=True)
             return

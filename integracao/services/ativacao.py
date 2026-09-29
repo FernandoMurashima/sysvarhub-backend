@@ -63,6 +63,25 @@ def serializar_status_ativacao(hub):
     }
 
 
+def marcar_credencial_hub_revogada(hub):
+    with transaction.atomic():
+        hub = HubConfig.objects.select_for_update().get(pk=hub.pk)
+        hub.ativo = False
+        hub.retaguarda_token = ""
+        hub.retaguarda_hub_id = None
+        hub.ativado_em = None
+        hub.save(
+            update_fields=[
+                "ativo",
+                "retaguarda_token",
+                "retaguarda_hub_id",
+                "ativado_em",
+                "atualizado_em",
+            ]
+        )
+    return hub
+
+
 def _validar_resposta_ativacao(resposta, hub):
     obrigatorios = ("token", "hub_uuid", "hub_id", "loja_id", "empresa_id")
     faltando = [campo for campo in obrigatorios if not resposta.get(campo)]

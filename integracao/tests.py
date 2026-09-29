@@ -4,6 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 import tempfile
 import uuid
+from urllib import error
 from unittest.mock import patch
 
 from django.core.management import call_command
@@ -25,13 +26,18 @@ from core.models import (
 )
 from integracao.services.bootstrap import BootstrapValidationError, sincronizar_bootstrap
 from integracao.services.catalogo import CatalogoValidationError, sincronizar_catalogo
-from integracao.services.ativacao import AtivacaoHubError, ativar_hub_local, serializar_status_ativacao
+from integracao.services.ativacao import (
+    AtivacaoHubError,
+    ativar_hub_local,
+    marcar_credencial_hub_revogada,
+    serializar_status_ativacao,
+)
 from integracao.services.formas_pagamento import (
     FormasPagamentoValidationError,
     sincronizar_formas_pagamento,
 )
 from integracao.services.clientes import ClientesValidationError, sincronizar_clientes
-from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
+from integracao.services.retaguarda import RetaguardaClient, RetaguardaCredencialInvalidaError, RetaguardaError
 
 
 class _JsonResponse:
@@ -258,6 +264,45 @@ class RetaguardaClientTests(TestCase):
                     versao="0.1.0",
                 )
 
+    def test_http_credencial_hub_invalida_gera_erro_terminal(self):
+        payload = json.dumps({"code": "HUB_CREDENTIAL_INVALID", "detail": "Credencial revogada."}).encode("utf-8")
+        http_error = error.HTTPError("http://central.test/api/hub/heartbeat/", 401, "Unauthorized", {}, io.BytesIO(payload))
+
+        with patch("integracao.services.retaguarda.request.urlopen", side_effect=http_error):
+            with self.assertRaises(RetaguardaCredencialInvalidaError):
+                RetaguardaClient("http://central.test").heartbeat(
+                    token="TOKEN-ANTIGO",
+                    hostname="loja-01",
+                    versao="0.1.0",
+                )
+
+    def test_http_401_sem_codigo_explicito_permanece_transitorio(self):
+        payload = json.dumps({"detail": "Token do Hub invalido."}).encode("utf-8")
+        http_error = error.HTTPError("http://central.test/api/hub/heartbeat/", 401, "Unauthorized", {}, io.BytesIO(payload))
+
+        with patch("integracao.services.retaguarda.request.urlopen", side_effect=http_error):
+            with self.assertRaises(RetaguardaError) as ctx:
+                RetaguardaClient("http://central.test").heartbeat(
+                    token="TOKEN-ANTIGO",
+                    hostname="loja-01",
+                    versao="0.1.0",
+                )
+
+        self.assertNotIsInstance(ctx.exception, RetaguardaCredencialInvalidaError)
+
+    def test_http_500_permanece_erro_controlado_transitorio(self):
+        http_error = error.HTTPError("http://central.test/api/hub/heartbeat/", 500, "Erro", {}, io.BytesIO(b"{}"))
+
+        with patch("integracao.services.retaguarda.request.urlopen", side_effect=http_error):
+            with self.assertRaises(RetaguardaError) as ctx:
+                RetaguardaClient("http://central.test").heartbeat(
+                    token="TOKEN-ANTIGO",
+                    hostname="loja-01",
+                    versao="0.1.0",
+                )
+
+        self.assertNotIsInstance(ctx.exception, RetaguardaCredencialInvalidaError)
+
     def test_baixar_catalogo_imagem_salva_extensao_por_content_type(self):
         casos = [
             ("image/jpeg", ".jpg"),
@@ -406,6 +451,32 @@ class HubAtivacaoServiceTests(TestCase):
         self.assertEqual(hub.empresa_id, 12)
         self.assertEqual(hub.loja_id, 44)
         self.assertEqual(hub.retaguarda_url, "http://central-nova.test")
+
+    def test_marcar_credencial_revogada_limpa_apenas_estado_de_ativacao(self):
+        hub = HubConfig.objects.create(
+            retaguarda_url="http://central.test",
+            ativo=True,
+            retaguarda_token="TOKEN-ANTIGO",
+            retaguarda_hub_id=7,
+            empresa_id=3,
+            empresa_nome="Empresa",
+            loja_id=5,
+            loja_nome="Loja",
+            ativado_em=timezone.now(),
+        )
+        hub_uuid = hub.hub_uuid
+
+        atualizado = marcar_credencial_hub_revogada(hub)
+
+        atualizado.refresh_from_db()
+        self.assertFalse(atualizado.ativo)
+        self.assertEqual(atualizado.retaguarda_token, "")
+        self.assertIsNone(atualizado.retaguarda_hub_id)
+        self.assertIsNone(atualizado.ativado_em)
+        self.assertEqual(atualizado.hub_uuid, hub_uuid)
+        self.assertEqual(atualizado.retaguarda_url, "http://central.test")
+        self.assertEqual(atualizado.empresa_id, 3)
+        self.assertEqual(atualizado.loja_id, 5)
 
 
 @override_settings(ROOT_URLCONF="sysvarhub.urls")
