@@ -36,6 +36,7 @@ from core.services.terminais import configurar_terminal
 from core.services.vendas import calcular_disponivel_local, listar_formas_pagamento
 from core.tests_caixa import criar_hub
 from core.tests_vendas import VendaHubTestMixin
+from integracao.services.retaguarda import RetaguardaError
 
 
 FISCAL_ITEM_NFCE = {
@@ -491,6 +492,85 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
         vales = {vale["documento"]: vale for vale in resposta.data["vales_troca"]}
         self.assertTrue(vales["VT0000001"]["utilizavel_offline"])
         self.assertFalse(vales["VT0000002"]["utilizavel_offline"])
+
+    def test_endpoint_vales_troca_disponiveis_consulta_central_e_canonicaliza_espelho(self):
+        cliente = self.criar_cliente(retaguarda_id=123)
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        ValeTrocaHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=45,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            documento="VT-HUB-DEV-antigo",
+            valor_original=Decimal("219.90"),
+            saldo=Decimal("219.90"),
+            sincronizado_em=timezone.now(),
+        )
+
+        resposta_central = {
+            "vales_troca": [
+                {
+                    "id": 45,
+                    "documento": "VT0000001",
+                    "cliente": {"id": 123, "nome": "Fernanda Oliveira Lima", "documento": "12345678901"},
+                    "valor_original": "219.90",
+                    "saldo_contabil": "219.90",
+                    "saldo_reservado": "0.00",
+                    "saldo_disponivel": "219.90",
+                    "status": "ABERTO",
+                    "validade": None,
+                    "loja_origem": {"id": 1, "nome": "Loja"},
+                    "devolucao_origem": None,
+                },
+                {
+                    "id": 46,
+                    "documento": "VT0000002",
+                    "cliente": {"id": 123, "nome": "Fernanda Oliveira Lima", "documento": "12345678901"},
+                    "valor_original": "219.90",
+                    "saldo_contabil": "219.90",
+                    "saldo_reservado": "0.00",
+                    "saldo_disponivel": "219.90",
+                    "status": "ABERTO",
+                    "validade": None,
+                    "loja_origem": {"id": 1, "nome": "Loja"},
+                    "devolucao_origem": None,
+                },
+            ]
+        }
+
+        with patch("core.services.vales_troca.RetaguardaClient") as client_cls:
+            client_cls.return_value.vale_troca_disponiveis.return_value = resposta_central
+            resposta = self.client.get(f"/api/terminal/vale-troca/disponiveis/?venda_uuid={venda_uuid}")
+
+        self.assertEqual(resposta.status_code, 200)
+        client_cls.return_value.vale_troca_disponiveis.assert_called_once_with(token=self.hub.retaguarda_token, cliente_id=123)
+        self.assertEqual([vale["documento"] for vale in resposta.data["vales_troca"]], ["VT0000001", "VT0000002"])
+        self.assertEqual(ValeTrocaHub.objects.count(), 1)
+        self.assertEqual(ValeTrocaHub.objects.get(retaguarda_id=45).documento, "VT0000001")
+
+    def test_endpoint_vales_troca_disponiveis_central_offline_retorna_erro_sem_espelho(self):
+        cliente = self.criar_cliente(retaguarda_id=123)
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        ValeTrocaHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=45,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            documento="VT-HUB-DEV-antigo",
+            valor_original=Decimal("219.90"),
+            saldo=Decimal("219.90"),
+            sincronizado_em=timezone.now(),
+        )
+
+        with patch("core.services.vales_troca.RetaguardaClient") as client_cls:
+            client_cls.return_value.vale_troca_disponiveis.side_effect = RetaguardaError("offline")
+            resposta = self.client.get(f"/api/terminal/vale-troca/disponiveis/?venda_uuid={venda_uuid}")
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertIn("Central offline. Consulta de Vale-Troca indisponível", resposta.data["detail"])
+        self.assertEqual(ValeTrocaHub.objects.get(retaguarda_id=45).documento, "VT-HUB-DEV-antigo")
 
     def test_vale_retaguarda_nao_pode_ser_consumido_offline(self):
         cliente = self.criar_cliente()

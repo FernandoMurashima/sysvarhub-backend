@@ -227,6 +227,15 @@ class RetaguardaClient:
             headers={"Authorization": f"Hub {token}"},
         )
 
+    def vale_troca_disponiveis(self, *, token, cliente_id):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._request_json(
+            f"api/hub/vales-troca/disponiveis/?cliente_id={parse.quote(str(cliente_id or ''))}",
+            method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
     def vale_troca_reservar_venda(self, *, token, payload):
         if not token:
             raise RetaguardaError("Token da retaguarda não informado.")

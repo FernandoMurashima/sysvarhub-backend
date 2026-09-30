@@ -87,7 +87,7 @@ from core.services.vendas import (
     selecionar_vendedor,
     venda_atual,
 )
-from core.services.vales_troca import adicionar_pagamento_vale_troca, consultar_vale_troca_online
+from core.services.vales_troca import adicionar_pagamento_vale_troca, consultar_vale_troca_online, listar_vales_troca_online_disponiveis
 from core.services.danfe_nfce import DanfeNFCeErroDominio, montar_dados_danfe_nfce
 from core.services.devolucoes import (
     consultar_venda_para_devolucao,
@@ -894,6 +894,20 @@ class ValeTrocaConsultarView(APIView):
     def get(self, request):
         try:
             payload = consultar_vale_troca_online(request.sysvar_terminal.hub, request.query_params.get("documento"))
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(payload)
+
+
+class ValeTrocaDisponiveisView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        try:
+            payload = listar_vales_troca_online_disponiveis(request.sysvar_terminal, request.query_params.get("venda_uuid"))
         except VendaConflictError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         except VendaError as exc:

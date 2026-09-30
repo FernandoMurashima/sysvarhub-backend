@@ -3,7 +3,7 @@ import re
 
 from django.db import transaction
 
-from core.models import VendaEventoHub, VendaHub, VendaPagamentoHub
+from core.models import ValeTrocaHub, VendaEventoHub, VendaHub, VendaPagamentoHub
 from core.services.vendas import (
     DINHEIRO,
     ZERO_2,
@@ -37,6 +37,45 @@ def consultar_vale_troca_online(hub, documento):
         return _client(hub).vale_troca_consultar(token=hub.retaguarda_token, documento=documento)
     except RetaguardaError as exc:
         raise VendaConflictError(f"Central ONLINE indisponivel para consultar Vale-Troca: {exc}") from exc
+
+
+def canonicalizar_espelho_vale_troca(hub, cliente, vale_payload):
+    retaguarda_id = vale_payload.get("id")
+    if not retaguarda_id:
+        return
+    registro = ValeTrocaHub.objects.filter(hub=hub, retaguarda_id=retaguarda_id).first()
+    if registro is None:
+        return
+    registro.cliente_uuid = cliente.cliente_uuid
+    registro.cliente_retaguarda_id = cliente.cliente_retaguarda_id
+    registro.documento = str(vale_payload.get("documento") or registro.documento).strip().upper()
+    registro.valor_original = money(Decimal(str(vale_payload.get("valor_original") or registro.valor_original or "0.00")))
+    registro.saldo = money(Decimal(str(vale_payload.get("saldo_contabil") or registro.saldo or "0.00")))
+    registro.status = vale_payload.get("status") or registro.status
+    registro.validade = vale_payload.get("validade") or registro.validade
+    registro.save(update_fields=["cliente_uuid", "cliente_retaguarda_id", "documento", "valor_original", "saldo", "status", "validade", "atualizado_em"])
+
+
+def listar_vales_troca_online_disponiveis(terminal, venda_uuid=None):
+    from core.services.vendas import obter_venda_terminal_por_uuid_bloqueada
+
+    with transaction.atomic():
+        terminal_bloqueado = terminal.__class__.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
+        venda = obter_venda_terminal_por_uuid_bloqueada(terminal_bloqueado, venda_uuid) if venda_uuid else VendaHub.objects.select_for_update().filter(terminal=terminal_bloqueado, status=VendaHub.STATUS_ABERTA).order_by("-criado_em").first()
+        if not venda:
+            raise VendaConflictError("Venda não está aberta.")
+        if not venda.cliente_uuid or not venda.cliente_retaguarda_id:
+            raise VendaConflictError("Vale-Troca exige cliente identificado.")
+        if venda.cliente_padrao:
+            raise VendaConflictError("Vale-Troca não pode ser usado para Consumidor Final.")
+        try:
+            resposta = _client(terminal_bloqueado.hub).vale_troca_disponiveis(token=terminal_bloqueado.hub.retaguarda_token, cliente_id=venda.cliente_retaguarda_id)
+        except RetaguardaError as exc:
+            raise VendaConflictError(f"Central offline. Consulta de Vale-Troca indisponível: {exc}") from exc
+        vales = resposta.get("vales_troca") or []
+        for vale in vales:
+            canonicalizar_espelho_vale_troca(terminal_bloqueado.hub, venda, vale)
+        return {"vales_troca": vales}
 
 
 def adicionar_pagamento_vale_troca(terminal, operador, sessao_operador, *, venda_uuid, operacao_uuid, documento, valor):
