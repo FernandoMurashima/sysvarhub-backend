@@ -117,6 +117,9 @@ def payload_venda_finalizada(venda):
                 "autorizacao": pagamento.autorizacao,
                 "tipo": pagamento.tipo,
                 "vale_troca_documento": pagamento.vale_troca_documento,
+                "vale_troca_retaguarda_id": pagamento.vale_troca_retaguarda_id,
+                "vale_troca_reserva_id": pagamento.vale_troca_reserva_id,
+                "operacao_uuid": str(pagamento.operacao_uuid),
             }
             for pagamento in pagamentos
         ],

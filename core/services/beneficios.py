@@ -165,7 +165,7 @@ def registrar_beneficios_venda(venda, pagamentos):
                     valor=pagamento.valor,
                     observacao=f"Uso na venda Hub {venda.venda_uuid}",
                 )
-            if tipo in ("TROCA", "VALE_TROCA"):
+            if tipo in ("TROCA", "VALE_TROCA") and not getattr(pagamento, "vale_troca_reserva_id", None):
                 _consumir_vale(venda, pagamento)
         _gerar_cashback(venda, pagamentos)
 

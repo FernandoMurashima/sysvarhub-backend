@@ -62,6 +62,8 @@ class NFCeConfiguracaoErro(NFCeErroDominio):
 
 
 def _tpag_pagamento(pagamento):
+    if str(pagamento.tipo or "").strip().upper() == "VALE_TROCA":
+        return "05"
     tipo = str(pagamento.forma_pagamento.tipo or "").strip().upper()
     codigo_tpag = TPAG_POR_TIPO_FORMA_PAGAMENTO.get(tipo)
     if not codigo_tpag:

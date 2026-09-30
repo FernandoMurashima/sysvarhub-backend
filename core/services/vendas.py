@@ -599,6 +599,9 @@ def remover_pagamento(terminal, operador, sessao_operador, *, pagamento_uuid):
             raise VendaConflictError("Venda finalizada não permite remover pagamento.")
         if pagamento.status == VendaPagamentoHub.STATUS_REMOVIDO:
             return venda
+        if (pagamento.tipo or "").upper() == "VALE_TROCA" and pagamento.vale_troca_reserva_id:
+            from core.services.vales_troca import liberar_reserva_pagamento_vale_troca
+            liberar_reserva_pagamento_vale_troca(pagamento)
 
         pagamento.status = VendaPagamentoHub.STATUS_REMOVIDO
         pagamento.removido_em = timezone.now()
@@ -668,6 +671,8 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
         if total_pago > venda.total and not any(pagamento.tipo == DINHEIRO for pagamento in pagamentos):
             raise VendaConflictError("Valor do pagamento excede o valor pendente.")
         for pagamento in pagamentos:
+            if (pagamento.tipo or "").upper() == "VALE_TROCA":
+                continue
             try:
                 validar_pagamento_beneficio(venda, pagamento.forma_pagamento, pagamento.valor, pagamento.autorizacao)
             except ValueError as exc:
@@ -706,6 +711,8 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
                     "quantidade": Decimal(item.quantidade).quantize(QUANTIDADE_ESTOQUE),
                 },
             )
+        from core.services.vales_troca import preparar_reservas_vale_troca
+        preparar_reservas_vale_troca(venda, pagamentos)
         try:
             registrar_beneficios_venda(venda, pagamentos)
         except ValueError as exc:

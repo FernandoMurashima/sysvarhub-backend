@@ -87,6 +87,7 @@ from core.services.vendas import (
     selecionar_vendedor,
     venda_atual,
 )
+from core.services.vales_troca import adicionar_pagamento_vale_troca, consultar_vale_troca_online
 from core.services.danfe_nfce import DanfeNFCeErroDominio, montar_dados_danfe_nfce
 from core.services.devolucoes import (
     consultar_venda_para_devolucao,
@@ -884,6 +885,46 @@ class VendaPagamentoDetalheView(APIView):
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({"venda": serializar_venda(venda)})
+
+
+class ValeTrocaConsultarView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        try:
+            payload = consultar_vale_troca_online(request.sysvar_terminal.hub, request.query_params.get("documento"))
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(payload)
+
+
+class ValeTrocaPagamentoView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request):
+        try:
+            venda, criado = adicionar_pagamento_vale_troca(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                venda_uuid=request.data.get("venda_uuid"),
+                operacao_uuid=request.data.get("operacao_uuid"),
+                documento=request.data.get("documento"),
+                valor=request.data.get("valor"),
+            )
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"venda": serializar_venda(venda)}, status=status.HTTP_201_CREATED if criado else status.HTTP_200_OK)
 
 
 class VendaFinalizarView(APIView):

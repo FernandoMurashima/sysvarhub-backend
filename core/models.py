@@ -1393,8 +1393,10 @@ class VendaPagamentoHub(models.Model):
         FormaPagamentoHub,
         on_delete=models.PROTECT,
         related_name="pagamentos_venda",
+        null=True,
+        blank=True,
     )
-    retaguarda_forma_pagamento_id = models.PositiveBigIntegerField()
+    retaguarda_forma_pagamento_id = models.PositiveBigIntegerField(null=True, blank=True)
     codigo = models.CharField(max_length=10)
     descricao = models.CharField(max_length=120)
     tipo = models.CharField(max_length=24)
@@ -1409,6 +1411,8 @@ class VendaPagamentoHub(models.Model):
     autorizacao = models.CharField(max_length=120, blank=True, default="")
     vale_troca_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
     vale_troca_documento = models.CharField(max_length=80, blank=True, default="")
+    vale_troca_reserva_id = models.PositiveBigIntegerField(null=True, blank=True)
+    vale_troca_valor_reservado = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     origem_captura = models.CharField(max_length=10, choices=ORIGEM_CHOICES, default=ORIGEM_MANUAL)
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_ATIVO)
     terminal_inclusao = models.ForeignKey(Terminal, on_delete=models.PROTECT, related_name="pagamentos_incluidos")

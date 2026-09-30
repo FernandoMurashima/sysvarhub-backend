@@ -218,6 +218,42 @@ class RetaguardaClient:
             headers={"Authorization": f"Hub {token}"},
         )
 
+    def vale_troca_consultar(self, *, token, documento):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._request_json(
+            f"api/hub/vales-troca/consultar/?documento={parse.quote(str(documento or ''))}",
+            method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
+    def vale_troca_reservar_venda(self, *, token, payload):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._post_json(
+            "api/hub/vales-troca/reservar-venda/",
+            payload,
+            headers={"Authorization": f"Hub {token}"},
+        )
+
+    def vale_troca_cancelar_reserva(self, *, token, payload):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._post_json(
+            "api/hub/vales-troca/cancelar-reserva/",
+            payload,
+            headers={"Authorization": f"Hub {token}"},
+        )
+
+    def vale_troca_cancelar_venda(self, *, token, venda_uuid):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._post_json(
+            "api/hub/vales-troca/cancelar-venda/",
+            {"venda_uuid": str(venda_uuid)},
+            headers={"Authorization": f"Hub {token}"},
+        )
+
     def sync_push(self, *, token, eventos):
         if not token:
             raise RetaguardaError("Token da retaguarda não informado.")
