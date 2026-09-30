@@ -135,6 +135,7 @@ def _espelhar_devolucao_online(hub, terminal, operador, payload, devolucao_uuid)
             cliente_retaguarda_id=cliente.get("id"),
             motivo=str(payload.get("motivo") or "")[:255],
             valor_total=Decimal(str(payload.get("valor_total") or 0)),
+            fiscal=_normalizar_fiscal_devolucao(payload.get("fiscal")),
             finalizada_em=timezone.now(),
         )
         for item in payload.get("itens") or []:
@@ -349,4 +350,18 @@ def serializar_devolucao(devolucao):
             "documento": vale.documento,
             "saldo": f"{vale.saldo:.2f}",
         } if vale else None,
+        "fiscal": devolucao.fiscal or None,
+    }
+
+
+def _normalizar_fiscal_devolucao(fiscal):
+    if not isinstance(fiscal, dict):
+        return {}
+    return {
+        "status": fiscal.get("status") or "",
+        "numero": fiscal.get("numero"),
+        "serie": fiscal.get("serie"),
+        "modelo": fiscal.get("modelo") or "55",
+        "chave_acesso": fiscal.get("chave_acesso") or "",
+        "mensagem": fiscal.get("mensagem") or fiscal.get("retorno_mensagem") or "",
     }

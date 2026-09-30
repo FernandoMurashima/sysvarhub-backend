@@ -1603,6 +1603,7 @@ class VendaDevolucaoHub(models.Model):
     cliente_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
     motivo = models.CharField(max_length=255, blank=True, default="")
     valor_total = models.DecimalField(max_digits=18, decimal_places=2)
+    fiscal = models.JSONField(default=dict, blank=True)
     status = models.CharField(max_length=12, default=STATUS_FINALIZADA)
     finalizada_em = models.DateTimeField()
     criado_em = models.DateTimeField(auto_now_add=True)
