@@ -877,7 +877,7 @@ class ClientesSyncTests(TestCase):
         vale = ValeTrocaHub.objects.create(
             hub=self.hub,
             cliente_uuid=cliente_local.cliente_uuid,
-            documento="VT-100",
+            documento="VT0000100",
             valor_original="50.00",
             saldo="50.00",
         )
@@ -889,7 +889,7 @@ class ClientesSyncTests(TestCase):
                     vales_troca=[
                         {
                             "id": 900,
-                            "documento": "VT-100",
+                            "documento": "VT0000100",
                             "valor_original": "50.00",
                             "saldo": "50.00",
                             "status": "ABERTO",

@@ -469,7 +469,7 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
             hub=self.hub,
             cliente_uuid=cliente.cliente_uuid,
             cliente_retaguarda_id=cliente.retaguarda_id,
-            documento="VT-LOCAL",
+            documento="VT0000001",
             valor_original=Decimal("10.00"),
             saldo=Decimal("10.00"),
         )
@@ -477,7 +477,7 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
             hub=self.hub,
             cliente_uuid=cliente.cliente_uuid,
             cliente_retaguarda_id=cliente.retaguarda_id,
-            documento="VT-RET",
+            documento="VT0000002",
             valor_original=Decimal("20.00"),
             saldo=Decimal("20.00"),
             sincronizado_em=timezone.now(),
@@ -489,8 +489,8 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(resposta.data["cashback"]["saldo_retaguarda"], "80.00")
         self.assertEqual(resposta.data["cashback"]["saldo_offline_utilizavel"], "30.00")
         vales = {vale["documento"]: vale for vale in resposta.data["vales_troca"]}
-        self.assertTrue(vales["VT-LOCAL"]["utilizavel_offline"])
-        self.assertFalse(vales["VT-RET"]["utilizavel_offline"])
+        self.assertTrue(vales["VT0000001"]["utilizavel_offline"])
+        self.assertFalse(vales["VT0000002"]["utilizavel_offline"])
 
     def test_vale_retaguarda_nao_pode_ser_consumido_offline(self):
         cliente = self.criar_cliente()
@@ -498,7 +498,7 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
             hub=self.hub,
             cliente_uuid=cliente.cliente_uuid,
             cliente_retaguarda_id=cliente.retaguarda_id,
-            documento="VT-RET",
+            documento="VT0000003",
             valor_original=Decimal("40.00"),
             saldo=Decimal("40.00"),
             sincronizado_em=timezone.now(),
@@ -514,7 +514,7 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
                 "operacao_uuid": str(uuid.uuid4()),
                 "forma_pagamento_id": troca.id,
                 "valor": "10.00",
-                "autorizacao": "VT-RET",
+                "autorizacao": "VT0000003",
             },
             format="json",
         )
@@ -538,7 +538,7 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
             hub=self.hub,
             cliente_uuid=cliente.cliente_uuid,
             cliente_retaguarda_id=cliente.retaguarda_id,
-            documento="VT-LOCAL",
+            documento="VT0000004",
             valor_original=Decimal("15.00"),
             saldo=Decimal("15.00"),
         )
