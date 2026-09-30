@@ -88,7 +88,15 @@ from core.services.vendas import (
     venda_atual,
 )
 from core.services.danfe_nfce import DanfeNFCeErroDominio, montar_dados_danfe_nfce
-from core.services.devolucoes import consultar_venda_para_devolucao, consultar_venda_para_devolucao_por_documento, finalizar_devolucao, serializar_devolucao
+from core.services.devolucoes import (
+    consultar_venda_para_devolucao,
+    consultar_venda_para_devolucao_online,
+    consultar_venda_para_devolucao_por_documento,
+    finalizar_devolucao,
+    listar_vendas_cliente_devolucao,
+    pesquisar_clientes_devolucao,
+    serializar_devolucao,
+)
 
 
 CATALOGO_TERMINAL_LIMIT_DEFAULT = 40
@@ -938,6 +946,23 @@ class DevolucaoConsultarView(APIView):
             return Response({"venda": consultar_venda_para_devolucao(request.sysvar_terminal, venda_uuid)})
         except VendaNotFoundError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+
+
+class DevolucaoVendaCentralView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request, venda_id):
+        try:
+            return Response({"venda": consultar_venda_para_devolucao_online(request.sysvar_terminal, venda_id)})
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class DevolucaoVendasView(APIView):
@@ -949,6 +974,41 @@ class DevolucaoVendasView(APIView):
             return Response({"venda": consultar_venda_para_devolucao_por_documento(request.sysvar_terminal, request.query_params.get("documento"))})
         except VendaNotFoundError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class DevolucaoClientesView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        try:
+            return Response(pesquisar_clientes_devolucao(
+                request.sysvar_terminal,
+                termo=request.query_params.get("q") or "",
+                documento=request.query_params.get("documento") or "",
+                nome=request.query_params.get("nome") or "",
+            ))
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class DevolucaoClienteVendasView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request, cliente_id):
+        try:
+            return Response(listar_vendas_cliente_devolucao(request.sysvar_terminal, cliente_id))
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         except VendaError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -962,9 +1022,12 @@ class DevolucaoFinalizarView(APIView):
             devolucao = finalizar_devolucao(
                 request.sysvar_terminal,
                 request.sysvar_operador,
+                venda_id=request.data.get("venda_id"),
                 venda_uuid=request.data.get("venda_uuid"),
+                documento_venda=request.data.get("documento_venda") or "",
                 itens=request.data.get("itens") or [],
                 motivo=request.data.get("motivo") or "",
+                devolucao_uuid=request.data.get("devolucao_uuid"),
             )
         except VendaNotFoundError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)

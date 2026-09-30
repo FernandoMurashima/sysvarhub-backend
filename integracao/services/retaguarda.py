@@ -1,7 +1,7 @@
 import json
 import os
 import tempfile
-from urllib import error, request
+from urllib import error, parse, request
 from urllib.parse import urljoin
 
 
@@ -169,6 +169,52 @@ class RetaguardaClient:
         return self._request_json(
             "api/hub/clientes/",
             method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
+    def devolucao_venda(self, *, token, documento):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._request_json(
+            f"api/hub/devolucoes/vendas/?documento={parse.quote(str(documento or ''))}",
+            method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
+    def devolucao_venda_detalhe(self, *, token, venda_id):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._request_json(
+            f"api/hub/devolucoes/vendas/{venda_id}/",
+            method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
+    def devolucao_clientes(self, *, token, termo="", documento="", nome=""):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        qs = parse.urlencode({"q": termo or "", "documento": documento or "", "nome": nome or ""})
+        return self._request_json(
+            f"api/hub/devolucoes/clientes/?{qs}",
+            method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
+    def devolucao_cliente_vendas(self, *, token, cliente_id):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._request_json(
+            f"api/hub/devolucoes/clientes/{cliente_id}/vendas/",
+            method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
+    def devolucao_finalizar(self, *, token, payload):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._post_json(
+            "api/hub/devolucoes/finalizar/",
+            payload,
             headers={"Authorization": f"Hub {token}"},
         )
 

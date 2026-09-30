@@ -1589,7 +1589,14 @@ class VendaDevolucaoHub(models.Model):
 
     devolucao_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="devolucoes")
-    venda_origem = models.ForeignKey(VendaHub, on_delete=models.PROTECT, related_name="devolucoes")
+    venda_origem = models.ForeignKey(VendaHub, on_delete=models.PROTECT, null=True, blank=True, related_name="devolucoes")
+    venda_origem_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True, db_index=True)
+    venda_origem_documento = models.CharField(max_length=80, blank=True, default="")
+    loja_origem_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    loja_origem_nome = models.CharField(max_length=150, blank=True, default="")
+    documento_central = models.CharField(max_length=80, blank=True, default="")
+    retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True, db_index=True)
+    confirmado_central_em = models.DateTimeField(null=True, blank=True)
     operador = models.ForeignKey(OperadorHub, on_delete=models.PROTECT, related_name="devolucoes")
     terminal = models.ForeignKey(Terminal, on_delete=models.PROTECT, related_name="devolucoes")
     cliente_uuid = models.UUIDField(null=True, blank=True)
@@ -1606,7 +1613,7 @@ class VendaDevolucaoHub(models.Model):
 
 class VendaDevolucaoItemHub(models.Model):
     devolucao = models.ForeignKey(VendaDevolucaoHub, on_delete=models.PROTECT, related_name="itens")
-    venda_item = models.ForeignKey(VendaItemHub, on_delete=models.PROTECT, related_name="devolucoes")
+    venda_item = models.ForeignKey(VendaItemHub, on_delete=models.PROTECT, null=True, blank=True, related_name="devolucoes")
     catalogo_item = models.ForeignKey(CatalogoItemHub, on_delete=models.PROTECT, related_name="devolucoes")
     retaguarda_produto_id = models.PositiveBigIntegerField()
     retaguarda_sku_id = models.PositiveBigIntegerField()
