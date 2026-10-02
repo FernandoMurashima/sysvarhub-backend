@@ -7,7 +7,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from core.models import CashbackMovimentoHub, EventoSyncHub, NFCeHub, ValeTrocaHub, VendaDevolucaoHub, VendaHub, VendaPagamentoHub
+from core.models import CashbackMovimentoHub, EventoSyncHub, NFCeHub, ValeTrocaHub, ValeTrocaMovimentoHub, VendaDevolucaoHub, VendaHub, VendaPagamentoHub
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 
 
@@ -21,6 +21,9 @@ SEGREDOS_BLOQUEADOS = {"certificado", "private_key", "chave_privada", "senha", "
 def enfileirar_venda_finalizada(venda):
     venda = _venda_queryset().get(pk=venda.pk)
     payload = payload_venda_finalizada(venda)
+    pendencias = _dependencias_devolucao_venda(venda)
+    if pendencias:
+        payload["dependencias"] = {"devolucoes_uuid": pendencias}
     return _criar_ou_atualizar_evento(
         hub=venda.hub,
         tipo=TIPO_VENDA_FINALIZADA,
@@ -157,7 +160,15 @@ def payload_devolucao_finalizada(devolucao):
     vale = getattr(devolucao, "vale_troca", None)
     return {
         "devolucao_uuid": str(devolucao.devolucao_uuid),
-        "venda_uuid": str(devolucao.venda_origem.venda_uuid),
+        "origem": devolucao.origem,
+        "venda_uuid": str(devolucao.venda_origem.venda_uuid) if devolucao.venda_origem_id else None,
+        "venda_origem_retaguarda_id": devolucao.venda_origem_retaguarda_id,
+        "documento_venda": devolucao.venda_origem_documento,
+        "loja_origem_retaguarda_id": devolucao.loja_origem_retaguarda_id,
+        "loja_origem_nome": devolucao.loja_origem_nome,
+        "loja_recebimento_retaguarda_id": devolucao.hub.loja_id,
+        "loja_recebimento_nome": devolucao.hub.loja_nome,
+        "dados_origem": devolucao.dados_origem or {},
         "cliente_uuid": str(devolucao.cliente_uuid) if devolucao.cliente_uuid else None,
         "cliente_retaguarda_id": devolucao.cliente_retaguarda_id,
         "operador_retaguarda_usuario_id": devolucao.operador.retaguarda_usuario_id,
@@ -167,7 +178,7 @@ def payload_devolucao_finalizada(devolucao):
         "finalizada_em": devolucao.finalizada_em.isoformat(),
         "itens": [
             {
-                "item_uuid": str(item.venda_item.item_uuid),
+                "item_uuid": str(item.venda_item.item_uuid) if item.venda_item_id else None,
                 "sku_retaguarda_id": item.retaguarda_sku_id,
                 "produto_retaguarda_id": item.retaguarda_produto_id,
                 "ean": item.ean13,
@@ -184,6 +195,7 @@ def payload_devolucao_finalizada(devolucao):
             "valor": f"{vale.valor_original:.2f}",
             "saldo": f"{vale.saldo:.2f}",
             "validade": vale.validade.isoformat() if vale.validade else None,
+            "provisorio": vale.provisorio,
         } if vale else None,
     }
 
@@ -197,7 +209,15 @@ def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=Non
         if hub is not None:
             qs = qs.filter(hub=hub)
         qs = qs.filter(Q(proxima_tentativa_em__isnull=True) | Q(proxima_tentativa_em__lte=agora))
-        eventos = list(qs.order_by("criado_em", "id")[:limite])
+        candidatos = list(qs.order_by("criado_em", "id")[:limite])
+        eventos = []
+        for evento in candidatos:
+            if _evento_bloqueado_por_dependencia(evento):
+                evento.ultimo_erro = "Aguardando devolução provisória ser confirmada pela Central."
+                evento.proxima_tentativa_em = agora + timedelta(seconds=60)
+                evento.save(update_fields=["ultimo_erro", "proxima_tentativa_em", "atualizado_em"])
+                continue
+            eventos.append(evento)
         for evento in eventos:
             evento.status = EventoSyncHub.STATUS_PROCESSANDO
             evento.tentativas += 1
@@ -224,12 +244,14 @@ def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=Non
             evento.ultimo_erro = ""
             evento.save(update_fields=["status", "sincronizado_em", "resposta", "ultimo_erro", "atualizado_em"])
             _marcar_beneficios_centralizados(evento, agora)
+            _canonicalizar_devolucao_confirmada(evento, resultado, agora)
             contadores["sincronizados"] += 1
         elif status == "CONFLITO":
             evento.status = EventoSyncHub.STATUS_CONFLITO
             evento.resposta = resultado
             evento.ultimo_erro = resultado.get("mensagem", "CONFLITO")[:255]
             evento.save(update_fields=["status", "resposta", "ultimo_erro", "atualizado_em"])
+            _marcar_devolucao_em_conflito(evento, evento.ultimo_erro)
             contadores["conflitos"] += 1
         else:
             _marcar_retry(evento, resultado.get("mensagem", "ERRO"), agora, resposta=resultado)
@@ -295,6 +317,77 @@ def _marcar_beneficios_centralizados(evento, agora):
         documento = vale_payload.get("documento")
         if documento:
             qs.filter(documento=documento).update(sincronizado_em=agora)
+
+
+def _canonicalizar_devolucao_confirmada(evento, resultado, agora):
+    if evento.tipo != TIPO_DEVOLUCAO_FINALIZADA:
+        return
+    payload = evento.payload or {}
+    devolucao_uuid = payload.get("devolucao_uuid")
+    if not devolucao_uuid:
+        return
+    devolucao = VendaDevolucaoHub.objects.filter(hub=evento.hub, devolucao_uuid=devolucao_uuid).first()
+    if not devolucao:
+        return
+    devolucao.status = VendaDevolucaoHub.STATUS_FINALIZADA
+    devolucao.conflito_mensagem = ""
+    devolucao.retaguarda_id = resultado.get("devolucao_retaguarda_id") or devolucao.retaguarda_id
+    devolucao.documento_central = resultado.get("documento") or devolucao.documento_central
+    devolucao.confirmado_central_em = agora
+    devolucao.save(update_fields=["status", "conflito_mensagem", "retaguarda_id", "documento_central", "confirmado_central_em"])
+    vale = getattr(devolucao, "vale_troca", None)
+    if vale:
+        vale.documento = resultado.get("vale_documento") or vale.documento
+        vale.retaguarda_id = resultado.get("vale_retaguarda_id") or vale.retaguarda_id
+        vale.provisorio = False
+        vale.origem = ValeTrocaHub.ORIGEM_CENTRAL
+        vale.conflito_mensagem = ""
+        vale.sincronizado_em = agora
+        vale.save(update_fields=["documento", "retaguarda_id", "provisorio", "origem", "conflito_mensagem", "sincronizado_em", "atualizado_em"])
+
+
+def _dependencias_devolucao_venda(venda):
+    docs = [
+        pagamento.vale_troca_documento
+        for pagamento in venda.pagamentos.filter(status=VendaPagamentoHub.STATUS_ATIVO, tipo__in=["TROCA", "VALE_TROCA"])
+        if pagamento.vale_troca_documento
+    ]
+    if not docs:
+        return []
+    movimentos = (
+        ValeTrocaMovimentoHub.objects
+        .select_related("vale", "vale__devolucao")
+        .filter(venda=venda, vale__documento__in=docs, vale__provisorio=True, vale__devolucao__isnull=False)
+    )
+    return sorted({str(mov.vale.devolucao.devolucao_uuid) for mov in movimentos})
+
+
+def _evento_bloqueado_por_dependencia(evento):
+    if evento.tipo != TIPO_VENDA_FINALIZADA:
+        return False
+    deps = ((evento.payload or {}).get("dependencias") or {}).get("devolucoes_uuid") or []
+    if not deps:
+        return False
+    return ValeTrocaHub.objects.filter(
+        hub=evento.hub,
+        devolucao__devolucao_uuid__in=deps,
+        provisorio=True,
+    ).exists()
+
+
+def _marcar_devolucao_em_conflito(evento, mensagem):
+    if evento.tipo != TIPO_DEVOLUCAO_FINALIZADA:
+        return
+    devolucao_uuid = (evento.payload or {}).get("devolucao_uuid")
+    if not devolucao_uuid:
+        return
+    VendaDevolucaoHub.objects.filter(hub=evento.hub, devolucao_uuid=devolucao_uuid).update(
+        status=VendaDevolucaoHub.STATUS_CONFLITO,
+        conflito_mensagem=mensagem[:255],
+    )
+    ValeTrocaHub.objects.filter(hub=evento.hub, devolucao__devolucao_uuid=devolucao_uuid).update(
+        conflito_mensagem=mensagem[:255],
+    )
 
 
 def _uuid_deterministico(*partes):

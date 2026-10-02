@@ -1513,6 +1513,8 @@ class ValeTrocaHub(models.Model):
     STATUS_USADO = "USADO"
     STATUS_CANCELADO = "CANCELADO"
     STATUS_EXPIRADO = "EXPIRADO"
+    ORIGEM_CENTRAL = "CENTRAL"
+    ORIGEM_HUB_PROVISORIO = "HUB_PROVISORIO"
 
     hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="vales_troca")
     vale_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
@@ -1526,6 +1528,9 @@ class ValeTrocaHub(models.Model):
     status = models.CharField(max_length=12, default=STATUS_ABERTO)
     validade = models.DateField(null=True, blank=True)
     origem_devolucao_uuid = models.UUIDField(null=True, blank=True)
+    origem = models.CharField(max_length=20, default=ORIGEM_CENTRAL)
+    provisorio = models.BooleanField(default=False)
+    conflito_mensagem = models.CharField(max_length=255, blank=True, default="")
     sincronizado_em = models.DateTimeField(null=True, blank=True)
     criado_em = models.DateTimeField(auto_now_add=True)
     atualizado_em = models.DateTimeField(auto_now=True)
@@ -1590,6 +1595,9 @@ class PromocaoHub(models.Model):
 
 class VendaDevolucaoHub(models.Model):
     STATUS_FINALIZADA = "FINALIZADA"
+    STATUS_CONFLITO = "CONFLITO"
+    ORIGEM_VENDA_LOCAL = "VENDA_LOCAL"
+    ORIGEM_MANUAL_OUTRA_LOJA = "MANUAL_OUTRA_LOJA"
 
     devolucao_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="devolucoes")
@@ -1608,6 +1616,9 @@ class VendaDevolucaoHub(models.Model):
     motivo = models.CharField(max_length=255, blank=True, default="")
     valor_total = models.DecimalField(max_digits=18, decimal_places=2)
     fiscal = models.JSONField(default=dict, blank=True)
+    origem = models.CharField(max_length=24, default=ORIGEM_VENDA_LOCAL)
+    dados_origem = models.JSONField(default=dict, blank=True)
+    conflito_mensagem = models.CharField(max_length=255, blank=True, default="")
     status = models.CharField(max_length=12, default=STATUS_FINALIZADA)
     finalizada_em = models.DateTimeField()
     criado_em = models.DateTimeField(auto_now_add=True)

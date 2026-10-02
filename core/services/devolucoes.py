@@ -4,7 +4,7 @@ from decimal import Decimal
 from django.db import models, transaction
 from django.utils import timezone
 
-from core.models import CatalogoItemHub, ValeTrocaHub, ValeTrocaMovimentoHub, VendaDevolucaoHub, VendaDevolucaoItemHub, VendaHub, VendaItemHub
+from core.models import CatalogoItemHub, ClienteHub, ValeTrocaHub, ValeTrocaMovimentoHub, VendaDevolucaoHub, VendaDevolucaoItemHub, VendaHub, VendaItemHub
 from core.services.central_status import CENTRAL_STATUS_ONLINE, calcular_status_central
 from core.services.sync import enfileirar_devolucao_finalizada
 from core.services.vendas import VendaConflictError, VendaNotFoundError, VendaValidationError, money
@@ -208,7 +208,16 @@ def consultar_venda_para_devolucao_por_documento_local(terminal, documento):
 
 def finalizar_devolucao(terminal, operador, *, venda_uuid=None, venda_id=None, documento_venda="", itens, motivo="", devolucao_uuid=None):
     if not venda_id and venda_uuid:
-        return finalizar_devolucao_local(terminal, operador, venda_uuid=venda_uuid, itens=itens, motivo=motivo)
+        return finalizar_devolucao_local(terminal, operador, venda_uuid=venda_uuid, itens=itens, motivo=motivo, devolucao_uuid=devolucao_uuid)
+    if not venda_id and not venda_uuid:
+        return finalizar_devolucao_manual_offline(
+            terminal,
+            operador,
+            documento_venda=documento_venda,
+            itens=itens,
+            motivo=motivo,
+            devolucao_uuid=devolucao_uuid,
+        )
     return finalizar_devolucao_online(
         terminal,
         operador,
@@ -221,10 +230,14 @@ def finalizar_devolucao(terminal, operador, *, venda_uuid=None, venda_id=None, d
     )
 
 
-def finalizar_devolucao_local(terminal, operador, *, venda_uuid, itens, motivo=""):
+def finalizar_devolucao_local(terminal, operador, *, venda_uuid, itens, motivo="", devolucao_uuid=None):
     if not itens:
         raise VendaValidationError("Informe os itens da devolução.")
+    devolucao_uuid = uuid.UUID(str(devolucao_uuid or uuid.uuid4()))
     with transaction.atomic():
+        existente = VendaDevolucaoHub.objects.select_for_update().filter(hub=terminal.hub, devolucao_uuid=devolucao_uuid).first()
+        if existente:
+            return existente
         venda = (
             VendaHub.objects.select_for_update()
             .filter(hub=terminal.hub, venda_uuid=venda_uuid, status=VendaHub.STATUS_FINALIZADA)
@@ -259,14 +272,20 @@ def finalizar_devolucao_local(terminal, operador, *, venda_uuid, itens, motivo="
             raise VendaValidationError("Valor da devolução inválido.")
 
         devolucao = VendaDevolucaoHub.objects.create(
+            devolucao_uuid=devolucao_uuid,
             hub=terminal.hub,
             venda_origem=venda,
+            venda_origem_retaguarda_id=None,
+            venda_origem_documento=_documento_venda_local(venda),
+            loja_origem_retaguarda_id=terminal.hub.loja_id,
+            loja_origem_nome=terminal.hub.loja_nome,
             operador=operador,
             terminal=terminal,
             cliente_uuid=venda.cliente_uuid,
             cliente_retaguarda_id=venda.cliente_retaguarda_id,
             motivo=str(motivo or "")[:255],
             valor_total=total,
+            origem=VendaDevolucaoHub.ORIGEM_VENDA_LOCAL,
             finalizada_em=timezone.now(),
         )
         for item, quantidade, valor in linhas:
@@ -297,6 +316,8 @@ def finalizar_devolucao_local(terminal, operador, *, venda_uuid, itens, motivo="
             saldo=total,
             status=ValeTrocaHub.STATUS_ABERTO,
             origem_devolucao_uuid=devolucao.devolucao_uuid,
+            origem=ValeTrocaHub.ORIGEM_HUB_PROVISORIO,
+            provisorio=True,
         )
         ValeTrocaMovimentoHub.objects.create(
             vale=vale,
@@ -304,6 +325,101 @@ def finalizar_devolucao_local(terminal, operador, *, venda_uuid, itens, motivo="
             valor=total,
             saldo_apos=total,
             observacao=f"Crédito gerado pela devolução Hub {devolucao.devolucao_uuid}",
+        )
+        transaction.on_commit(lambda devolucao_id=devolucao.pk: enfileirar_devolucao_finalizada(VendaDevolucaoHub.objects.get(pk=devolucao_id)))
+    return devolucao
+
+
+def finalizar_devolucao_manual_offline(terminal, operador, *, documento_venda="", itens, motivo="", devolucao_uuid=None):
+    _exigir_central_offline(terminal.hub)
+    if not itens:
+        raise VendaValidationError("Informe os itens da devolução.")
+    documento_venda = str(documento_venda or "").strip()
+    if not documento_venda:
+        raise VendaValidationError("Informe o documento/cupom original.")
+    devolucao_uuid = uuid.UUID(str(devolucao_uuid or uuid.uuid4()))
+    with transaction.atomic():
+        existente = VendaDevolucaoHub.objects.select_for_update().filter(hub=terminal.hub, devolucao_uuid=devolucao_uuid).first()
+        if existente:
+            return existente
+        cliente = _cliente_manual(terminal.hub, itens)
+        linhas = []
+        total = Decimal("0.00")
+        for entrada in itens:
+            catalogo = _catalogo_manual(terminal.hub, entrada)
+            quantidade = int(entrada.get("quantidade") or 0)
+            if quantidade <= 0:
+                raise VendaValidationError("Quantidade devolvida inválida.")
+            valor_liquido = money(Decimal(str(entrada.get("valor_liquido") or entrada.get("total_item") or 0)))
+            if valor_liquido <= 0:
+                raise VendaValidationError("Valor líquido original do item é obrigatório.")
+            total = money(total + valor_liquido)
+            linhas.append((entrada, catalogo, quantidade, valor_liquido))
+        if total <= 0:
+            raise VendaValidationError("Valor da devolução inválido.")
+
+        dados_origem = {
+            "documento_original": documento_venda,
+            "loja_origem_retaguarda_id": _int_or_none((itens[0] or {}).get("loja_origem_retaguarda_id")),
+            "loja_origem_nome": str((itens[0] or {}).get("loja_origem_nome") or "")[:150],
+            "data_venda_original": str((itens[0] or {}).get("data_venda_original") or ""),
+            "cliente_documento": cliente.documento,
+            "cliente_nome": cliente.nome_cliente,
+        }
+        devolucao = VendaDevolucaoHub.objects.create(
+            devolucao_uuid=devolucao_uuid,
+            hub=terminal.hub,
+            venda_origem=None,
+            venda_origem_documento=documento_venda,
+            loja_origem_retaguarda_id=dados_origem["loja_origem_retaguarda_id"],
+            loja_origem_nome=dados_origem["loja_origem_nome"],
+            operador=operador,
+            terminal=terminal,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            motivo=str(motivo or "")[:255],
+            valor_total=total,
+            origem=VendaDevolucaoHub.ORIGEM_MANUAL_OUTRA_LOJA,
+            dados_origem=dados_origem,
+            finalizada_em=timezone.now(),
+        )
+        for entrada, catalogo, quantidade, valor in linhas:
+            VendaDevolucaoItemHub.objects.create(
+                devolucao=devolucao,
+                venda_item=None,
+                catalogo_item=catalogo,
+                retaguarda_produto_id=catalogo.retaguarda_produto_id,
+                retaguarda_sku_id=catalogo.retaguarda_sku_id,
+                ean13=str(entrada.get("ean") or catalogo.ean13 or "")[:13],
+                descricao=str(entrada.get("descricao") or catalogo.descricao)[:200],
+                quantidade=quantidade,
+                preco_unitario=money(valor / Decimal(quantidade)),
+                desconto=Decimal("0.00"),
+                total_item=valor,
+            )
+            CatalogoItemHub.objects.filter(pk=catalogo.pk).update(
+                estoque_fisico=models.F("estoque_fisico") + Decimal(quantidade),
+                estoque_disponivel=models.F("estoque_disponivel") + Decimal(quantidade),
+            )
+        vale = ValeTrocaHub.objects.create(
+            hub=terminal.hub,
+            devolucao=devolucao,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            documento=f"VT-HUB-{devolucao.devolucao_uuid.hex[:20]}",
+            valor_original=total,
+            saldo=total,
+            status=ValeTrocaHub.STATUS_ABERTO,
+            origem_devolucao_uuid=devolucao.devolucao_uuid,
+            origem=ValeTrocaHub.ORIGEM_HUB_PROVISORIO,
+            provisorio=True,
+        )
+        ValeTrocaMovimentoHub.objects.create(
+            vale=vale,
+            tipo=ValeTrocaMovimentoHub.TIPO_CREDITO,
+            valor=total,
+            saldo_apos=total,
+            observacao=f"Crédito provisório gerado pela devolução Hub {devolucao.devolucao_uuid}",
         )
         transaction.on_commit(lambda devolucao_id=devolucao.pk: enfileirar_devolucao_finalizada(VendaDevolucaoHub.objects.get(pk=devolucao_id)))
     return devolucao
@@ -347,11 +463,64 @@ def serializar_devolucao(devolucao):
         "valor_total": f"{devolucao.valor_total:.2f}",
         "finalizada_em": devolucao.finalizada_em.isoformat(),
         "vale_troca": {
-            "documento": vale.documento,
+            "documento": "" if vale.provisorio else vale.documento,
+            "documento_tecnico": vale.documento,
             "saldo": f"{vale.saldo:.2f}",
+            "provisorio": vale.provisorio,
+            "rotulo": "Crédito provisório" if vale.provisorio else "Vale-Troca",
         } if vale else None,
         "fiscal": devolucao.fiscal or None,
     }
+
+
+def _exigir_central_offline(hub):
+    status = calcular_status_central(hub)
+    if status["status"] == CENTRAL_STATUS_ONLINE:
+        raise VendaConflictError("Contingência manual permitida somente com a Central OFFLINE.")
+
+
+def _cliente_manual(hub, itens):
+    entrada = next((i for i in itens if i.get("cliente_uuid") or i.get("cliente_retaguarda_id") or i.get("cliente_documento")), {})
+    qs = ClienteHub.objects.select_for_update().filter(hub=hub, ativo=True)
+    cliente = None
+    if entrada.get("cliente_uuid"):
+        cliente = qs.filter(cliente_uuid=entrada.get("cliente_uuid")).first()
+    if not cliente and entrada.get("cliente_retaguarda_id"):
+        cliente = qs.filter(retaguarda_id=entrada.get("cliente_retaguarda_id")).first()
+    documento = "".join(ch for ch in str(entrada.get("cliente_documento") or "").strip() if ch.isdigit())
+    if not cliente and documento:
+        cliente = qs.filter(documento=documento).first()
+    if not cliente or cliente.cliente_padrao:
+        raise VendaConflictError("Devolução em contingência exige cliente identificado no cadastro local.")
+    return cliente
+
+
+def _catalogo_manual(hub, entrada):
+    qs = CatalogoItemHub.objects.select_for_update().filter(hub=hub)
+    catalogo = None
+    ean = str(entrada.get("ean") or "").strip()
+    sku_id = _int_or_none(entrada.get("sku_retaguarda_id") or entrada.get("sku_id"))
+    if ean:
+        catalogo = qs.filter(ean13=ean).first()
+    if not catalogo and sku_id:
+        catalogo = qs.filter(retaguarda_sku_id=sku_id).first()
+    if not catalogo:
+        raise VendaValidationError("Item da contingência não existe no catálogo local.")
+    return catalogo
+
+
+def _documento_venda_local(venda):
+    nfce = getattr(venda, "nfce", None)
+    if nfce and nfce.numero:
+        return str(nfce.numero)
+    return str(venda.venda_uuid)
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _normalizar_fiscal_devolucao(fiscal):

@@ -4,6 +4,7 @@ import re
 from django.db import transaction
 
 from core.models import ValeTrocaHub, VendaEventoHub, VendaHub, VendaPagamentoHub
+from core.services.beneficios import vales_abertos
 from core.services.vendas import (
     DINHEIRO,
     ZERO_2,
@@ -23,6 +24,7 @@ from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 
 TIPO_VALE_TROCA = "VALE_TROCA"
 DOCUMENTO_VALE_TROCA_RE = re.compile(r"^VT[0-9]{7}$")
+DOCUMENTO_CREDITO_PROVISORIO_RE = re.compile(r"^VT-HUB-[0-9a-fA-F]{20}$")
 
 
 def _client(hub):
@@ -71,6 +73,9 @@ def listar_vales_troca_online_disponiveis(terminal, venda_uuid=None):
         try:
             resposta = _client(terminal_bloqueado.hub).vale_troca_disponiveis(token=terminal_bloqueado.hub.retaguarda_token, cliente_id=venda.cliente_retaguarda_id)
         except RetaguardaError as exc:
+            locais = _vales_provisorios_payload(venda)
+            if locais:
+                return {"vales_troca": locais}
             raise VendaConflictError(f"Central offline. Consulta de Vale-Troca indisponível: {exc}") from exc
         vales = resposta.get("vales_troca") or []
         for vale in vales:
@@ -85,7 +90,7 @@ def adicionar_pagamento_vale_troca(terminal, operador, sessao_operador, *, venda
     valor = validar_valor_pagamento(valor)
     if not documento:
         raise VendaValidationError("Informe o número do Vale-Troca.")
-    if not DOCUMENTO_VALE_TROCA_RE.match(documento):
+    if not (DOCUMENTO_VALE_TROCA_RE.match(documento) or DOCUMENTO_CREDITO_PROVISORIO_RE.match(documento)):
         raise VendaValidationError("Número do Vale-Troca deve seguir o formato VT0000001.")
     with transaction.atomic():
         from core.services.vendas import obter_sessao_caixa_terminal, obter_venda_terminal_por_uuid_bloqueada, tem_troco
@@ -111,9 +116,20 @@ def adicionar_pagamento_vale_troca(terminal, operador, sessao_operador, *, venda
             raise VendaConflictError("Venda já possui troco.")
         if valor > pendente:
             raise VendaConflictError("Valor do Vale-Troca excede o valor pendente.")
-        consulta = consultar_vale_troca_online(terminal_bloqueado.hub, documento).get("vale_troca") or {}
+        credito_local = _credito_provisorio_local(venda, documento)
+        if credito_local:
+            consulta = {
+                "id": None,
+                "documento": credito_local.documento,
+                "cliente": {"id": venda.cliente_retaguarda_id},
+                "saldo_disponivel": f"{credito_local.saldo:.2f}",
+                "status": credito_local.status,
+                "provisorio": True,
+            }
+        else:
+            consulta = consultar_vale_troca_online(terminal_bloqueado.hub, documento).get("vale_troca") or {}
         documento_oficial = str(consulta.get("documento") or documento).strip().upper()
-        if not DOCUMENTO_VALE_TROCA_RE.match(documento_oficial):
+        if not (DOCUMENTO_VALE_TROCA_RE.match(documento_oficial) or DOCUMENTO_CREDITO_PROVISORIO_RE.match(documento_oficial)):
             raise VendaConflictError("Central retornou número de Vale-Troca inválido.")
         if VendaPagamentoHub.objects.filter(venda=venda, status=VendaPagamentoHub.STATUS_ATIVO, vale_troca_documento=documento_oficial).exists():
             raise VendaConflictError("O mesmo Vale-Troca não pode ser usado duas vezes na venda.")
@@ -149,7 +165,10 @@ def adicionar_pagamento_vale_troca(terminal, operador, sessao_operador, *, venda
 
 
 def preparar_reservas_vale_troca(venda, pagamentos):
-    vales = [p for p in pagamentos if (p.tipo or "").upper() == TIPO_VALE_TROCA]
+    vales = [
+        p for p in pagamentos
+        if (p.tipo or "").upper() == TIPO_VALE_TROCA and not _credito_provisorio_local(venda, p.vale_troca_documento or p.autorizacao)
+    ]
     if not vales:
         return
     payload = {
@@ -193,3 +212,42 @@ def liberar_reserva_pagamento_vale_troca(pagamento):
         )
     except RetaguardaError as exc:
         raise VendaConflictError(f"Não foi possível liberar reserva de Vale-Troca na Central: {exc}") from exc
+
+
+def _credito_provisorio_local(venda, documento):
+    documento = str(documento or "").strip().upper()
+    if not DOCUMENTO_CREDITO_PROVISORIO_RE.match(documento):
+        return None
+    qs = ValeTrocaHub.objects.filter(
+        hub=venda.hub,
+        documento=documento,
+        status=ValeTrocaHub.STATUS_ABERTO,
+        saldo__gt=0,
+        provisorio=True,
+    )
+    if venda.cliente_retaguarda_id:
+        qs = qs.filter(cliente_retaguarda_id=venda.cliente_retaguarda_id)
+    else:
+        qs = qs.filter(cliente_uuid=venda.cliente_uuid)
+    return qs.first()
+
+
+def _vales_provisorios_payload(venda):
+    return [
+        {
+            "id": None,
+            "documento": vale.documento,
+            "cliente": {"id": venda.cliente_retaguarda_id, "nome": venda.cliente_nome, "documento": venda.cliente_documento or ""},
+            "valor_original": f"{vale.valor_original:.2f}",
+            "saldo_contabil": f"{vale.saldo:.2f}",
+            "saldo_reservado": "0.00",
+            "saldo_disponivel": f"{vale.saldo:.2f}",
+            "status": vale.status,
+            "validade": vale.validade.isoformat() if vale.validade else None,
+            "loja_origem": {"id": venda.hub.loja_id, "nome": venda.hub.loja_nome},
+            "devolucao_origem": {"id": vale.devolucao_id, "documento": "Crédito provisório"} if vale.devolucao_id else None,
+            "provisorio": True,
+            "rotulo": "Crédito provisório",
+        }
+        for vale in vales_abertos(venda, apenas_utilizaveis_offline=True).filter(provisorio=True)
+    ]

@@ -18,12 +18,14 @@ Exemplo: uma venda da Loja Centro devolvida na Loja Barra mantem `VendaDevolucao
 
 O Vale-Troca online nasce oficialmente na Central, vinculado a devolucao e a cliente identificada. O Hub apenas guarda um espelho local confirmado para continuidade operacional e exibicao.
 
-## Espelho local
+## Espelho local e contingencia
 
-`VendaDevolucaoHub` preserva a estrutura local para a contingencia offline futura. Para devolucoes online, o espelho pode representar venda remota sem criar uma `VendaHub` artificial. Campos de origem central guardam documento, loja de origem e identificadores de retaguarda.
+`VendaDevolucaoHub` preserva a estrutura local para devolucoes online espelhadas e para contingencia offline. Para devolucoes online, o espelho pode representar venda remota sem criar uma `VendaHub` artificial. Campos de origem central guardam documento, loja de origem e identificadores de retaguarda.
 
 Devolucao online confirmada nao enfileira `DEVOLUCAO_FINALIZADA`, evitando reenvio e duplicidade.
 
 ## Offline
 
-Quando a Central esta OFFLINE, a tela informa a indisponibilidade da operacao online. A devolucao offline, Vale-Troca provisorio offline e sincronizacao de contingencia ficam para etapa posterior.
+Quando a Central esta OFFLINE, o Hub pode registrar devolucao provisoria com cliente identificado, itens do catalogo local e valor liquido original. A entrada de estoque ocorre imediatamente na loja do Hub recebedor. O credito local usa `ValeTrocaHub` com `provisorio=True` e documento tecnico `VT-HUB-*`, mas a interface deve apresenta-lo como Credito provisorio, sem tratar esse identificador como documento comercial.
+
+O evento `DEVOLUCAO_FINALIZADA` carrega os dados da venda local quando ela existe ou os dados declarados do documento original para venda de outra loja. Vendas que consumirem credito provisorio recebem dependencia explicita da devolucao e so podem sincronizar apos a Central materializar a devolucao e retornar o Vale-Troca oficial. Em conflito, a devolucao e o credito permanecem registrados localmente para resolucao administrativa posterior.
