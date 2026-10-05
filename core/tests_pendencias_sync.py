@@ -67,7 +67,7 @@ class PendenciasSyncApiTests(TestCase):
         self.assertEqual(sem_operador.status_code, 403)
 
     def test_lista_eventos_do_hub_com_resumo_filtros_busca_e_paginacao(self):
-        self.evento(status=EventoSyncHub.STATUS_ERRO, ultimo_erro="timeout Central", payload={"nfce_uuid": str(uuid4()), "numero": 7, "serie": 1})
+        self.evento(tipo="NFCE_ATUALIZADA", status=EventoSyncHub.STATUS_ERRO, ultimo_erro="timeout Central", payload={"nfce_uuid": str(uuid4()), "numero": 7, "serie": 1})
         self.evento(tipo="NFCE_ATUALIZADA", status=EventoSyncHub.STATUS_SINCRONIZADO, payload={"numero": 6, "serie": 1, "venda_uuid": str(uuid4())})
         EventoSyncHub.objects.create(
             hub=self.outro_hub,
