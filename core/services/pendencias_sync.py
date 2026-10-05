@@ -1,8 +1,8 @@
 from django.core.paginator import Paginator
-from django.db.models import Case, CharField, Count, IntegerField, Q, Value, When
+from django.db.models import CharField, Count, Q
 from django.db.models.functions import Cast
 
-from core.models import EventoSyncHub, ValeTrocaHub
+from core.models import EventoSyncHub, NFCeHub, ValeTrocaHub, VendaHub
 from core.services.central_status import calcular_status_central
 from core.services.sync import SEGREDOS_BLOQUEADOS, sincronizar_eventos_pendentes
 
@@ -39,26 +39,15 @@ def listar_pendencias_sync(hub, *, filtros):
     if busca:
         qs = _aplicar_busca(qs, busca)
 
-    qs = qs.annotate(
-        prioridade_status=Case(
-            When(status=EventoSyncHub.STATUS_CONFLITO, then=Value(1)),
-            When(status=EventoSyncHub.STATUS_ERRO, then=Value(2)),
-            When(status=EventoSyncHub.STATUS_PENDENTE, then=Value(4)),
-            When(status=EventoSyncHub.STATUS_PROCESSANDO, then=Value(5)),
-            When(status=EventoSyncHub.STATUS_SINCRONIZADO, then=Value(6)),
-            default=Value(9),
-            output_field=IntegerField(),
-        )
-    ).order_by("prioridade_status", "-atualizado_em", "-criado_em", "-id")
-
-    pagina = Paginator(qs, page_size).get_page(page)
-    eventos = [serializar_evento_operacional(evento) for evento in pagina.object_list]
+    eventos = [serializar_evento_operacional(evento) for evento in qs.order_by("-atualizado_em", "-criado_em", "-id")]
     if status_filtro == STATUS_OPERACIONAL_AGUARDANDO_DEPENDENCIA:
         eventos = [evento for evento in eventos if evento["bloqueado_por_dependencia"]]
 
-    eventos.sort(key=lambda item: (STATUS_PRIORIDADE.get(item["status_operacional"], 9), item["atualizado_em"] or ""))
+    eventos.sort(key=_ordem_data, reverse=True)
+    eventos.sort(key=lambda item: STATUS_PRIORIDADE.get(item["status_operacional"], 9))
+    pagina = Paginator(eventos, page_size).get_page(page)
     return {
-        "eventos": eventos,
+        "eventos": list(pagina.object_list),
         "resumo": resumo_eventos_sync(hub),
         "central": calcular_status_central(hub),
         "paginacao": {
@@ -119,7 +108,7 @@ def serializar_evento_operacional(evento):
     }
 
 
-def tentar_reprocessar_evento(hub, evento_id):
+def tentar_reprocessar_evento(hub, evento_id, *, client=None):
     evento = EventoSyncHub.objects.filter(hub=hub, pk=evento_id).first()
     if not evento:
         return None, "Evento não encontrado."
@@ -132,7 +121,7 @@ def tentar_reprocessar_evento(hub, evento_id):
         return visao, "Evento não está elegível para retry manual."
     evento.proxima_tentativa_em = None
     evento.save(update_fields=["proxima_tentativa_em", "atualizado_em"])
-    resultado = sincronizar_eventos_pendentes(hub=hub, limite=1)
+    resultado = sincronizar_eventos_pendentes(hub=hub, client=client, limite=1, evento_ids=[evento.pk])
     evento.refresh_from_db()
     return serializar_evento_operacional(evento), "", resultado
 
@@ -154,7 +143,7 @@ def _documento_evento(evento):
         texto = " · ".join(str(parte) for parte in partes if parte)
         return texto or f"Devolução {str(payload.get('devolucao_uuid') or evento.evento_uuid)[:8]}"
     if evento.tipo == "VENDA_FINALIZADA":
-        return payload.get("documento") or payload.get("documento_venda") or f"Venda {str(payload.get('venda_uuid') or evento.evento_uuid)[:8]}"
+        return _documento_venda_finalizada(evento, payload)
     for chave in ["documento", "sessao_uuid", "caixa_codigo", "fechamento_uuid"]:
         if payload.get(chave):
             return str(payload[chave])
@@ -228,6 +217,25 @@ def _aplicar_busca(qs, busca):
         | Q(payload_text__icontains=busca)
         | Q(resposta_text__icontains=busca)
     )
+
+
+def _documento_venda_finalizada(evento, payload):
+    venda_uuid = payload.get("venda_uuid")
+    if venda_uuid:
+        venda = VendaHub.objects.filter(hub=evento.hub, venda_uuid=venda_uuid).first()
+        if venda:
+            nfce = NFCeHub.objects.filter(hub=evento.hub, venda=venda).first()
+            if nfce:
+                partes = [f"NFC-e {nfce.numero}"]
+                if nfce.serie:
+                    partes.append(f"Série {nfce.serie}")
+                return " · ".join(partes)
+            return f"Venda local {str(venda.venda_uuid)[:8]}"
+    return payload.get("documento") or payload.get("documento_venda") or f"Venda {str(venda_uuid or evento.evento_uuid)[:8]}"
+
+
+def _ordem_data(item):
+    return item["atualizado_em"] or item["criado_em"] or ""
 
 
 def _sanitizar_json(valor):

@@ -200,7 +200,7 @@ def payload_devolucao_finalizada(devolucao):
     }
 
 
-def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=None):
+def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=None, evento_ids=None):
     agora = agora or timezone.now()
     with transaction.atomic():
         qs = EventoSyncHub.objects.select_for_update().filter(
@@ -208,6 +208,8 @@ def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=Non
         )
         if hub is not None:
             qs = qs.filter(hub=hub)
+        if evento_ids is not None:
+            qs = qs.filter(pk__in=evento_ids)
         qs = qs.filter(Q(proxima_tentativa_em__isnull=True) | Q(proxima_tentativa_em__lte=agora))
         candidatos = list(qs.order_by("criado_em", "id")[:limite])
         eventos = []
