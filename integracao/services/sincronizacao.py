@@ -4,6 +4,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from core.models import HubConfig, SincronizacaoRecebidaHub
+from core.services.numeracao_vendas import garantir_faixa_venda_suficiente
 from integracao.services.bootstrap import sincronizar_bootstrap
 from integracao.services.catalogo import sincronizar_catalogo
 from integracao.services.clientes import sincronizar_clientes
@@ -59,6 +60,7 @@ def executar_sincronizacao_comando(hub, comando, client=None):
                 funcao(hub, resposta, client=client)
             else:
                 funcao(hub, resposta)
+        garantir_faixa_venda_suficiente(hub, client)
         _marcar_concluida(hub, sincronizacao)
         try:
             _informar(client, hub, sincronizacao, SincronizacaoRecebidaHub.STATUS_CONCLUIDA)

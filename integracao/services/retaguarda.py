@@ -272,6 +272,15 @@ class RetaguardaClient:
             headers={"Authorization": f"Hub {token}"},
         )
 
+    def reservar_faixa_vendas(self, *, token):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._post_json(
+            "api/hub/vendas/faixa-numeracao/",
+            {},
+            headers={"Authorization": f"Hub {token}"},
+        )
+
     def atualizar_status_sincronizacao(self, *, token, sincronizacao_id, status, etapa_atual="", mensagem_erro=""):
         if not token:
             raise RetaguardaError("Token da retaguarda não informado.")

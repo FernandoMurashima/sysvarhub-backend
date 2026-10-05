@@ -5,6 +5,7 @@ import threading
 from django.utils import timezone
 
 from core.models import HubConfig
+from core.services.numeracao_vendas import tentar_repor_faixa_venda
 from core.services.snapshot_operacional import montar_snapshot_operacional
 from core.services.sync import sincronizar_eventos_pendentes
 from integracao.services.comandos_administrativos import executar_comando_administrativo, reenviar_resultados_pendentes
@@ -68,6 +69,7 @@ class SyncWorker:
             reenviar_resultados_pendentes(hub, client=client)
         except RetaguardaError:
             logger.warning("Falha ao reenviar resultados administrativos pendentes.", exc_info=True)
+        tentar_repor_faixa_venda(hub, client, logger=logger)
 
 
 def start_worker_thread(stop_event=None, interval=10):

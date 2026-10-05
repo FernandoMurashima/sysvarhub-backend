@@ -1151,6 +1151,7 @@ class VendaHub(models.Model):
     ]
 
     venda_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    documento = models.CharField(max_length=12, null=True, blank=True, unique=True, db_index=True)
     hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="vendas")
     sessao_caixa = models.ForeignKey(
         SessaoCaixaHub,
@@ -1254,6 +1255,30 @@ class VendaHub(models.Model):
 
     def __str__(self):
         return f"{self.venda_uuid} - {self.status}"
+
+
+class FaixaNumeracaoVendaHub(models.Model):
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="faixas_numeracao_venda")
+    inicio = models.PositiveIntegerField()
+    fim = models.PositiveIntegerField()
+    proximo_numero = models.PositiveIntegerField()
+    recebido_em = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Faixa de numeracao de venda do Hub"
+        verbose_name_plural = "Faixas de numeracao de venda do Hub"
+        ordering = ("hub_id", "inicio")
+        constraints = [
+            models.UniqueConstraint(fields=["hub", "inicio", "fim"], name="uniq_faixa_venda_hub_intervalo"),
+            models.CheckConstraint(check=models.Q(inicio__lte=models.F("fim")), name="ck_faixa_venda_hub_ordem"),
+            models.CheckConstraint(check=models.Q(proximo_numero__gte=models.F("inicio")), name="ck_faixa_venda_hub_prox_min"),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "proximo_numero", "fim"], name="idx_faixa_venda_hub_disp"),
+        ]
+
+    def __str__(self):
+        return f"{self.hub_id} - {self.inicio}-{self.fim}"
 
 
 class VendaItemHub(models.Model):

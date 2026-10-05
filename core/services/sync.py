@@ -80,6 +80,7 @@ def payload_venda_finalizada(venda):
     pagamentos = venda.pagamentos.filter(status=VendaPagamentoHub.STATUS_ATIVO).order_by("id")
     return {
         "venda_uuid": str(venda.venda_uuid),
+        "documento": venda.documento,
         "caixa_retaguarda_id": venda.sessao_caixa.caixa.retaguarda_id,
         "cliente_uuid": str(venda.cliente_uuid) if venda.cliente_uuid else None,
         "cliente_retaguarda_id": venda.cliente_retaguarda_id,

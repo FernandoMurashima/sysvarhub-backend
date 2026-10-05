@@ -33,6 +33,7 @@ from core.services.nfce import (
     processar_nfce_preparada,
     validar_nfce_para_finalizacao,
 )
+from core.services.numeracao_vendas import NumeracaoVendaHubError, consumir_documento_venda
 from core.services.sync import enfileirar_nfce_atualizada, enfileirar_venda_finalizada
 
 
@@ -720,6 +721,11 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
 
         agora = timezone.now()
         troco = calcular_troco(venda, total_pago)
+        if not venda.documento:
+            try:
+                venda.documento = consumir_documento_venda(venda.hub)
+            except NumeracaoVendaHubError as exc:
+                raise VendaConflictError(str(exc)) from exc
         venda.status = VendaHub.STATUS_FINALIZADA
         venda.finalizada_em = agora
         venda.terminal_finalizacao = terminal_bloqueado
@@ -731,6 +737,7 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
         venda.save(
             update_fields=[
                 "status",
+                "documento",
                 "finalizada_em",
                 "terminal_finalizacao",
                 "operador_finalizacao",
@@ -1330,6 +1337,7 @@ def serializar_venda(venda):
     troco = venda.troco if venda.status == VendaHub.STATUS_FINALIZADA else calcular_troco(venda, total_pago)
     return {
         "uuid": str(venda.venda_uuid),
+        "documento": venda.documento,
         "status": venda.status,
         "criada_em": venda.criada_em.isoformat(),
         "subtotal": f"{venda.subtotal:.2f}",
