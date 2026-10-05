@@ -6,6 +6,7 @@ from django.utils import timezone
 
 from core.models import CatalogoItemHub, ClienteHub, ValeTrocaHub, ValeTrocaMovimentoHub, VendaDevolucaoHub, VendaDevolucaoItemHub, VendaHub, VendaItemHub
 from core.services.central_status import CENTRAL_STATUS_ONLINE, calcular_status_central
+from core.services.numeracao_devolucoes import NumeracaoDevolucaoHubError, consumir_documento_devolucao
 from core.services.sync import enfileirar_devolucao_finalizada
 from core.services.vendas import VendaConflictError, VendaNotFoundError, VendaValidationError, money
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaCredencialInvalidaError, RetaguardaError
@@ -119,15 +120,17 @@ def _espelhar_devolucao_online(hub, terminal, operador, payload, devolucao_uuid)
         venda_origem = payload.get("venda_origem") or {}
         loja_origem = venda_origem.get("loja_origem") or {}
         cliente = payload.get("cliente") or venda_origem.get("cliente") or {}
+        documento = str(payload.get("documento") or "").strip()
         devolucao = VendaDevolucaoHub.objects.create(
             devolucao_uuid=devolucao_uuid,
             hub=hub,
+            documento=documento or None,
             venda_origem=None,
             venda_origem_retaguarda_id=venda_origem.get("id"),
             venda_origem_documento=venda_origem.get("documento") or "",
             loja_origem_retaguarda_id=loja_origem.get("id"),
             loja_origem_nome=loja_origem.get("nome") or "",
-            documento_central=payload.get("documento") or "",
+            documento_central=documento,
             retaguarda_id=payload.get("id"),
             confirmado_central_em=timezone.now(),
             operador=operador,
@@ -270,10 +273,15 @@ def finalizar_devolucao_local(terminal, operador, *, venda_uuid, itens, motivo="
             linhas.append((item, quantidade, valor))
         if total <= 0:
             raise VendaValidationError("Valor da devolução inválido.")
+        try:
+            documento = consumir_documento_devolucao(terminal.hub)
+        except NumeracaoDevolucaoHubError as exc:
+            raise VendaConflictError(str(exc)) from exc
 
         devolucao = VendaDevolucaoHub.objects.create(
             devolucao_uuid=devolucao_uuid,
             hub=terminal.hub,
+            documento=documento,
             venda_origem=venda,
             venda_origem_retaguarda_id=None,
             venda_origem_documento=_documento_venda_local(venda),
@@ -357,6 +365,10 @@ def finalizar_devolucao_manual_offline(terminal, operador, *, documento_venda=""
             linhas.append((entrada, catalogo, quantidade, valor_liquido))
         if total <= 0:
             raise VendaValidationError("Valor da devolução inválido.")
+        try:
+            documento = consumir_documento_devolucao(terminal.hub)
+        except NumeracaoDevolucaoHubError as exc:
+            raise VendaConflictError(str(exc)) from exc
 
         dados_origem = {
             "documento_original": documento_venda,
@@ -369,6 +381,7 @@ def finalizar_devolucao_manual_offline(terminal, operador, *, documento_venda=""
         devolucao = VendaDevolucaoHub.objects.create(
             devolucao_uuid=devolucao_uuid,
             hub=terminal.hub,
+            documento=documento,
             venda_origem=None,
             venda_origem_documento=documento_venda,
             loja_origem_retaguarda_id=dados_origem["loja_origem_retaguarda_id"],
@@ -456,7 +469,7 @@ def serializar_devolucao(devolucao):
     return {
         "uuid": str(devolucao.devolucao_uuid),
         "venda_uuid": venda_uuid,
-        "documento": devolucao.documento_central or str(devolucao.devolucao_uuid),
+        "documento": devolucao.documento or devolucao.documento_central or str(devolucao.devolucao_uuid),
         "venda_documento": devolucao.venda_origem_documento,
         "loja_origem": devolucao.loja_origem_nome,
         "loja_recebimento": devolucao.hub.loja_nome,

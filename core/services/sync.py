@@ -161,6 +161,7 @@ def payload_devolucao_finalizada(devolucao):
     vale = getattr(devolucao, "vale_troca", None)
     return {
         "devolucao_uuid": str(devolucao.devolucao_uuid),
+        "documento": devolucao.documento,
         "origem": devolucao.origem,
         "venda_uuid": str(devolucao.venda_origem.venda_uuid) if devolucao.venda_origem_id else None,
         "venda_origem_retaguarda_id": devolucao.venda_origem_retaguarda_id,
@@ -332,10 +333,14 @@ def _canonicalizar_devolucao_confirmada(evento, resultado, agora):
     devolucao = VendaDevolucaoHub.objects.filter(hub=evento.hub, devolucao_uuid=devolucao_uuid).first()
     if not devolucao:
         return
+    documento_confirmado = resultado.get("documento") or ""
+    if devolucao.documento and documento_confirmado and documento_confirmado != devolucao.documento:
+        _marcar_devolucao_em_conflito(evento, "Central retornou documento de devolucao diferente do enviado pelo Hub.")
+        return
     devolucao.status = VendaDevolucaoHub.STATUS_FINALIZADA
     devolucao.conflito_mensagem = ""
     devolucao.retaguarda_id = resultado.get("devolucao_retaguarda_id") or devolucao.retaguarda_id
-    devolucao.documento_central = resultado.get("documento") or devolucao.documento_central
+    devolucao.documento_central = documento_confirmado or devolucao.documento_central
     devolucao.confirmado_central_em = agora
     devolucao.save(update_fields=["status", "conflito_mensagem", "retaguarda_id", "documento_central", "confirmado_central_em"])
     vale = getattr(devolucao, "vale_troca", None)

@@ -1626,6 +1626,7 @@ class VendaDevolucaoHub(models.Model):
 
     devolucao_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="devolucoes")
+    documento = models.CharField(max_length=11, null=True, blank=True, db_index=True)
     venda_origem = models.ForeignKey(VendaHub, on_delete=models.PROTECT, null=True, blank=True, related_name="devolucoes")
     venda_origem_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True, db_index=True)
     venda_origem_documento = models.CharField(max_length=80, blank=True, default="")
@@ -1650,6 +1651,33 @@ class VendaDevolucaoHub(models.Model):
 
     class Meta:
         ordering = ("-finalizada_em", "-id")
+        constraints = [
+            models.UniqueConstraint(fields=["hub", "documento"], name="uniq_dev_hub_documento"),
+        ]
+
+
+class FaixaNumeracaoDevolucaoHub(models.Model):
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="faixas_numeracao_devolucao")
+    inicio = models.PositiveIntegerField()
+    fim = models.PositiveIntegerField()
+    proximo_numero = models.PositiveIntegerField()
+    recebido_em = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Faixa de numeracao de devolucao do Hub"
+        verbose_name_plural = "Faixas de numeracao de devolucao do Hub"
+        ordering = ("hub_id", "inicio")
+        constraints = [
+            models.UniqueConstraint(fields=["hub", "inicio", "fim"], name="uniq_faixa_dev_hub_intervalo"),
+            models.CheckConstraint(check=models.Q(inicio__lte=models.F("fim")), name="ck_faixa_dev_hub_ordem"),
+            models.CheckConstraint(check=models.Q(proximo_numero__gte=models.F("inicio")), name="ck_faixa_dev_hub_prox_min"),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "proximo_numero", "fim"], name="idx_faixa_dev_hub_disp"),
+        ]
+
+    def __str__(self):
+        return f"{self.hub_id} - {self.inicio}-{self.fim}"
 
 
 class VendaDevolucaoItemHub(models.Model):
