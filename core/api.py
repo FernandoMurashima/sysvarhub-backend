@@ -55,6 +55,7 @@ from core.services.operadores import (
     encerrar_sessao,
     serializar_operador,
 )
+from core.services.pendencias_sync import listar_pendencias_sync, tentar_reprocessar_evento
 from core.services.resumo_caixa import obter_resumo_caixa
 from core.services.terminais import (
     PareamentoTerminalError,
@@ -185,6 +186,27 @@ class TerminalCentralStatusView(APIView):
     def get(self, request):
         hub = HubConfig.objects.filter(pk=request.sysvar_terminal.hub_id).first()
         return Response(calcular_status_central(hub))
+
+
+class TerminalPendenciasSyncView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        return Response(listar_pendencias_sync(request.sysvar_terminal.hub, filtros=request.query_params))
+
+
+class TerminalPendenciaSyncRetryView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request, evento_id):
+        resultado = tentar_reprocessar_evento(request.sysvar_terminal.hub, evento_id)
+        if resultado[0] is None:
+            return Response({"detail": resultado[1]}, status=status.HTTP_404_NOT_FOUND)
+        if len(resultado) == 2:
+            return Response({"detail": resultado[1], "evento": resultado[0]}, status=status.HTTP_409_CONFLICT)
+        return Response({"evento": resultado[0], "resultado": resultado[2]})
 
 
 class TerminalCatalogoView(APIView):
