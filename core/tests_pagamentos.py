@@ -17,6 +17,8 @@ from core.models import (
     FormaPagamentoFiscalMapHub,
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
+    PrazoPagamentoHub,
+    PrazoPagamentoParcelaHub,
     SessaoCaixaHub,
     VendaEventoHub,
     VendaHub,
@@ -59,6 +61,9 @@ class PagamentoHubTestMixin(VendaHubTestMixin):
         self.dinheiro = self.criar_forma("DIN", "DINHEIRO")
         self.pix = self.criar_forma("PIX", "PIX")
         self.cartao = self.criar_forma("CAR", "CARTAO")
+        self.credito = self.criar_forma("CRE", "CREDITO")
+        self.prazo_1x = self.criar_prazo("30D", 1, [30])
+        self.prazo_2x = self.criar_prazo("30-60", 2, [30, 60])
         self.tef = self.criar_forma("TEF", "CARTAO", tef_habilitado=True)
 
     def criar_forma(self, codigo, tipo, **overrides):
@@ -88,6 +93,30 @@ class PagamentoHubTestMixin(VendaHubTestMixin):
             sincronizado_em=timezone.now(),
         )
         return forma
+
+    def criar_prazo(self, codigo, num_parcelas, dias, **overrides):
+        prazo = PrazoPagamentoHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=overrides.pop("retaguarda_id", 7000 + PrazoPagamentoHub.objects.count()),
+            codigo=codigo,
+            descricao=overrides.pop("descricao", codigo),
+            num_parcelas=num_parcelas,
+            intervalo_dias=overrides.pop("intervalo_dias", 30),
+            ativo=True,
+            sincronizado_em=timezone.now(),
+            **overrides,
+        )
+        percentual = Decimal("1.000000") / Decimal(num_parcelas)
+        for indice, dia in enumerate(dias, start=1):
+            PrazoPagamentoParcelaHub.objects.create(
+                prazo=prazo,
+                ordem=indice,
+                dias=dia,
+                percentual=percentual,
+                valor_fixo=None,
+                sincronizado_em=timezone.now(),
+            )
+        return prazo
 
     def criar_venda_com_item(self, quantidade=1):
         resposta = self.post_item({"quantidade": quantidade})
@@ -121,13 +150,14 @@ class PagamentoHubTestMixin(VendaHubTestMixin):
         )
         return vendedor
 
-    def pagar(self, venda_uuid, forma=None, valor="199.90", operacao_uuid=None):
+    def pagar(self, venda_uuid, forma=None, valor="199.90", operacao_uuid=None, prazo=None):
         return self.client.post(
             "/api/terminal/venda/pagamento/",
             {
                 "venda_uuid": venda_uuid,
                 "operacao_uuid": str(operacao_uuid or uuid.uuid4()),
                 "forma_pagamento_id": (forma or self.dinheiro).id,
+                "prazo_pagamento_id": prazo.id if prazo else None,
                 "valor": valor,
                 "autorizacao": "",
             },
@@ -182,7 +212,7 @@ class FormasPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         with CaptureQueriesContext(connection) as contexto:
             payload = listar_formas_pagamento(self.terminal)
 
-        self.assertLessEqual(len(contexto), 2)
+        self.assertLessEqual(len(contexto), 4)
         self.assertGreaterEqual(len(payload["formas"]), 3)
 
 
@@ -828,6 +858,31 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         self.pagar(venda_uuid, self.dinheiro)
 
         self.assertEqual(VendaPagamentoParcelaHub.objects.count(), 1)
+
+    def test_credito_exige_prazo_e_copia_parcelas_do_prazo(self):
+        venda_uuid = self.criar_venda_com_item()
+
+        sem_prazo = self.pagar(venda_uuid, self.credito)
+        resposta = self.pagar(venda_uuid, self.credito, prazo=self.prazo_2x)
+
+        pagamento = VendaPagamentoHub.objects.get()
+        self.assertEqual(sem_prazo.status_code, 400)
+        self.assertEqual(resposta.status_code, 201)
+        self.assertEqual(pagamento.codigo, "CRE")
+        self.assertEqual(pagamento.prazo_pagamento, self.prazo_2x)
+        self.assertEqual(pagamento.num_parcelas, 2)
+        self.assertEqual(list(pagamento.parcelas_snapshot.order_by("ordem").values_list("dias", flat=True)), [30, 60])
+
+    def test_retry_com_prazo_diferente_retorna_409(self):
+        venda_uuid = self.criar_venda_com_item()
+        operacao_uuid = uuid.uuid4()
+        self.pagar(venda_uuid, self.credito, operacao_uuid=operacao_uuid, prazo=self.prazo_1x)
+
+        resposta = self.pagar(venda_uuid, self.credito, operacao_uuid=operacao_uuid, prazo=self.prazo_2x)
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(VendaPagamentoHub.objects.count(), 1)
+        self.assertEqual(VendaPagamentoHub.objects.get().prazo_pagamento, self.prazo_1x)
 
     def test_remover_pagamento_nao_deleta_linha_e_libera_carrinho(self):
         venda_uuid = self.criar_venda_com_item()

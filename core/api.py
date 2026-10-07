@@ -867,6 +867,7 @@ class VendaPagamentoView(APIView):
                 venda_uuid=request.data.get("venda_uuid"),
                 operacao_uuid=request.data.get("operacao_uuid"),
                 forma_pagamento_id=request.data.get("forma_pagamento_id"),
+                prazo_pagamento_id=request.data.get("prazo_pagamento_id"),
                 valor=request.data.get("valor"),
                 autorizacao=request.data.get("autorizacao") or "",
             )

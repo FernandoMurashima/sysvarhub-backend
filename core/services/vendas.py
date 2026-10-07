@@ -14,6 +14,8 @@ from core.models import (
     EstoqueMovimentoHub,
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
+    PrazoPagamentoHub,
+    PrazoPagamentoParcelaHub,
     SessaoCaixaHub,
     Terminal,
     VendaEventoHub,
@@ -455,10 +457,16 @@ def cancelar_venda(terminal, operador, sessao_operador):
 
 def listar_formas_pagamento(terminal):
     parcelas_ordenadas = FormaPagamentoParcelaHub.objects.order_by("ordem", "id")
+    parcelas_prazo_ordenadas = PrazoPagamentoParcelaHub.objects.order_by("ordem", "id")
     formas = (
         FormaPagamentoHub.objects.filter(hub=terminal.hub, ativo=True)
         .prefetch_related(Prefetch("parcelas", queryset=parcelas_ordenadas))
         .order_by("codigo", "retaguarda_id")
+    )
+    prazos = (
+        PrazoPagamentoHub.objects.filter(hub=terminal.hub, ativo=True)
+        .prefetch_related(Prefetch("parcelas", queryset=parcelas_prazo_ordenadas))
+        .order_by("num_parcelas", "codigo", "retaguarda_id")
     )
     return {
         "versao": terminal.hub.formas_pagamento_versao,
@@ -468,6 +476,7 @@ def listar_formas_pagamento(terminal):
             else None
         ),
         "formas": [serializar_forma_pagamento(forma) for forma in formas],
+        "prazos": [serializar_prazo_pagamento(prazo) for prazo in prazos],
     }
 
 
@@ -479,12 +488,14 @@ def adicionar_pagamento(
     venda_uuid,
     operacao_uuid,
     forma_pagamento_id,
+    prazo_pagamento_id=None,
     valor,
     autorizacao="",
 ):
     venda_uuid = validar_uuid_obrigatorio(venda_uuid, "Venda inválida.")
     operacao_uuid = validar_uuid_obrigatorio(operacao_uuid, "Operação inválida.")
     forma_pagamento_id = validar_inteiro_positivo(forma_pagamento_id, "Forma de pagamento inválida.")
+    prazo_pagamento_id = validar_inteiro_positivo_opcional(prazo_pagamento_id, "Prazo de pagamento inválido.")
     valor = validar_valor_pagamento(valor)
     autorizacao = validar_autorizacao(autorizacao)
 
@@ -504,6 +515,7 @@ def adicionar_pagamento(
             validar_retry_pagamento(
                 pagamento_existente,
                 forma_pagamento_id=forma_pagamento_id,
+                prazo_pagamento_id=prazo_pagamento_id,
                 valor=valor,
                 autorizacao=autorizacao,
             )
@@ -521,6 +533,18 @@ def adicionar_pagamento(
         )
         if not forma:
             raise VendaValidationError("Forma de pagamento inválida.")
+        prazo = None
+        if forma.tipo == "CREDITO":
+            if prazo_pagamento_id is None:
+                raise VendaValidationError("Prazo de pagamento inválido.")
+            prazo = (
+                PrazoPagamentoHub.objects.select_for_update()
+                .prefetch_related(Prefetch("parcelas", queryset=PrazoPagamentoParcelaHub.objects.order_by("ordem", "id")))
+                .filter(pk=prazo_pagamento_id, hub=terminal_bloqueado.hub, ativo=True)
+                .first()
+            )
+            if not prazo:
+                raise VendaValidationError("Prazo de pagamento inválido.")
         if forma.tef_habilitado:
             raise VendaConflictError("Forma de pagamento exige integração TEF.")
         try:
@@ -542,10 +566,14 @@ def adicionar_pagamento(
             venda=venda,
             forma_pagamento=forma,
             retaguarda_forma_pagamento_id=forma.retaguarda_id,
+            prazo_pagamento=prazo,
+            retaguarda_prazo_pagamento_id=prazo.retaguarda_id if prazo else forma.prazo_retaguarda_id,
+            prazo_codigo=prazo.codigo if prazo else forma.prazo_codigo,
+            prazo_descricao=prazo.descricao if prazo else forma.prazo_descricao,
             codigo=forma.codigo,
             descricao=forma.descricao,
             tipo=forma.tipo,
-            num_parcelas=forma.num_parcelas,
+            num_parcelas=prazo.num_parcelas if prazo else forma.num_parcelas,
             adquirente=forma.adquirente,
             conta_liquidacao_retaguarda_id=forma.conta_liquidacao_retaguarda_id,
             gera_recebivel_bancario=forma.gera_recebivel_bancario,
@@ -561,7 +589,8 @@ def adicionar_pagamento(
             operador_inclusao=operador,
             sessao_operador_inclusao=sessao_operador,
         )
-        for parcela in forma.parcelas.all():
+        parcelas_snapshot = prazo.parcelas.all() if prazo else forma.parcelas.all()
+        for parcela in parcelas_snapshot:
             VendaPagamentoParcelaHub.objects.create(
                 pagamento=pagamento,
                 ordem=parcela.ordem,
@@ -1078,6 +1107,12 @@ def validar_inteiro_positivo(valor, mensagem):
     return inteiro
 
 
+def validar_inteiro_positivo_opcional(valor, mensagem):
+    if valor in (None, ""):
+        return None
+    return validar_inteiro_positivo(valor, mensagem)
+
+
 def validar_disponibilidade(catalogo_item, quantidade_adicional):
     disponivel = calcular_disponivel_local(catalogo_item)
     if Decimal(quantidade_adicional) > disponivel:
@@ -1216,9 +1251,10 @@ def validar_autorizacao(valor):
     return texto
 
 
-def validar_retry_pagamento(pagamento, *, forma_pagamento_id, valor, autorizacao):
+def validar_retry_pagamento(pagamento, *, forma_pagamento_id, prazo_pagamento_id, valor, autorizacao):
     if (
         pagamento.forma_pagamento_id != forma_pagamento_id
+        or pagamento.prazo_pagamento_id != prazo_pagamento_id
         or pagamento.valor != valor
         or pagamento.autorizacao != autorizacao
     ):
@@ -1480,6 +1516,10 @@ def serializar_pagamento(pagamento):
         "uuid": str(pagamento.pagamento_uuid),
         "forma_pagamento_id": pagamento.forma_pagamento_id,
         "forma_retaguarda_id": pagamento.retaguarda_forma_pagamento_id,
+        "prazo_pagamento_id": pagamento.prazo_pagamento_id,
+        "prazo_retaguarda_id": pagamento.retaguarda_prazo_pagamento_id,
+        "prazo_codigo": pagamento.prazo_codigo,
+        "prazo_descricao": pagamento.prazo_descricao,
         "codigo": pagamento.codigo,
         "descricao": pagamento.descricao,
         "tipo": pagamento.tipo,
@@ -1489,6 +1529,27 @@ def serializar_pagamento(pagamento):
         "vale_troca_documento": pagamento.vale_troca_documento,
         "origem_captura": pagamento.origem_captura,
         "criado_em": pagamento.criado_em.isoformat(),
+    }
+
+
+def serializar_prazo_pagamento(prazo):
+    parcelas = prazo.parcelas.all()
+    return {
+        "id": prazo.id,
+        "retaguarda_id": prazo.retaguarda_id,
+        "codigo": prazo.codigo,
+        "descricao": prazo.descricao,
+        "num_parcelas": prazo.num_parcelas,
+        "intervalo_dias": prazo.intervalo_dias,
+        "parcelas": [
+            {
+                "ordem": parcela.ordem,
+                "dias": parcela.dias,
+                "percentual": f"{parcela.percentual:.6f}" if parcela.percentual is not None else None,
+                "valor_fixo": f"{parcela.valor_fixo:.2f}" if parcela.valor_fixo is not None else None,
+            }
+            for parcela in parcelas
+        ],
     }
 
 

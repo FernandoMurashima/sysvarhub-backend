@@ -22,6 +22,8 @@ from core.models import (
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
     HubConfig,
+    PrazoPagamentoHub,
+    PrazoPagamentoParcelaHub,
     Terminal,
     ValeTrocaHub,
 )
@@ -1990,6 +1992,7 @@ class FormasPagamentoHubServiceTests(TestCase):
             "empresa": {"id": 11},
             "loja": {"id": 41},
             "formas_pagamento": formas,
+            "prazos_pagamento": [],
             "mapas_fiscais": [],
         }
         payload.update(overrides)
@@ -2121,6 +2124,29 @@ class FormasPagamentoHubServiceTests(TestCase):
         sincronizar_formas_pagamento(self.hub, self.resposta())
 
         self.assertEqual(FormaPagamentoParcelaHub.objects.count(), 1)
+
+    def test_prazos_independentes_sao_sincronizados(self):
+        resposta = self.resposta(
+            [self.forma(id=10, codigo="CRE", tipo="CREDITO", prazo_pagamento=None, parcelas=[])],
+            prazos_pagamento=[
+                {
+                    "id": 5,
+                    "codigo": "30-60",
+                    "descricao": "30/60",
+                    "num_parcelas": 2,
+                    "intervalo_dias": 30,
+                    "ativo": True,
+                    "parcelas": [self.parcela(ordem=1, dias=30), self.parcela(ordem=2, dias=60)],
+                }
+            ],
+        )
+
+        resultado = sincronizar_formas_pagamento(self.hub, resposta)
+
+        self.assertEqual(resultado["prazos"], 1)
+        self.assertEqual(FormaPagamentoHub.objects.get().codigo, "CRE")
+        self.assertEqual(PrazoPagamentoHub.objects.get().codigo, "30-60")
+        self.assertEqual(list(PrazoPagamentoParcelaHub.objects.order_by("ordem").values_list("dias", flat=True)), [30, 60])
 
     def test_parcelas_atualizadas(self):
         sincronizar_formas_pagamento(self.hub, self.resposta())

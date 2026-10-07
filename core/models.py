@@ -524,6 +524,64 @@ class FormaPagamentoParcelaHub(models.Model):
         return f"{self.forma.codigo} - {self.ordem}"
 
 
+class PrazoPagamentoHub(models.Model):
+    hub = models.ForeignKey(
+        HubConfig,
+        on_delete=models.PROTECT,
+        related_name="prazos_pagamento",
+    )
+    retaguarda_id = models.PositiveBigIntegerField()
+    codigo = models.CharField(max_length=12)
+    descricao = models.CharField(max_length=120)
+    num_parcelas = models.PositiveIntegerField()
+    intervalo_dias = models.PositiveIntegerField(null=True, blank=True)
+    ativo = models.BooleanField(default=True)
+    sincronizado_em = models.DateTimeField()
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Prazo de pagamento do Hub"
+        verbose_name_plural = "Prazos de pagamento do Hub"
+        ordering = ("num_parcelas", "codigo", "retaguarda_id")
+        constraints = [
+            models.UniqueConstraint(fields=["hub", "retaguarda_id"], name="uniq_prazo_hub_ret"),
+            models.UniqueConstraint(fields=["hub", "codigo"], name="uniq_prazo_hub_cod"),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "ativo"], name="idx_prazo_hub_ativo"),
+        ]
+
+    def __str__(self):
+        return f"{self.codigo} - {self.descricao}"
+
+
+class PrazoPagamentoParcelaHub(models.Model):
+    prazo = models.ForeignKey(
+        PrazoPagamentoHub,
+        on_delete=models.CASCADE,
+        related_name="parcelas",
+    )
+    ordem = models.PositiveIntegerField()
+    dias = models.IntegerField()
+    percentual = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    valor_fixo = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    sincronizado_em = models.DateTimeField()
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Parcela de prazo de pagamento do Hub"
+        verbose_name_plural = "Parcelas de prazos de pagamento do Hub"
+        ordering = ("ordem", "id")
+        constraints = [
+            models.UniqueConstraint(fields=["prazo", "ordem"], name="uniq_prazo_parc_ord"),
+        ]
+
+    def __str__(self):
+        return f"{self.prazo.codigo} - {self.ordem}"
+
+
 class FormaPagamentoFiscalMapHub(models.Model):
     hub = models.ForeignKey(
         HubConfig,
@@ -1422,6 +1480,16 @@ class VendaPagamentoHub(models.Model):
         blank=True,
     )
     retaguarda_forma_pagamento_id = models.PositiveBigIntegerField(null=True, blank=True)
+    prazo_pagamento = models.ForeignKey(
+        PrazoPagamentoHub,
+        on_delete=models.PROTECT,
+        related_name="pagamentos_venda",
+        null=True,
+        blank=True,
+    )
+    retaguarda_prazo_pagamento_id = models.PositiveBigIntegerField(null=True, blank=True)
+    prazo_codigo = models.CharField(max_length=12, blank=True, default="")
+    prazo_descricao = models.CharField(max_length=120, blank=True, default="")
     codigo = models.CharField(max_length=10)
     descricao = models.CharField(max_length=120)
     tipo = models.CharField(max_length=24)

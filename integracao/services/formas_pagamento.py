@@ -5,7 +5,13 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-from core.models import FormaPagamentoFiscalMapHub, FormaPagamentoHub, FormaPagamentoParcelaHub
+from core.models import (
+    FormaPagamentoFiscalMapHub,
+    FormaPagamentoHub,
+    FormaPagamentoParcelaHub,
+    PrazoPagamentoHub,
+    PrazoPagamentoParcelaHub,
+)
 
 
 FORMAS_PAGAMENTO_VERSOES_SUPORTADAS = {1}
@@ -33,7 +39,35 @@ def sincronizar_formas_pagamento(hub, resposta):
         formas_ativas = 0
         formas_inativas = 0
         total_parcelas = 0
+        total_prazos = 0
+        ids_prazos_recebidos = set()
         mapas_recebidos = set()
+
+        for prazo_payload in dados["prazos_pagamento"]:
+            ids_prazos_recebidos.add(prazo_payload["retaguarda_id"])
+            parcelas = prazo_payload.pop("parcelas")
+            prazo, _created = PrazoPagamentoHub.objects.update_or_create(
+                hub=hub,
+                retaguarda_id=prazo_payload["retaguarda_id"],
+                defaults={
+                    **prazo_payload,
+                    "sincronizado_em": sincronizado_em,
+                },
+            )
+            total_prazos += 1
+            ordens_recebidas = set()
+            for parcela_payload in parcelas:
+                ordens_recebidas.add(parcela_payload["ordem"])
+                PrazoPagamentoParcelaHub.objects.update_or_create(
+                    prazo=prazo,
+                    ordem=parcela_payload["ordem"],
+                    defaults={
+                        **parcela_payload,
+                        "sincronizado_em": sincronizado_em,
+                    },
+                )
+                total_parcelas += 1
+            prazo.parcelas.exclude(ordem__in=ordens_recebidas).delete()
 
         for forma_payload in dados["formas_pagamento"]:
             ids_recebidos.add(forma_payload["retaguarda_id"])
@@ -65,6 +99,10 @@ def sincronizar_formas_pagamento(hub, resposta):
                 total_parcelas += 1
 
             forma.parcelas.exclude(ordem__in=ordens_recebidas).delete()
+
+        PrazoPagamentoHub.objects.filter(hub=hub, ativo=True).exclude(
+            retaguarda_id__in=ids_prazos_recebidos
+        ).update(ativo=False, sincronizado_em=sincronizado_em)
 
         for mapa in dados["mapas_fiscais"]:
             mapas_recebidos.add((mapa["forma_pagamento_retaguarda_id"], mapa["codigo_tpag"]))
@@ -111,6 +149,7 @@ def sincronizar_formas_pagamento(hub, resposta):
         "formas_ativas": formas_ativas,
         "formas_inativas": formas_inativas,
         "formas_ausentes_inativadas": formas_ausentes_inativadas,
+        "prazos": total_prazos,
         "parcelas": total_parcelas,
         "mapas_fiscais": len(dados["mapas_fiscais"]),
         "mapas_fiscais_ausentes_removidos": mapas_ausentes_removidos,
@@ -138,6 +177,7 @@ def _validar_formas_pagamento(hub, resposta):
     empresa_payload = resposta["empresa"]
     loja_payload = resposta["loja"]
     formas = resposta["formas_pagamento"]
+    prazos = resposta.get("prazos_pagamento") or []
     mapas = resposta.get("mapas_fiscais") or []
     if (
         not isinstance(hub_payload, dict)
@@ -149,6 +189,8 @@ def _validar_formas_pagamento(hub, resposta):
         raise FormasPagamentoValidationError("Resposta de formas de pagamento inválida: formas_pagamento deve ser lista.")
     if not isinstance(mapas, list):
         raise FormasPagamentoValidationError("Resposta de formas de pagamento inválida: mapas_fiscais deve ser lista.")
+    if not isinstance(prazos, list):
+        raise FormasPagamentoValidationError("Resposta de formas de pagamento inválida: prazos_pagamento deve ser lista.")
 
     _exigir_campos(hub_payload, ("id", "hub_uuid"))
     _exigir_campos(empresa_payload, ("id",))
@@ -159,6 +201,19 @@ def _validar_formas_pagamento(hub, resposta):
     _validar_identidade_inteira("loja_id", loja_payload["id"], hub.loja_id)
 
     formas_validadas = []
+    prazos_validados = []
+    ids_prazos = set()
+    codigos_prazos = set()
+    for item in prazos:
+        validado = _validar_prazo_independente(item)
+        if validado["retaguarda_id"] in ids_prazos:
+            raise FormasPagamentoValidationError("Prazos de pagamento retornou id duplicado.")
+        if validado["codigo"] in codigos_prazos:
+            raise FormasPagamentoValidationError("Prazos de pagamento retornou codigo duplicado.")
+        ids_prazos.add(validado["retaguarda_id"])
+        codigos_prazos.add(validado["codigo"])
+        prazos_validados.append(validado)
+
     ids = set()
     codigos = set()
     for item in formas:
@@ -187,6 +242,7 @@ def _validar_formas_pagamento(hub, resposta):
         "gerado_em": gerado_em,
         "empresa_id": empresa_payload["id"],
         "loja_id": loja_payload["id"],
+        "prazos_pagamento": prazos_validados,
         "formas_pagamento": formas_validadas,
         "mapas_fiscais": mapas_validados,
     }
@@ -300,6 +356,33 @@ def _validar_prazo(prazo):
         "descricao": _texto_obrigatorio(prazo["descricao"], "prazo_pagamento.descricao", max_length=120),
         "num_parcelas": _inteiro_positivo(prazo["num_parcelas"], "prazo_pagamento.num_parcelas"),
         "intervalo_dias": _inteiro_nao_negativo(prazo["intervalo_dias"], "prazo_pagamento.intervalo_dias"),
+    }
+
+
+def _validar_prazo_independente(item):
+    if not isinstance(item, dict):
+        raise FormasPagamentoValidationError("Prazos de pagamento retornou item inválido.")
+    _exigir_campos(item, ("id", "codigo", "descricao", "num_parcelas", "intervalo_dias", "ativo", "parcelas"))
+    if not isinstance(item["ativo"], bool):
+        raise FormasPagamentoValidationError("Prazos de pagamento retornou ativo inválido.")
+    if not isinstance(item["parcelas"], list):
+        raise FormasPagamentoValidationError("Prazos de pagamento retornou parcelas inválidas.")
+    parcelas = []
+    ordens = set()
+    for parcela in item["parcelas"]:
+        parcela_validada = _validar_parcela(parcela)
+        if parcela_validada["ordem"] in ordens:
+            raise FormasPagamentoValidationError("Prazos de pagamento retornou ordem de parcela duplicada.")
+        ordens.add(parcela_validada["ordem"])
+        parcelas.append(parcela_validada)
+    return {
+        "retaguarda_id": _inteiro_positivo(item["id"], "prazo.id"),
+        "codigo": _texto_obrigatorio(item["codigo"], "prazo.codigo", max_length=12),
+        "descricao": _texto_obrigatorio(item["descricao"], "prazo.descricao", max_length=120),
+        "num_parcelas": _inteiro_positivo(item["num_parcelas"], "prazo.num_parcelas"),
+        "intervalo_dias": _inteiro_nao_negativo(item["intervalo_dias"], "prazo.intervalo_dias"),
+        "ativo": item["ativo"],
+        "parcelas": sorted(parcelas, key=lambda parcela: parcela["ordem"]),
     }
 
 
