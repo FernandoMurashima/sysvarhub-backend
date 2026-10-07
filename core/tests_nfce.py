@@ -12,7 +12,15 @@ from django.test import TestCase
 from django.utils import timezone
 from lxml import etree
 
-from core.models import ConfiguracaoFiscalHub, EventoSyncHub, FormaPagamentoFiscalMapHub, NFCeHub, VendaHub, VendaItemHub
+from core.models import (
+    ConfiguracaoFiscalHub,
+    EventoSyncHub,
+    FaixaNumeracaoVendaHub,
+    FormaPagamentoFiscalMapHub,
+    NFCeHub,
+    VendaHub,
+    VendaItemHub,
+)
 from core.services.nfce import (
     CANONICALIZATION_ALGORITHM,
     DIGEST_ALGORITHM,
@@ -90,6 +98,12 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
         self.catalogo_item.estoque_fisico = Decimal("50.000")
         self.catalogo_item.estoque_disponivel = Decimal("50.000")
         self.catalogo_item.save(update_fields=["fiscal", "estoque_fisico", "estoque_disponivel"])
+        FaixaNumeracaoVendaHub.objects.create(
+            hub=self.hub,
+            inicio=1,
+            fim=999,
+            proximo_numero=1,
+        )
         self.config = ConfiguracaoFiscalHub.objects.create(
             hub=self.hub,
             emite_nfce=True,
@@ -120,7 +134,13 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
         self.config.emite_nfce = False
         self.config.save(update_fields=["emite_nfce"])
         venda_uuid = self.criar_venda_com_item()
-        self.pagar(venda_uuid, forma or self.dinheiro, valor=valor_pagamento)
+        forma_pagamento = forma or self.dinheiro
+        self.pagar(
+            venda_uuid,
+            forma_pagamento,
+            valor=valor_pagamento,
+            prazo=self.prazo_1x if forma_pagamento.tipo == "CREDITO" else None,
+        )
         self.finalizar(venda_uuid)
         self.config.emite_nfce = True
         self.config.save(update_fields=["emite_nfce"])
@@ -131,7 +151,12 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
         self.config.save(update_fields=["emite_nfce"])
         venda_uuid = self.criar_venda_com_item()
         for forma, valor in pagamentos:
-            self.pagar(venda_uuid, forma, valor=valor)
+            self.pagar(
+                venda_uuid,
+                forma,
+                valor=valor,
+                prazo=self.prazo_1x if forma.tipo == "CREDITO" else None,
+            )
         self.finalizar(venda_uuid)
         self.config.emite_nfce = True
         self.config.save(update_fields=["emite_nfce"])
@@ -244,7 +269,12 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
 
         for indice, (codigo, tipo, tpag) in enumerate(cenarios):
             with self.subTest(tipo=tipo):
-                forma = self.dinheiro if tipo == "DINHEIRO" else self.criar_forma(codigo, tipo)
+                if tipo == "DINHEIRO":
+                    forma = self.dinheiro
+                elif tipo == "CREDITO":
+                    forma = self.credito
+                else:
+                    forma = self.criar_forma(codigo, tipo)
                 venda = self.venda_finalizada(forma=forma)
                 nfce = self.gerar_nfce(venda, codigo_numerico=f"{indice + 1:08d}")
 
