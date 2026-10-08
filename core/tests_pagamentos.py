@@ -962,6 +962,53 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(pagamento_payload["taxa_fixa"], "1.10")
         self.assertEqual([parcela["dias"] for parcela in pagamento_payload["parcelas"]], [30, 60])
 
+    def test_condicoes_oficiais_deb_e_credito_preservam_snapshot_e_payload(self):
+        self.credito.permite_parcelamento = True
+        self.credito.save(update_fields=["permite_parcelamento", "atualizado_em"])
+        debito = self.criar_forma("DEB", "DEBITO", permite_parcelamento=True)
+        prazo_av = self.criar_prazo("AV", 1, [0], retaguarda_id=7010, intervalo_dias=0)
+        prazo_3x = self.criar_prazo("30-60-90", 3, [30, 60, 90], retaguarda_id=7011)
+        cenarios = [
+            (debito, prazo_av, self.criar_condicao(debito, prazo_av, retaguarda_id=9500, taxa_percentual=Decimal("0.0000"), taxa_fixa=Decimal("0.00")), [0], Decimal("0.0000"), "49.00"),
+            (self.credito, self.prazo_1x, self.criar_condicao(self.credito, self.prazo_1x, retaguarda_id=9501, taxa_percentual=Decimal("2.0000"), taxa_fixa=Decimal("0.00")), [30], Decimal("2.0000"), "50.00"),
+            (self.credito, self.prazo_2x, self.criar_condicao(self.credito, self.prazo_2x, retaguarda_id=9502, taxa_percentual=Decimal("2.5000"), taxa_fixa=Decimal("0.00")), [30, 60], Decimal("2.5000"), "50.00"),
+            (self.credito, prazo_3x, self.criar_condicao(self.credito, prazo_3x, retaguarda_id=9503, taxa_percentual=Decimal("2.5000"), taxa_fixa=Decimal("0.00")), [30, 60, 90], Decimal("2.5000"), "50.90"),
+        ]
+        venda_uuid = self.criar_venda_com_item()
+
+        for forma, prazo, condicao, dias, taxa, valor in cenarios:
+            with self.subTest(forma=forma.codigo, prazo=prazo.codigo):
+                resposta = self.pagar(venda_uuid, forma, valor=valor, prazo=prazo)
+                pagamento = VendaPagamentoHub.objects.get(venda__venda_uuid=venda_uuid, forma_pagamento=forma, prazo_pagamento=prazo)
+
+                self.assertEqual(resposta.status_code, 201)
+                self.assertEqual(pagamento.retaguarda_forma_pagamento_condicao_id, condicao.retaguarda_id)
+                self.assertEqual(pagamento.retaguarda_prazo_pagamento_id, prazo.retaguarda_id)
+                self.assertEqual(pagamento.num_parcelas, prazo.num_parcelas)
+                self.assertEqual(pagamento.taxa_percentual, taxa)
+                self.assertEqual(pagamento.taxa_fixa, Decimal("0.00"))
+                self.assertEqual(list(pagamento.parcelas_snapshot.order_by("ordem").values_list("dias", flat=True)), dias)
+
+                condicao.taxa_percentual = Decimal("9.0000")
+                condicao.save(update_fields=["taxa_percentual", "atualizado_em"])
+                pagamento.refresh_from_db()
+                self.assertEqual(pagamento.taxa_percentual, taxa)
+                self.assertEqual(list(pagamento.parcelas_snapshot.order_by("ordem").values_list("dias", flat=True)), dias)
+
+        payloads = {
+            pagamento["forma_pagamento_condicao_id"]: pagamento
+            for pagamento in enfileirar_venda_finalizada(VendaHub.objects.get(venda_uuid=venda_uuid)).payload["pagamentos"]
+        }
+        for _forma, prazo, condicao, dias, taxa, _valor in cenarios:
+            with self.subTest(payload=condicao.retaguarda_id):
+                payload = payloads[condicao.retaguarda_id]
+                self.assertEqual(payload["forma_pagamento_condicao_id"], condicao.retaguarda_id)
+                self.assertEqual(payload["prazo_pagamento_id"], prazo.retaguarda_id)
+                self.assertEqual(payload["prazo_codigo"], prazo.codigo)
+                self.assertEqual(payload["num_parcelas"], prazo.num_parcelas)
+                self.assertEqual(payload["taxa_percentual"], f"{taxa:.4f}")
+                self.assertEqual([parcela["dias"] for parcela in payload["parcelas"]], dias)
+
     def test_retry_com_prazo_diferente_retorna_409_quando_parcelado(self):
         self.credito.permite_parcelamento = True
         self.credito.save(update_fields=["permite_parcelamento", "atualizado_em"])

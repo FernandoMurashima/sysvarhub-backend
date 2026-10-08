@@ -2199,6 +2199,111 @@ class FormasPagamentoHubServiceTests(TestCase):
         self.assertEqual(resultado["condicoes_ausentes_inativadas"], 1)
         self.assertFalse(FormaPagamentoCondicaoHub.objects.get(retaguarda_id=91).ativo)
 
+    def test_payload_oficial_formas_e_condicoes_pagamento(self):
+        prazo_av = {
+            "id": 1,
+            "codigo": "AV",
+            "descricao": "À vista",
+            "num_parcelas": 1,
+            "intervalo_dias": 0,
+            "ativo": True,
+            "parcelas": [self.parcela(dias=0, percentual="1.000000")],
+        }
+        prazo_30d = {
+            "id": 2,
+            "codigo": "30D",
+            "descricao": "30 dias",
+            "num_parcelas": 1,
+            "intervalo_dias": 30,
+            "ativo": True,
+            "parcelas": [self.parcela(dias=30, percentual="1.000000")],
+        }
+        prazo_30_60 = {
+            "id": 3,
+            "codigo": "30-60",
+            "descricao": "30/60",
+            "num_parcelas": 2,
+            "intervalo_dias": 30,
+            "ativo": True,
+            "parcelas": [
+                self.parcela(ordem=1, dias=30, percentual="0.500000"),
+                self.parcela(ordem=2, dias=60, percentual="0.500000"),
+            ],
+        }
+        prazo_30_60_90 = {
+            "id": 4,
+            "codigo": "30-60-90",
+            "descricao": "30/60/90",
+            "num_parcelas": 3,
+            "intervalo_dias": 30,
+            "ativo": True,
+            "parcelas": [
+                self.parcela(ordem=1, dias=30, percentual="0.333333"),
+                self.parcela(ordem=2, dias=60, percentual="0.333333"),
+                self.parcela(ordem=3, dias=90, percentual="0.333334"),
+            ],
+        }
+        prazo_4x = {
+            "id": 5,
+            "codigo": "30-60-90-120",
+            "descricao": "30/60/90/120",
+            "num_parcelas": 4,
+            "intervalo_dias": 30,
+            "ativo": True,
+            "parcelas": [
+                self.parcela(ordem=1, dias=30, percentual="0.250000"),
+                self.parcela(ordem=2, dias=60, percentual="0.250000"),
+                self.parcela(ordem=3, dias=90, percentual="0.250000"),
+                self.parcela(ordem=4, dias=120, percentual="0.250000"),
+            ],
+        }
+        formas = [
+            self.forma(id=10, codigo="DIN", descricao="Dinheiro", tipo="DINHEIRO", permite_parcelamento=False, prazo_pagamento=prazo_av, condicoes_parcelamento=[]),
+            self.forma(id=11, codigo="PIX", descricao="PIX", tipo="PIX", permite_parcelamento=False, prazo_pagamento=prazo_av, condicoes_parcelamento=[]),
+            self.forma(
+                id=12,
+                codigo="DEB",
+                descricao="Cartão de débito",
+                tipo="DEBITO",
+                permite_parcelamento=True,
+                prazo_pagamento=prazo_av,
+                condicoes_parcelamento=[
+                    self.condicao(id=120, prazo_pagamento_id=1, prazo_codigo="AV", prazo_descricao="À vista", prazo_num_parcelas=1, prazo_intervalo_dias=0, taxa_percentual="0.0000", taxa_fixa="0.00", parcelas=prazo_av["parcelas"])
+                ],
+            ),
+            self.forma(
+                id=13,
+                codigo="CRE",
+                descricao="Cartão de crédito",
+                tipo="CREDITO",
+                permite_parcelamento=True,
+                prazo_pagamento=prazo_30d,
+                condicoes_parcelamento=[
+                    self.condicao(id=130, prazo_pagamento_id=2, prazo_codigo="30D", prazo_descricao="30 dias", prazo_num_parcelas=1, taxa_percentual="2.0000", taxa_fixa="0.00", parcelas=prazo_30d["parcelas"]),
+                    self.condicao(id=131, prazo_pagamento_id=3, prazo_codigo="30-60", prazo_descricao="30/60", prazo_num_parcelas=2, taxa_percentual="2.5000", taxa_fixa="0.00", parcelas=prazo_30_60["parcelas"]),
+                    self.condicao(id=132, prazo_pagamento_id=4, prazo_codigo="30-60-90", prazo_descricao="30/60/90", prazo_num_parcelas=3, taxa_percentual="2.5000", taxa_fixa="0.00", parcelas=prazo_30_60_90["parcelas"]),
+                ],
+            ),
+        ]
+
+        sincronizar_formas_pagamento(self.hub, self.resposta(formas, prazos_pagamento=[prazo_av, prazo_30d, prazo_30_60, prazo_30_60_90, prazo_4x]))
+
+        formas_db = {forma.codigo: forma for forma in FormaPagamentoHub.objects.prefetch_related("condicoes_parcelamento")}
+        self.assertFalse(formas_db["DIN"].permite_parcelamento)
+        self.assertFalse(formas_db["PIX"].permite_parcelamento)
+        self.assertEqual(formas_db["DIN"].condicoes_parcelamento.filter(ativo=True).count(), 0)
+        self.assertEqual(formas_db["PIX"].condicoes_parcelamento.filter(ativo=True).count(), 0)
+        self.assertTrue(formas_db["DEB"].permite_parcelamento)
+        self.assertTrue(formas_db["CRE"].permite_parcelamento)
+        self.assertEqual(list(formas_db["DEB"].condicoes_parcelamento.filter(ativo=True).values_list("prazo_pagamento__codigo", flat=True)), ["AV"])
+        self.assertEqual(set(formas_db["CRE"].condicoes_parcelamento.filter(ativo=True).values_list("prazo_pagamento__codigo", flat=True)), {"30D", "30-60", "30-60-90"})
+        self.assertFalse(formas_db["CRE"].condicoes_parcelamento.filter(ativo=True, prazo_pagamento__codigo="30-60-90-120").exists())
+        taxas = {
+            condicao.prazo_pagamento.codigo: condicao.taxa_percentual
+            for condicao in formas_db["CRE"].condicoes_parcelamento.select_related("prazo_pagamento").filter(ativo=True)
+        }
+        self.assertEqual(taxas, {"30D": Decimal("2.0000"), "30-60": Decimal("2.5000"), "30-60-90": Decimal("2.5000")})
+
     def test_condicao_parcelamento_para_prazo_desconhecido_rejeita(self):
         forma = self.forma(
             tipo="CREDITO",
