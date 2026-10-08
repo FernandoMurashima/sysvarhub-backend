@@ -438,6 +438,7 @@ class FormaPagamentoHub(models.Model):
     tipo = models.CharField(max_length=24)
     num_parcelas = models.PositiveIntegerField()
     ativo = models.BooleanField(default=True)
+    permite_parcelamento = models.BooleanField(default=False)
 
     prazo_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
     prazo_codigo = models.CharField(max_length=12, blank=True, default="")
@@ -522,6 +523,53 @@ class FormaPagamentoParcelaHub(models.Model):
 
     def __str__(self):
         return f"{self.forma.codigo} - {self.ordem}"
+
+
+class FormaPagamentoCondicaoHub(models.Model):
+    hub = models.ForeignKey(
+        HubConfig,
+        on_delete=models.PROTECT,
+        related_name="formas_pagamento_condicoes",
+    )
+    retaguarda_id = models.PositiveBigIntegerField()
+    forma_pagamento = models.ForeignKey(
+        FormaPagamentoHub,
+        on_delete=models.CASCADE,
+        related_name="condicoes_parcelamento",
+    )
+    prazo_pagamento = models.ForeignKey(
+        "PrazoPagamentoHub",
+        on_delete=models.PROTECT,
+        related_name="formas_pagamento_condicoes",
+    )
+    taxa_percentual = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    taxa_fixa = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    ativo = models.BooleanField(default=True)
+    sincronizado_em = models.DateTimeField()
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Condição de parcelamento de forma de pagamento do Hub"
+        verbose_name_plural = "Condições de parcelamento de formas de pagamento do Hub"
+        ordering = ("forma_pagamento__codigo", "prazo_pagamento__num_parcelas", "retaguarda_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["hub", "retaguarda_id"],
+                name="uniq_fpg_cond_hub_ret",
+            ),
+            models.UniqueConstraint(
+                fields=["forma_pagamento", "prazo_pagamento"],
+                name="uniq_fpg_cond_forma_prazo",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "ativo"], name="idx_fpg_cond_hub_ativo"),
+            models.Index(fields=["forma_pagamento", "ativo"], name="idx_fpg_cond_forma_ativo"),
+        ]
+
+    def __str__(self):
+        return f"{self.forma_pagamento.codigo} - {self.prazo_pagamento.codigo}"
 
 
 class PrazoPagamentoHub(models.Model):
@@ -1480,6 +1528,7 @@ class VendaPagamentoHub(models.Model):
         blank=True,
     )
     retaguarda_forma_pagamento_id = models.PositiveBigIntegerField(null=True, blank=True)
+    retaguarda_forma_pagamento_condicao_id = models.PositiveBigIntegerField(null=True, blank=True)
     prazo_pagamento = models.ForeignKey(
         PrazoPagamentoHub,
         on_delete=models.PROTECT,

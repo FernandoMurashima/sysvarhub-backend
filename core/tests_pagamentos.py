@@ -14,6 +14,7 @@ from core.models import (
     ConfiguracaoFiscalHub,
     EventoSyncHub,
     EstoqueMovimentoHub,
+    FormaPagamentoCondicaoHub,
     FormaPagamentoFiscalMapHub,
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
@@ -93,6 +94,19 @@ class PagamentoHubTestMixin(VendaHubTestMixin):
             sincronizado_em=timezone.now(),
         )
         return forma
+
+    def criar_condicao(self, forma, prazo, **overrides):
+        return FormaPagamentoCondicaoHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=overrides.pop("retaguarda_id", 9000 + FormaPagamentoCondicaoHub.objects.count()),
+            forma_pagamento=forma,
+            prazo_pagamento=prazo,
+            taxa_percentual=overrides.pop("taxa_percentual", Decimal("1.5000")),
+            taxa_fixa=overrides.pop("taxa_fixa", Decimal("0.25")),
+            ativo=overrides.pop("ativo", True),
+            sincronizado_em=timezone.now(),
+            **overrides,
+        )
 
     def criar_prazo(self, codigo, num_parcelas, dias, **overrides):
         prazo = PrazoPagamentoHub.objects.create(
@@ -181,6 +195,20 @@ class FormasPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         self.assertIn("DIN", codigos)
         self.assertEqual(resposta.data["formas"][0]["parcelas"][0]["percentual"], "1.000000")
 
+    def test_listar_forma_com_condicoes_parcelamento_ativas(self):
+        self.credito.permite_parcelamento = True
+        self.credito.save(update_fields=["permite_parcelamento", "atualizado_em"])
+        condicao = self.criar_condicao(self.credito, self.prazo_2x, retaguarda_id=9100)
+        self.criar_condicao(self.credito, self.prazo_1x, retaguarda_id=9101, ativo=False)
+
+        resposta = self.client.get("/api/terminal/formas-pagamento/")
+
+        credito = next(forma for forma in resposta.data["formas"] if forma["codigo"] == "CRE")
+        self.assertTrue(credito["permite_parcelamento"])
+        self.assertEqual(len(credito["condicoes_parcelamento"]), 1)
+        self.assertEqual(credito["condicoes_parcelamento"][0]["retaguarda_id"], condicao.retaguarda_id)
+        self.assertEqual(credito["condicoes_parcelamento"][0]["prazo_retaguarda_id"], self.prazo_2x.retaguarda_id)
+
     def test_nao_listar_forma_inativa(self):
         self.pix.ativo = False
         self.pix.save()
@@ -212,7 +240,7 @@ class FormasPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         with CaptureQueriesContext(connection) as contexto:
             payload = listar_formas_pagamento(self.terminal)
 
-        self.assertLessEqual(len(contexto), 4)
+        self.assertLessEqual(len(contexto), 6)
         self.assertGreaterEqual(len(payload["formas"]), 3)
 
 
@@ -872,6 +900,53 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(pagamento.prazo_pagamento, self.prazo_2x)
         self.assertEqual(pagamento.num_parcelas, 2)
         self.assertEqual(list(pagamento.parcelas_snapshot.order_by("ordem").values_list("dias", flat=True)), [30, 60])
+
+    def test_forma_com_permite_parcelamento_exige_condicao_ativa_e_usa_taxas(self):
+        self.credito.permite_parcelamento = True
+        self.credito.save(update_fields=["permite_parcelamento", "atualizado_em"])
+        condicao = self.criar_condicao(
+            self.credito,
+            self.prazo_2x,
+            retaguarda_id=9200,
+            taxa_percentual=Decimal("2.5000"),
+            taxa_fixa=Decimal("0.50"),
+        )
+        venda_uuid = self.criar_venda_com_item()
+
+        sem_prazo = self.pagar(venda_uuid, self.credito)
+        prazo_nao_vinculado = self.pagar(venda_uuid, self.credito, prazo=self.prazo_1x)
+        resposta = self.pagar(venda_uuid, self.credito, prazo=self.prazo_2x)
+
+        pagamento = VendaPagamentoHub.objects.get()
+        self.assertEqual(sem_prazo.status_code, 400)
+        self.assertEqual(prazo_nao_vinculado.status_code, 400)
+        self.assertEqual(resposta.status_code, 201)
+        self.assertEqual(pagamento.retaguarda_forma_pagamento_condicao_id, condicao.retaguarda_id)
+        self.assertEqual(pagamento.taxa_percentual, Decimal("2.5000"))
+        self.assertEqual(pagamento.taxa_fixa, Decimal("0.50"))
+        self.assertEqual(list(pagamento.parcelas_snapshot.order_by("ordem").values_list("dias", flat=True)), [30, 60])
+
+    def test_payload_sync_pagamento_preserva_condicao_prazo_taxas_e_parcelas(self):
+        self.credito.permite_parcelamento = True
+        self.credito.save(update_fields=["permite_parcelamento", "atualizado_em"])
+        condicao = self.criar_condicao(
+            self.credito,
+            self.prazo_2x,
+            retaguarda_id=9300,
+            taxa_percentual=Decimal("2.7500"),
+            taxa_fixa=Decimal("1.10"),
+        )
+        venda_uuid = self.criar_venda_com_item()
+        self.pagar(venda_uuid, self.credito, prazo=self.prazo_2x)
+
+        evento = enfileirar_venda_finalizada(VendaHub.objects.get(venda_uuid=venda_uuid))
+        pagamento_payload = evento.payload["pagamentos"][0]
+
+        self.assertEqual(pagamento_payload["forma_pagamento_condicao_id"], condicao.retaguarda_id)
+        self.assertEqual(pagamento_payload["prazo_pagamento_id"], self.prazo_2x.retaguarda_id)
+        self.assertEqual(pagamento_payload["taxa_percentual"], "2.7500")
+        self.assertEqual(pagamento_payload["taxa_fixa"], "1.10")
+        self.assertEqual([parcela["dias"] for parcela in pagamento_payload["parcelas"]], [30, 60])
 
     def test_retry_com_prazo_diferente_retorna_409(self):
         venda_uuid = self.criar_venda_com_item()

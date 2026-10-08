@@ -6,6 +6,7 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
 from core.models import (
+    FormaPagamentoCondicaoHub,
     FormaPagamentoFiscalMapHub,
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
@@ -40,7 +41,9 @@ def sincronizar_formas_pagamento(hub, resposta):
         formas_inativas = 0
         total_parcelas = 0
         total_prazos = 0
+        total_condicoes = 0
         ids_prazos_recebidos = set()
+        ids_condicoes_recebidas = set()
         mapas_recebidos = set()
 
         for prazo_payload in dados["prazos_pagamento"]:
@@ -69,9 +72,15 @@ def sincronizar_formas_pagamento(hub, resposta):
                 total_parcelas += 1
             prazo.parcelas.exclude(ordem__in=ordens_recebidas).delete()
 
+        prazos_por_retaguarda = {
+            prazo.retaguarda_id: prazo
+            for prazo in PrazoPagamentoHub.objects.filter(hub=hub, retaguarda_id__in=ids_prazos_recebidos)
+        }
+
         for forma_payload in dados["formas_pagamento"]:
             ids_recebidos.add(forma_payload["retaguarda_id"])
             parcelas = forma_payload.pop("parcelas")
+            condicoes = forma_payload.pop("condicoes_parcelamento")
             forma, _created = FormaPagamentoHub.objects.update_or_create(
                 hub=hub,
                 retaguarda_id=forma_payload["retaguarda_id"],
@@ -99,6 +108,33 @@ def sincronizar_formas_pagamento(hub, resposta):
                 total_parcelas += 1
 
             forma.parcelas.exclude(ordem__in=ordens_recebidas).delete()
+
+            for condicao_payload in condicoes:
+                prazo = prazos_por_retaguarda.get(condicao_payload["prazo_retaguarda_id"])
+                if prazo is None:
+                    raise FormasPagamentoValidationError(
+                        "Condição de parcelamento retornou prazo_pagamento_id desconhecido."
+                    )
+                ids_condicoes_recebidas.add(condicao_payload["retaguarda_id"])
+                FormaPagamentoCondicaoHub.objects.update_or_create(
+                    hub=hub,
+                    retaguarda_id=condicao_payload["retaguarda_id"],
+                    defaults={
+                        "forma_pagamento": forma,
+                        "prazo_pagamento": prazo,
+                        "taxa_percentual": condicao_payload["taxa_percentual"],
+                        "taxa_fixa": condicao_payload["taxa_fixa"],
+                        "ativo": True,
+                        "sincronizado_em": sincronizado_em,
+                    },
+                )
+                total_condicoes += 1
+
+        condicoes_ausentes_inativadas = (
+            FormaPagamentoCondicaoHub.objects.filter(hub=hub, ativo=True)
+            .exclude(retaguarda_id__in=ids_condicoes_recebidas)
+            .update(ativo=False, sincronizado_em=sincronizado_em)
+        )
 
         PrazoPagamentoHub.objects.filter(hub=hub, ativo=True).exclude(
             retaguarda_id__in=ids_prazos_recebidos
@@ -150,6 +186,8 @@ def sincronizar_formas_pagamento(hub, resposta):
         "formas_inativas": formas_inativas,
         "formas_ausentes_inativadas": formas_ausentes_inativadas,
         "prazos": total_prazos,
+        "condicoes": total_condicoes,
+        "condicoes_ausentes_inativadas": condicoes_ausentes_inativadas,
         "parcelas": total_parcelas,
         "mapas_fiscais": len(dados["mapas_fiscais"]),
         "mapas_fiscais_ausentes_removidos": mapas_ausentes_removidos,
@@ -216,12 +254,21 @@ def _validar_formas_pagamento(hub, resposta):
 
     ids = set()
     codigos = set()
+    ids_condicoes = set()
     for item in formas:
         validado = _validar_forma(item)
         if validado["retaguarda_id"] in ids:
             raise FormasPagamentoValidationError("Formas de pagamento retornou id duplicado.")
         if validado["codigo"] in codigos:
             raise FormasPagamentoValidationError("Formas de pagamento retornou codigo duplicado.")
+        for condicao in validado["condicoes_parcelamento"]:
+            if condicao["retaguarda_id"] in ids_condicoes:
+                raise FormasPagamentoValidationError("Condição de parcelamento retornou id duplicado.")
+            if condicao["prazo_retaguarda_id"] not in ids_prazos:
+                raise FormasPagamentoValidationError(
+                    "Condição de parcelamento retornou prazo_pagamento_id desconhecido."
+                )
+            ids_condicoes.add(condicao["retaguarda_id"])
         ids.add(validado["retaguarda_id"])
         codigos.add(validado["codigo"])
         formas_validadas.append(validado)
@@ -293,6 +340,14 @@ def _validar_forma(item):
         raise FormasPagamentoValidationError("Formas de pagamento retornou gera_recebivel_bancario inválido.")
     if not isinstance(item["tef_habilitado"], bool):
         raise FormasPagamentoValidationError("Formas de pagamento retornou tef_habilitado inválido.")
+    permite_parcelamento = item.get("permite_parcelamento", False)
+    if not isinstance(permite_parcelamento, bool):
+        raise FormasPagamentoValidationError("Formas de pagamento retornou permite_parcelamento inválido.")
+    condicoes_payload = item.get("condicoes_parcelamento", [])
+    if condicoes_payload is None:
+        condicoes_payload = []
+    if not isinstance(condicoes_payload, list):
+        raise FormasPagamentoValidationError("Formas de pagamento retornou condicoes_parcelamento inválidas.")
     if not isinstance(item["parcelas"], list):
         raise FormasPagamentoValidationError("Formas de pagamento retornou parcelas inválidas.")
 
@@ -301,6 +356,19 @@ def _validar_forma(item):
     if tipo not in TIPOS_FORMA_PAGAMENTO_SUPORTADOS:
         raise FormasPagamentoValidationError("Formas de pagamento retornou tipo inválido.")
     num_parcelas = _num_parcelas_forma(item, prazo)
+    condicoes = []
+    condicoes_ids = set()
+    condicoes_prazos = set()
+    for condicao in condicoes_payload:
+        condicao_validada = _validar_condicao_parcelamento(condicao)
+        if condicao_validada["retaguarda_id"] in condicoes_ids:
+            raise FormasPagamentoValidationError("Formas de pagamento retornou condição de parcelamento duplicada.")
+        if condicao_validada["prazo_retaguarda_id"] in condicoes_prazos:
+            raise FormasPagamentoValidationError("Formas de pagamento retornou prazo de parcelamento duplicado.")
+        condicoes_ids.add(condicao_validada["retaguarda_id"])
+        condicoes_prazos.add(condicao_validada["prazo_retaguarda_id"])
+        condicoes.append(condicao_validada)
+
     parcelas = []
     ordens = set()
     for parcela in item["parcelas"]:
@@ -317,6 +385,7 @@ def _validar_forma(item):
         "tipo": tipo,
         "num_parcelas": num_parcelas,
         "ativo": item["ativo"],
+        "permite_parcelamento": permite_parcelamento,
         "prazo_retaguarda_id": prazo["id"] if prazo else None,
         "prazo_codigo": prazo["codigo"] if prazo else "",
         "prazo_descricao": prazo["descricao"] if prazo else "",
@@ -340,6 +409,51 @@ def _validar_forma(item):
         "tef_modalidade": _texto_opcional(item["tef_modalidade"], "tef_modalidade", max_length=20) or "",
         "tef_adquirente_codigo": _texto_opcional(item["tef_adquirente_codigo"], "tef_adquirente_codigo", max_length=40) or "",
         "tef_terminal_logico": _texto_opcional(item["tef_terminal_logico"], "tef_terminal_logico", max_length=40) or "",
+        "condicoes_parcelamento": sorted(condicoes, key=lambda condicao: condicao["prazo_num_parcelas"]),
+        "parcelas": sorted(parcelas, key=lambda parcela: parcela["ordem"]),
+    }
+
+
+def _validar_condicao_parcelamento(item):
+    if not isinstance(item, dict):
+        raise FormasPagamentoValidationError("Formas de pagamento retornou condição de parcelamento inválida.")
+    _exigir_campos(
+        item,
+        (
+            "id",
+            "prazo_pagamento_id",
+            "prazo_codigo",
+            "prazo_descricao",
+            "prazo_num_parcelas",
+            "prazo_intervalo_dias",
+            "taxa_percentual",
+            "taxa_fixa",
+            "parcelas",
+        ),
+        permitir_nulos={"prazo_intervalo_dias"},
+    )
+    if not isinstance(item["parcelas"], list):
+        raise FormasPagamentoValidationError("Formas de pagamento retornou parcelas de condição inválidas.")
+    parcelas = []
+    ordens = set()
+    for parcela in item["parcelas"]:
+        parcela_validada = _validar_parcela(parcela)
+        if parcela_validada["ordem"] in ordens:
+            raise FormasPagamentoValidationError("Formas de pagamento retornou ordem de parcela duplicada.")
+        ordens.add(parcela_validada["ordem"])
+        parcelas.append(parcela_validada)
+    return {
+        "retaguarda_id": _inteiro_positivo(item["id"], "condicao.id"),
+        "prazo_retaguarda_id": _inteiro_positivo(item["prazo_pagamento_id"], "condicao.prazo_pagamento_id"),
+        "prazo_codigo": _texto_obrigatorio(item["prazo_codigo"], "condicao.prazo_codigo", max_length=12),
+        "prazo_descricao": _texto_obrigatorio(item["prazo_descricao"], "condicao.prazo_descricao", max_length=120),
+        "prazo_num_parcelas": _inteiro_positivo(item["prazo_num_parcelas"], "condicao.prazo_num_parcelas"),
+        "prazo_intervalo_dias": _inteiro_nao_negativo_opcional(
+            item["prazo_intervalo_dias"],
+            "condicao.prazo_intervalo_dias",
+        ),
+        "taxa_percentual": _decimal_string(item["taxa_percentual"], "condicao.taxa_percentual", 4),
+        "taxa_fixa": _decimal_string(item["taxa_fixa"], "condicao.taxa_fixa", 2),
         "parcelas": sorted(parcelas, key=lambda parcela: parcela["ordem"]),
     }
 
@@ -481,6 +595,12 @@ def _inteiro_nao_negativo(valor, campo):
     if isinstance(valor, bool) or not isinstance(valor, int) or valor < 0:
         raise FormasPagamentoValidationError(f"Formas de pagamento retornou {campo} inválido.")
     return valor
+
+
+def _inteiro_nao_negativo_opcional(valor, campo):
+    if valor is None:
+        return None
+    return _inteiro_nao_negativo(valor, campo)
 
 
 def _exigir_campos(payload, campos, *, permitir_nulos=None, permitir_vazios=None):

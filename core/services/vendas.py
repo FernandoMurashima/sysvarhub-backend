@@ -12,6 +12,7 @@ from core.models import (
     ClienteHub,
     ContextoVendaTerminalHub,
     EstoqueMovimentoHub,
+    FormaPagamentoCondicaoHub,
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
     PrazoPagamentoHub,
@@ -458,9 +459,18 @@ def cancelar_venda(terminal, operador, sessao_operador):
 def listar_formas_pagamento(terminal):
     parcelas_ordenadas = FormaPagamentoParcelaHub.objects.order_by("ordem", "id")
     parcelas_prazo_ordenadas = PrazoPagamentoParcelaHub.objects.order_by("ordem", "id")
+    condicoes_ordenadas = (
+        FormaPagamentoCondicaoHub.objects.filter(ativo=True)
+        .select_related("prazo_pagamento")
+        .prefetch_related(Prefetch("prazo_pagamento__parcelas", queryset=parcelas_prazo_ordenadas))
+        .order_by("prazo_pagamento__num_parcelas", "prazo_pagamento__codigo", "retaguarda_id")
+    )
     formas = (
         FormaPagamentoHub.objects.filter(hub=terminal.hub, ativo=True)
-        .prefetch_related(Prefetch("parcelas", queryset=parcelas_ordenadas))
+        .prefetch_related(
+            Prefetch("parcelas", queryset=parcelas_ordenadas),
+            Prefetch("condicoes_parcelamento", queryset=condicoes_ordenadas),
+        )
         .order_by("codigo", "retaguarda_id")
     )
     prazos = (
@@ -525,6 +535,7 @@ def adicionar_pagamento(
             raise VendaConflictError("Selecione um vendedor antes de registrar pagamentos.")
 
         parcelas_ordenadas = FormaPagamentoParcelaHub.objects.order_by("ordem", "id")
+        parcelas_prazo_ordenadas = PrazoPagamentoParcelaHub.objects.order_by("ordem", "id")
         forma = (
             FormaPagamentoHub.objects.select_for_update()
             .prefetch_related(Prefetch("parcelas", queryset=parcelas_ordenadas))
@@ -534,17 +545,31 @@ def adicionar_pagamento(
         if not forma:
             raise VendaValidationError("Forma de pagamento inválida.")
         prazo = None
-        if forma.tipo == "CREDITO":
+        condicao_parcelamento = None
+        if forma.permite_parcelamento or forma.tipo == "CREDITO":
             if prazo_pagamento_id is None:
                 raise VendaValidationError("Prazo de pagamento inválido.")
             prazo = (
                 PrazoPagamentoHub.objects.select_for_update()
-                .prefetch_related(Prefetch("parcelas", queryset=PrazoPagamentoParcelaHub.objects.order_by("ordem", "id")))
+                .prefetch_related(Prefetch("parcelas", queryset=parcelas_prazo_ordenadas))
                 .filter(pk=prazo_pagamento_id, hub=terminal_bloqueado.hub, ativo=True)
                 .first()
             )
             if not prazo:
                 raise VendaValidationError("Prazo de pagamento inválido.")
+            if forma.permite_parcelamento:
+                condicao_parcelamento = (
+                    FormaPagamentoCondicaoHub.objects.select_for_update()
+                    .filter(
+                        hub=terminal_bloqueado.hub,
+                        forma_pagamento=forma,
+                        prazo_pagamento=prazo,
+                        ativo=True,
+                    )
+                    .first()
+                )
+                if not condicao_parcelamento:
+                    raise VendaValidationError("Condição de parcelamento inválida.")
         if forma.tef_habilitado:
             raise VendaConflictError("Forma de pagamento exige integração TEF.")
         try:
@@ -561,11 +586,17 @@ def adicionar_pagamento(
         if forma.tipo != DINHEIRO and valor > pendente:
             raise VendaConflictError("Valor do pagamento excede o valor pendente.")
 
+        taxa_percentual = condicao_parcelamento.taxa_percentual if condicao_parcelamento else forma.taxa_percentual
+        taxa_fixa = condicao_parcelamento.taxa_fixa if condicao_parcelamento else forma.taxa_fixa
+
         pagamento = VendaPagamentoHub.objects.create(
             operacao_uuid=operacao_uuid,
             venda=venda,
             forma_pagamento=forma,
             retaguarda_forma_pagamento_id=forma.retaguarda_id,
+            retaguarda_forma_pagamento_condicao_id=(
+                condicao_parcelamento.retaguarda_id if condicao_parcelamento else None
+            ),
             prazo_pagamento=prazo,
             retaguarda_prazo_pagamento_id=prazo.retaguarda_id if prazo else forma.prazo_retaguarda_id,
             prazo_codigo=prazo.codigo if prazo else forma.prazo_codigo,
@@ -578,8 +609,8 @@ def adicionar_pagamento(
             conta_liquidacao_retaguarda_id=forma.conta_liquidacao_retaguarda_id,
             gera_recebivel_bancario=forma.gera_recebivel_bancario,
             prazo_credito_dias=forma.prazo_credito_dias,
-            taxa_percentual=forma.taxa_percentual,
-            taxa_fixa=forma.taxa_fixa,
+            taxa_percentual=taxa_percentual,
+            taxa_fixa=taxa_fixa,
             valor=valor,
             autorizacao=autorizacao,
             vale_troca_documento=autorizacao if forma.tipo in ("TROCA", "VALE_TROCA") else "",
@@ -1516,6 +1547,7 @@ def serializar_pagamento(pagamento):
         "uuid": str(pagamento.pagamento_uuid),
         "forma_pagamento_id": pagamento.forma_pagamento_id,
         "forma_retaguarda_id": pagamento.retaguarda_forma_pagamento_id,
+        "forma_pagamento_condicao_retaguarda_id": pagamento.retaguarda_forma_pagamento_condicao_id,
         "prazo_pagamento_id": pagamento.prazo_pagamento_id,
         "prazo_retaguarda_id": pagamento.retaguarda_prazo_pagamento_id,
         "prazo_codigo": pagamento.prazo_codigo,
@@ -1555,6 +1587,7 @@ def serializar_prazo_pagamento(prazo):
 
 def serializar_forma_pagamento(forma):
     parcelas = forma.parcelas.all()
+    condicoes = forma.condicoes_parcelamento.all()
     return {
         "id": forma.id,
         "retaguarda_id": forma.retaguarda_id,
@@ -1562,7 +1595,35 @@ def serializar_forma_pagamento(forma):
         "descricao": forma.descricao,
         "tipo": forma.tipo,
         "num_parcelas": forma.num_parcelas,
+        "permite_parcelamento": forma.permite_parcelamento,
         "tef_habilitado": forma.tef_habilitado,
+        "condicoes_parcelamento": [serializar_condicao_parcelamento(condicao) for condicao in condicoes],
+        "parcelas": [
+            {
+                "ordem": parcela.ordem,
+                "dias": parcela.dias,
+                "percentual": f"{parcela.percentual:.6f}" if parcela.percentual is not None else None,
+                "valor_fixo": f"{parcela.valor_fixo:.2f}" if parcela.valor_fixo is not None else None,
+            }
+            for parcela in parcelas
+        ],
+    }
+
+
+def serializar_condicao_parcelamento(condicao):
+    prazo = condicao.prazo_pagamento
+    parcelas = prazo.parcelas.all()
+    return {
+        "id": condicao.id,
+        "retaguarda_id": condicao.retaguarda_id,
+        "prazo_pagamento_id": prazo.id,
+        "prazo_retaguarda_id": prazo.retaguarda_id,
+        "prazo_codigo": prazo.codigo,
+        "prazo_descricao": prazo.descricao,
+        "prazo_num_parcelas": prazo.num_parcelas,
+        "prazo_intervalo_dias": prazo.intervalo_dias,
+        "taxa_percentual": f"{condicao.taxa_percentual:.4f}",
+        "taxa_fixa": f"{condicao.taxa_fixa:.2f}",
         "parcelas": [
             {
                 "ordem": parcela.ordem,

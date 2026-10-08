@@ -18,6 +18,7 @@ from core.models import (
     CashbackConfigHub,
     ClienteHub,
     ConfiguracaoFiscalHub,
+    FormaPagamentoCondicaoHub,
     FormaPagamentoFiscalMapHub,
     FormaPagamentoHub,
     FormaPagamentoParcelaHub,
@@ -1956,6 +1957,21 @@ class FormasPagamentoHubServiceTests(TestCase):
         payload.update(overrides)
         return payload
 
+    def condicao(self, **overrides):
+        payload = {
+            "id": 90,
+            "prazo_pagamento_id": 5,
+            "prazo_codigo": "30D",
+            "prazo_descricao": "30 dias",
+            "prazo_num_parcelas": 1,
+            "prazo_intervalo_dias": 30,
+            "taxa_percentual": "1.5000",
+            "taxa_fixa": "0.25",
+            "parcelas": [self.parcela(dias=30)],
+        }
+        payload.update(overrides)
+        return payload
+
     def forma(self, **overrides):
         payload = {
             "id": 10,
@@ -2124,6 +2140,74 @@ class FormasPagamentoHubServiceTests(TestCase):
         sincronizar_formas_pagamento(self.hub, self.resposta())
 
         self.assertEqual(FormaPagamentoParcelaHub.objects.count(), 1)
+
+    def test_condicoes_parcelamento_sao_sincronizadas_e_inativadas(self):
+        prazo_1x = {
+            "id": 5,
+            "codigo": "30D",
+            "descricao": "30 dias",
+            "num_parcelas": 1,
+            "intervalo_dias": 30,
+            "ativo": True,
+            "parcelas": [self.parcela(dias=30)],
+        }
+        prazo_2x = {
+            "id": 6,
+            "codigo": "2X",
+            "descricao": "2x",
+            "num_parcelas": 2,
+            "intervalo_dias": 30,
+            "ativo": True,
+            "parcelas": [self.parcela(ordem=1, dias=30, percentual="0.500000"), self.parcela(ordem=2, dias=60, percentual="0.500000")],
+        }
+        condicao_1x = self.condicao(id=90, prazo_pagamento_id=5)
+        condicao_2x = self.condicao(
+            id=91,
+            prazo_pagamento_id=6,
+            prazo_codigo="2X",
+            prazo_descricao="2x",
+            prazo_num_parcelas=2,
+            taxa_percentual="2.5000",
+            taxa_fixa="0.50",
+            parcelas=prazo_2x["parcelas"],
+        )
+        forma = self.forma(
+            codigo="CRE",
+            tipo="CREDITO",
+            permite_parcelamento=True,
+            condicoes_parcelamento=[condicao_1x, condicao_2x],
+            parcelas=[],
+        )
+
+        resultado = sincronizar_formas_pagamento(
+            self.hub,
+            self.resposta([forma], prazos_pagamento=[prazo_1x, prazo_2x]),
+        )
+
+        forma_db = FormaPagamentoHub.objects.get(codigo="CRE")
+        self.assertTrue(forma_db.permite_parcelamento)
+        self.assertEqual(resultado["condicoes"], 2)
+        self.assertEqual(FormaPagamentoCondicaoHub.objects.count(), 2)
+        self.assertEqual(FormaPagamentoCondicaoHub.objects.get(retaguarda_id=91).taxa_percentual, Decimal("2.5000"))
+
+        forma["condicoes_parcelamento"] = [condicao_1x]
+        resultado = sincronizar_formas_pagamento(
+            self.hub,
+            self.resposta([forma], prazos_pagamento=[prazo_1x, prazo_2x]),
+        )
+
+        self.assertEqual(resultado["condicoes_ausentes_inativadas"], 1)
+        self.assertFalse(FormaPagamentoCondicaoHub.objects.get(retaguarda_id=91).ativo)
+
+    def test_condicao_parcelamento_para_prazo_desconhecido_rejeita(self):
+        forma = self.forma(
+            tipo="CREDITO",
+            permite_parcelamento=True,
+            condicoes_parcelamento=[self.condicao(prazo_pagamento_id=99)],
+            parcelas=[],
+        )
+
+        self.assert_rejeita(self.resposta([forma], prazos_pagamento=[]))
 
     def test_prazos_independentes_sao_sincronizados(self):
         resposta = self.resposta(
