@@ -546,7 +546,7 @@ def adicionar_pagamento(
             raise VendaValidationError("Forma de pagamento inválida.")
         prazo = None
         condicao_parcelamento = None
-        if forma.permite_parcelamento or forma.tipo == "CREDITO":
+        if forma.permite_parcelamento:
             if prazo_pagamento_id is None:
                 raise VendaValidationError("Prazo de pagamento inválido.")
             prazo = (

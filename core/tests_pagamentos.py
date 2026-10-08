@@ -887,19 +887,18 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
 
         self.assertEqual(VendaPagamentoParcelaHub.objects.count(), 1)
 
-    def test_credito_exige_prazo_e_copia_parcelas_do_prazo(self):
+    def test_credito_sem_permite_parcelamento_nao_exige_prazo(self):
         venda_uuid = self.criar_venda_com_item()
 
-        sem_prazo = self.pagar(venda_uuid, self.credito)
-        resposta = self.pagar(venda_uuid, self.credito, prazo=self.prazo_2x)
+        resposta = self.pagar(venda_uuid, self.credito)
 
         pagamento = VendaPagamentoHub.objects.get()
-        self.assertEqual(sem_prazo.status_code, 400)
         self.assertEqual(resposta.status_code, 201)
         self.assertEqual(pagamento.codigo, "CRE")
-        self.assertEqual(pagamento.prazo_pagamento, self.prazo_2x)
-        self.assertEqual(pagamento.num_parcelas, 2)
-        self.assertEqual(list(pagamento.parcelas_snapshot.order_by("ordem").values_list("dias", flat=True)), [30, 60])
+        self.assertIsNone(pagamento.prazo_pagamento)
+        self.assertIsNone(pagamento.retaguarda_forma_pagamento_condicao_id)
+        self.assertEqual(pagamento.num_parcelas, self.credito.num_parcelas)
+        self.assertEqual(list(pagamento.parcelas_snapshot.order_by("ordem").values_list("dias", flat=True)), [0])
 
     def test_forma_com_permite_parcelamento_exige_condicao_ativa_e_usa_taxas(self):
         self.credito.permite_parcelamento = True
@@ -926,6 +925,21 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(pagamento.taxa_fixa, Decimal("0.50"))
         self.assertEqual(list(pagamento.parcelas_snapshot.order_by("ordem").values_list("dias", flat=True)), [30, 60])
 
+    def test_pix_com_permite_parcelamento_exige_condicao_ativa(self):
+        self.pix.permite_parcelamento = True
+        self.pix.save(update_fields=["permite_parcelamento", "atualizado_em"])
+        self.criar_condicao(self.pix, self.prazo_1x, retaguarda_id=9250)
+        venda_uuid = self.criar_venda_com_item()
+
+        sem_prazo = self.pagar(venda_uuid, self.pix)
+        resposta = self.pagar(venda_uuid, self.pix, prazo=self.prazo_1x)
+
+        pagamento = VendaPagamentoHub.objects.get()
+        self.assertEqual(sem_prazo.status_code, 400)
+        self.assertEqual(resposta.status_code, 201)
+        self.assertEqual(pagamento.tipo, "PIX")
+        self.assertEqual(pagamento.prazo_pagamento, self.prazo_1x)
+
     def test_payload_sync_pagamento_preserva_condicao_prazo_taxas_e_parcelas(self):
         self.credito.permite_parcelamento = True
         self.credito.save(update_fields=["permite_parcelamento", "atualizado_em"])
@@ -948,7 +962,11 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(pagamento_payload["taxa_fixa"], "1.10")
         self.assertEqual([parcela["dias"] for parcela in pagamento_payload["parcelas"]], [30, 60])
 
-    def test_retry_com_prazo_diferente_retorna_409(self):
+    def test_retry_com_prazo_diferente_retorna_409_quando_parcelado(self):
+        self.credito.permite_parcelamento = True
+        self.credito.save(update_fields=["permite_parcelamento", "atualizado_em"])
+        self.criar_condicao(self.credito, self.prazo_1x, retaguarda_id=9400)
+        self.criar_condicao(self.credito, self.prazo_2x, retaguarda_id=9401)
         venda_uuid = self.criar_venda_com_item()
         operacao_uuid = uuid.uuid4()
         self.pagar(venda_uuid, self.credito, operacao_uuid=operacao_uuid, prazo=self.prazo_1x)
