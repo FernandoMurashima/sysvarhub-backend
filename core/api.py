@@ -25,6 +25,11 @@ from core.services.caixa import (
 )
 from core.services.beneficios import consultar_beneficios_cliente
 from core.services.central_status import calcular_status_central
+from core.services.consulta_vendas import (
+    ConsultaVendasValidationError,
+    detalhar_venda,
+    listar_vendas,
+)
 from core.services.fechamento_dia import (
     FechamentoDiaConflictError,
     FechamentoDiaConsistencyError,
@@ -207,6 +212,28 @@ class TerminalPendenciaSyncRetryView(APIView):
         if len(resultado) == 2:
             return Response({"detail": resultado[1], "evento": resultado[0]}, status=status.HTTP_409_CONFLICT)
         return Response({"evento": resultado[0], "resultado": resultado[2]})
+
+
+class TerminalVendasView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        try:
+            return Response(listar_vendas(request.sysvar_terminal.hub, request.query_params))
+        except ConsultaVendasValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class TerminalVendaDetalheView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request, venda_uuid):
+        venda = detalhar_venda(request.sysvar_terminal.hub, venda_uuid)
+        if venda is None:
+            raise Http404
+        return Response(venda)
 
 
 class TerminalCatalogoView(APIView):
