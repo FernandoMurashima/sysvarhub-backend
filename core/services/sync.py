@@ -7,13 +7,25 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from core.models import CashbackMovimentoHub, EventoSyncHub, NFCeHub, ValeTrocaHub, ValeTrocaMovimentoHub, VendaDevolucaoHub, VendaHub, VendaPagamentoHub
+from core.models import (
+    CashbackMovimentoHub,
+    EventoSyncHub,
+    NFCeHub,
+    RecebimentoMercadoriaHub,
+    RecebimentoMercadoriaMovimentoEstoqueHub,
+    ValeTrocaHub,
+    ValeTrocaMovimentoHub,
+    VendaDevolucaoHub,
+    VendaHub,
+    VendaPagamentoHub,
+)
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 
 
 TIPO_VENDA_FINALIZADA = "VENDA_FINALIZADA"
 TIPO_NFCE_ATUALIZADA = "NFCE_ATUALIZADA"
 TIPO_DEVOLUCAO_FINALIZADA = "DEVOLUCAO_FINALIZADA"
+TIPO_RECEBIMENTO_LOJA_CONFERIDO = "RECEBIMENTO_LOJA_CONFERIDO"
 STATUS_CONFIRMADOS = {"PROCESSADO", "DUPLICADO"}
 SEGREDOS_BLOQUEADOS = {"certificado", "private_key", "chave_privada", "senha", "csc", "token_csc"}
 
@@ -62,6 +74,26 @@ def enfileirar_devolucao_finalizada(devolucao):
         chave=f"DEVOLUCAO:{devolucao.devolucao_uuid}:FINALIZADA",
         payload=payload,
         evento_uuid=_uuid_deterministico(devolucao.hub_id, TIPO_DEVOLUCAO_FINALIZADA, str(devolucao.devolucao_uuid)),
+    )
+
+
+def enfileirar_recebimento_conferido(recebimento):
+    recebimento = (
+        RecebimentoMercadoriaHub.objects.select_related("hub", "operador_conferencia")
+        .prefetch_related("itens")
+        .get(pk=recebimento.pk)
+    )
+    payload = payload_recebimento_conferido(recebimento)
+    return _criar_ou_atualizar_evento(
+        hub=recebimento.hub,
+        tipo=TIPO_RECEBIMENTO_LOJA_CONFERIDO,
+        chave=f"RECEBIMENTO:{recebimento.retaguarda_id}:CONFERIDO",
+        payload=payload,
+        evento_uuid=_uuid_deterministico(
+            recebimento.hub_id,
+            TIPO_RECEBIMENTO_LOJA_CONFERIDO,
+            str(recebimento.retaguarda_id),
+        ),
     )
 
 
@@ -219,6 +251,29 @@ def payload_devolucao_finalizada(devolucao):
     }
 
 
+def payload_recebimento_conferido(recebimento):
+    payload = {
+        "recebimento_id": recebimento.retaguarda_id,
+        "operador_retaguarda_usuario_id": (
+            recebimento.operador_conferencia.retaguarda_usuario_id
+            if recebimento.operador_conferencia_id
+            else None
+        ),
+        "itens": [
+            {
+                "conferencia_item_id": item.conferencia_item_id,
+                "sku_retaguarda_id": item.retaguarda_sku_id,
+                "ean": item.ean13,
+                "quantidade_recebida": f"{item.quantidade_recebida:.3f}",
+            }
+            for item in recebimento.itens.order_by("id")
+        ],
+    }
+    if recebimento.observacao_divergencia:
+        payload["observacao_divergencia"] = recebimento.observacao_divergencia
+    return payload
+
+
 def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=None, evento_ids=None):
     agora = agora or timezone.now()
     with transaction.atomic():
@@ -266,6 +321,7 @@ def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=Non
             evento.save(update_fields=["status", "sincronizado_em", "resposta", "ultimo_erro", "atualizado_em"])
             _marcar_beneficios_centralizados(evento, agora)
             _canonicalizar_devolucao_confirmada(evento, resultado, agora)
+            _marcar_recebimento_confirmado(evento, resultado, agora)
             contadores["sincronizados"] += 1
         elif status == "CONFLITO":
             evento.status = EventoSyncHub.STATUS_CONFLITO
@@ -273,6 +329,7 @@ def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=Non
             evento.ultimo_erro = resultado.get("mensagem", "CONFLITO")[:255]
             evento.save(update_fields=["status", "resposta", "ultimo_erro", "atualizado_em"])
             _marcar_devolucao_em_conflito(evento, evento.ultimo_erro)
+            _marcar_recebimento_em_conflito(evento, evento.ultimo_erro)
             contadores["conflitos"] += 1
         else:
             _marcar_retry(evento, resultado.get("mensagem", "ERRO"), agora, resposta=resultado)
@@ -371,6 +428,32 @@ def _canonicalizar_devolucao_confirmada(evento, resultado, agora):
         vale.save(update_fields=["documento", "retaguarda_id", "provisorio", "origem", "conflito_mensagem", "sincronizado_em", "atualizado_em"])
 
 
+def _marcar_recebimento_confirmado(evento, resultado, agora):
+    if evento.tipo != TIPO_RECEBIMENTO_LOJA_CONFERIDO:
+        return
+    recebimento_id = (evento.payload or {}).get("recebimento_id")
+    if not recebimento_id:
+        return
+    mapeamento = resultado.get("mapeamento") or {}
+    atualizados = RecebimentoMercadoriaHub.objects.filter(
+        hub=evento.hub,
+        retaguarda_id=recebimento_id,
+    ).update(
+        status_local=RecebimentoMercadoriaHub.STATUS_LOCAL_SINCRONIZADO,
+        status_retaguarda=mapeamento.get("status") or "CONCLUIDO",
+        confirmado_central_em=agora,
+        sincronizado_em=agora,
+        mensagem_sync="",
+        resposta_central=resultado,
+    )
+    if atualizados:
+        RecebimentoMercadoriaMovimentoEstoqueHub.objects.filter(
+            hub=evento.hub,
+            recebimento__retaguarda_id=recebimento_id,
+            sincronizado_central_em__isnull=True,
+        ).update(sincronizado_central_em=agora)
+
+
 def _dependencias_devolucao_venda(venda):
     docs = [
         pagamento.vale_troca_documento
@@ -412,6 +495,19 @@ def _marcar_devolucao_em_conflito(evento, mensagem):
     )
     ValeTrocaHub.objects.filter(hub=evento.hub, devolucao__devolucao_uuid=devolucao_uuid).update(
         conflito_mensagem=mensagem[:255],
+    )
+
+
+def _marcar_recebimento_em_conflito(evento, mensagem):
+    if evento.tipo != TIPO_RECEBIMENTO_LOJA_CONFERIDO:
+        return
+    recebimento_id = (evento.payload or {}).get("recebimento_id")
+    if not recebimento_id:
+        return
+    RecebimentoMercadoriaHub.objects.filter(hub=evento.hub, retaguarda_id=recebimento_id).update(
+        status_local=RecebimentoMercadoriaHub.STATUS_LOCAL_CONFLITO,
+        mensagem_sync=mensagem[:255],
+        resposta_central=evento.resposta or {},
     )
 
 

@@ -171,7 +171,7 @@ def _existe_evento_estoque_pendente(hub):
             EventoSyncHub.STATUS_PROCESSANDO,
             EventoSyncHub.STATUS_ERRO,
         ],
-        tipo__in=["VENDA_FINALIZADA", "DEVOLUCAO_FINALIZADA"],
+        tipo__in=["VENDA_FINALIZADA", "DEVOLUCAO_FINALIZADA", "RECEBIMENTO_LOJA_CONFERIDO"],
     ).exists()
 
 

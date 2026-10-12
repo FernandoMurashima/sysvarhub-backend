@@ -11,6 +11,7 @@ from integracao.services.catalogo import sincronizar_catalogo
 from integracao.services.clientes import sincronizar_clientes
 from integracao.services.formas_pagamento import sincronizar_formas_pagamento
 from integracao.services.operadores import sincronizar_operadores
+from integracao.services.recebimentos import sincronizar_recebimentos
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 from integracao.services.tipos_despesa_pdv import sincronizar_tipos_despesa_pdv
 from integracao.services.vendedores import sincronizar_vendedores
@@ -26,6 +27,7 @@ ETAPAS = [
     ("FORMAS_PAGAMENTO", "formas_pagamento", sincronizar_formas_pagamento),
     ("TIPOS_DESPESA", "tipos_despesa_pdv", sincronizar_tipos_despesa_pdv),
     ("CLIENTES", "clientes", sincronizar_clientes),
+    ("RECEBIMENTOS", "recebimentos", sincronizar_recebimentos),
 ]
 
 
@@ -57,7 +59,7 @@ def executar_sincronizacao_comando(hub, comando, client=None):
             _atualizar_etapa(sincronizacao, etapa)
             _informar(client, hub, sincronizacao, SincronizacaoRecebidaHub.STATUS_PROCESSANDO)
             resposta = getattr(client, metodo_client)(token=hub.retaguarda_token)
-            if etapa == "CATALOGO":
+            if etapa in {"CATALOGO", "RECEBIMENTOS"}:
                 funcao(hub, resposta, client=client)
             else:
                 funcao(hub, resposta)

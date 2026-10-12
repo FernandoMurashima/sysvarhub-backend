@@ -2160,6 +2160,133 @@ class EstoqueMovimentoHub(models.Model):
         return f"{self.tipo} - {self.retaguarda_sku_id} - {self.quantidade}"
 
 
+class RecebimentoMercadoriaHub(models.Model):
+    STATUS_LOCAL_PENDENTE = "PENDENTE"
+    STATUS_LOCAL_CONFERIDO = "CONFERIDO"
+    STATUS_LOCAL_SINCRONIZADO = "SINCRONIZADO"
+    STATUS_LOCAL_CONFLITO = "CONFLITO"
+    STATUS_LOCAL_CHOICES = [
+        (STATUS_LOCAL_PENDENTE, "Pendente"),
+        (STATUS_LOCAL_CONFERIDO, "Conferido"),
+        (STATUS_LOCAL_SINCRONIZADO, "Sincronizado"),
+        (STATUS_LOCAL_CONFLITO, "Conflito"),
+    ]
+
+    recebimento_uuid = models.UUIDField(default=uuid.uuid4, editable=False)
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="recebimentos_mercadoria")
+    retaguarda_id = models.PositiveBigIntegerField()
+    origem = models.CharField(max_length=30, blank=True, default="")
+    status_retaguarda = models.CharField(max_length=30, blank=True, default="")
+    status_local = models.CharField(max_length=20, choices=STATUS_LOCAL_CHOICES, default=STATUS_LOCAL_PENDENTE, db_index=True)
+    empresa_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    loja_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    loja_nome = models.CharField(max_length=150, blank=True, default="")
+    fornecedor_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    fornecedor_nome = models.CharField(max_length=150, blank=True, default="")
+    fornecedor_documento = models.CharField(max_length=20, blank=True, default="")
+    documento_fiscal = models.JSONField(default=dict, blank=True)
+    pedidos = models.JSONField(default=list, blank=True)
+    resumo = models.JSONField(default=dict, blank=True)
+    contrato_retorno = models.JSONField(default=dict, blank=True)
+    observacao_divergencia = models.TextField(blank=True, default="")
+    operador_conferencia = models.ForeignKey(OperadorHub, on_delete=models.PROTECT, null=True, blank=True, related_name="recebimentos_conferidos")
+    terminal_conferencia = models.ForeignKey(Terminal, on_delete=models.PROTECT, null=True, blank=True, related_name="recebimentos_conferidos")
+    sessao_operador_conferencia = models.ForeignKey(SessaoOperadorHub, on_delete=models.PROTECT, null=True, blank=True, related_name="recebimentos_conferidos")
+    evento_sync = models.ForeignKey(EventoSyncHub, on_delete=models.SET_NULL, null=True, blank=True, related_name="recebimentos_mercadoria")
+    mensagem_sync = models.CharField(max_length=255, blank=True, default="")
+    resposta_central = models.JSONField(default=dict, blank=True)
+    recebido_central_em = models.DateTimeField(null=True, blank=True)
+    conferido_em = models.DateTimeField(null=True, blank=True)
+    estoque_efetivado_em = models.DateTimeField(null=True, blank=True)
+    confirmado_central_em = models.DateTimeField(null=True, blank=True)
+    sincronizado_em = models.DateTimeField(null=True, blank=True)
+    criado_em = models.DateTimeField(auto_now_add=True)
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Recebimento de mercadoria do Hub"
+        verbose_name_plural = "Recebimentos de mercadoria do Hub"
+        ordering = ("-recebido_central_em", "-id")
+        constraints = [
+            models.UniqueConstraint(fields=["hub", "retaguarda_id"], name="uniq_rec_hub_ret"),
+        ]
+        indexes = [
+            models.Index(fields=["hub", "status_local"], name="idx_rec_hub_status"),
+            models.Index(fields=["hub", "status_retaguarda"], name="idx_rec_hub_status_ret"),
+        ]
+
+    def __str__(self):
+        return f"Recebimento {self.retaguarda_id} - {self.status_local}"
+
+
+class RecebimentoMercadoriaItemHub(models.Model):
+    recebimento = models.ForeignKey(RecebimentoMercadoriaHub, on_delete=models.CASCADE, related_name="itens")
+    catalogo_item = models.ForeignKey(CatalogoItemHub, on_delete=models.PROTECT, null=True, blank=True, related_name="recebimentos_mercadoria")
+    conferencia_item_id = models.PositiveBigIntegerField()
+    pedido_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    pedido_item_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    retaguarda_produto_id = models.PositiveBigIntegerField()
+    retaguarda_sku_id = models.PositiveBigIntegerField()
+    ean13 = models.CharField(max_length=13, blank=True, default="")
+    referencia = models.CharField(max_length=80, blank=True, default="")
+    descricao = models.CharField(max_length=200)
+    cor_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    cor_descricao = models.CharField(max_length=80, blank=True, default="")
+    tamanho_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)
+    tamanho_descricao = models.CharField(max_length=80, blank=True, default="")
+    quantidade_esperada = models.DecimalField(max_digits=14, decimal_places=3, default=0)
+    quantidade_recebida = models.DecimalField(max_digits=14, decimal_places=3, default=0)
+    diferenca = models.DecimalField(max_digits=14, decimal_places=3, default=0)
+    situacao = models.CharField(max_length=10, blank=True, default="")
+    atualizado_em = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Item de recebimento de mercadoria do Hub"
+        verbose_name_plural = "Itens de recebimento de mercadoria do Hub"
+        ordering = ("id",)
+        constraints = [
+            models.UniqueConstraint(fields=["recebimento", "conferencia_item_id"], name="uniq_rec_item_hub_conf"),
+        ]
+        indexes = [
+            models.Index(fields=["retaguarda_sku_id"], name="idx_rec_item_hub_sku"),
+        ]
+
+    def __str__(self):
+        return f"{self.conferencia_item_id} - {self.descricao}"
+
+
+class RecebimentoMercadoriaMovimentoEstoqueHub(models.Model):
+    TIPO_ENTRADA_RECEBIMENTO = "ENTRADA_RECEBIMENTO"
+
+    movimento_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    recebimento = models.ForeignKey(RecebimentoMercadoriaHub, on_delete=models.PROTECT, related_name="movimentos_estoque")
+    item = models.OneToOneField(RecebimentoMercadoriaItemHub, on_delete=models.PROTECT, related_name="movimento_estoque")
+    catalogo_item = models.ForeignKey(CatalogoItemHub, on_delete=models.PROTECT, related_name="movimentos_recebimento")
+    hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="movimentos_recebimento")
+    retaguarda_produto_id = models.PositiveBigIntegerField()
+    retaguarda_sku_id = models.PositiveBigIntegerField()
+    ean13 = models.CharField(max_length=13, blank=True, default="")
+    referencia = models.CharField(max_length=80, blank=True, default="")
+    tipo = models.CharField(max_length=30, default=TIPO_ENTRADA_RECEBIMENTO)
+    quantidade = models.DecimalField(max_digits=14, decimal_places=3)
+    saldo_anterior = models.DecimalField(max_digits=14, decimal_places=3, default=0)
+    saldo_posterior = models.DecimalField(max_digits=14, decimal_places=3, default=0)
+    sincronizado_central_em = models.DateTimeField(null=True, blank=True)
+    criado_em = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Movimento de entrada de recebimento do Hub"
+        verbose_name_plural = "Movimentos de entrada de recebimento do Hub"
+        ordering = ("criado_em", "id")
+        indexes = [
+            models.Index(fields=["hub", "retaguarda_sku_id"], name="idx_rec_mov_hub_sku"),
+            models.Index(fields=["sincronizado_central_em"], name="idx_rec_mov_hub_sync"),
+        ]
+
+    def __str__(self):
+        return f"{self.tipo} - {self.retaguarda_sku_id} - {self.quantidade}"
+
+
 class PareamentoTerminal(models.Model):
     CODIGO_GRUPOS = 3
     CODIGO_TAMANHO_GRUPO = 4

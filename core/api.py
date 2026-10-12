@@ -61,6 +61,16 @@ from core.services.operadores import (
     serializar_operador,
 )
 from core.services.pendencias_sync import listar_pendencias_sync, tentar_reprocessar_evento
+from core.services.recebimentos import (
+    RecebimentoConflictError,
+    RecebimentoError,
+    RecebimentoNotFoundError,
+    RecebimentoValidationError,
+    detalhar_recebimento,
+    finalizar_recebimento,
+    listar_recebimentos,
+    serializar_recebimento,
+)
 from core.services.resumo_caixa import obter_resumo_caixa
 from core.services.terminais import (
     PareamentoTerminalError,
@@ -223,6 +233,50 @@ class TerminalVendasView(APIView):
             return Response(listar_vendas(request.sysvar_terminal.hub, request.query_params))
         except ConsultaVendasValidationError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class TerminalRecebimentosView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        return Response(listar_recebimentos(request.sysvar_terminal.hub, filtros=request.query_params))
+
+
+class TerminalRecebimentoDetalheView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request, recebimento_id):
+        try:
+            return Response({"recebimento": detalhar_recebimento(request.sysvar_terminal.hub, recebimento_id)})
+        except RecebimentoNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+
+
+class TerminalRecebimentoFinalizarView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request, recebimento_id):
+        try:
+            recebimento = finalizar_recebimento(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                recebimento_id=recebimento_id,
+                itens=request.data.get("itens") or [],
+                observacao_divergencia=request.data.get("observacao_divergencia") or request.data.get("observacao") or "",
+            )
+        except RecebimentoNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except RecebimentoValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except RecebimentoConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except RecebimentoError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"recebimento": serializar_recebimento(recebimento, detalhado=True)})
 
 
 class TerminalVendaDetalheView(APIView):
