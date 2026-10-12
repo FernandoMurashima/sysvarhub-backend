@@ -103,7 +103,7 @@ def atualizar_recebimento_por_payload(hub, payload, *, detalhado=False):
     recebimento.documento_fiscal = payload.get("documento_fiscal") or {}
     recebimento.pedidos = _pedidos_payload(payload)
     recebimento.resumo = payload.get("resumo") or {}
-    recebimento.contrato_retorno = payload.get("contrato_retorno") or {}
+    recebimento.contrato_retorno = _contrato_retorno_payload(payload)
     recebimento.recebido_central_em = agora
     recebimento.save(update_fields=update_fields)
 
@@ -493,6 +493,17 @@ def _variacao_payload(value):
     if isinstance(value, dict):
         return value
     return {"nome": value or ""}
+
+
+def _contrato_retorno_payload(payload):
+    contrato = payload.get("contrato_retorno") if isinstance(payload.get("contrato_retorno"), dict) else {}
+    contrato = dict(contrato)
+    if payload.get("origem") == ORIGEM_DISTRIBUICAO:
+        unidade_origem = payload.get("unidade_origem")
+        if isinstance(unidade_origem, dict):
+            contrato["unidade_origem"] = unidade_origem
+            contrato.setdefault("loja_origem", unidade_origem)
+    return contrato
 
 
 def _unidade_origem_payload(recebimento):
