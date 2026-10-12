@@ -13,6 +13,7 @@ from core.models import (
 
 
 QUANTIDADE_ESTOQUE = Decimal("0.001")
+ORIGEM_DISTRIBUICAO = "DISTRIBUICAO"
 
 
 class RecebimentoError(Exception):
@@ -57,7 +58,10 @@ def atualizar_recebimento_por_payload(hub, payload, *, detalhado=False):
         raise RecebimentoValidationError("Recebimento da Central inválido.")
     retaguarda_id = _inteiro_obrigatorio(payload.get("id"), "id")
     recebimento_uuid = payload.get("recebimento_uuid") or None
+    origem = str(payload.get("origem") or "")
     loja = payload.get("loja") or {}
+    if origem == ORIGEM_DISTRIBUICAO:
+        loja = payload.get("loja_destino") or loja
     fornecedor = payload.get("fornecedor") or {}
     agora = timezone.now()
 
@@ -66,6 +70,7 @@ def atualizar_recebimento_por_payload(hub, payload, *, detalhado=False):
         defaults["recebimento_uuid"] = recebimento_uuid
     recebimento, criado = RecebimentoMercadoriaHub.objects.select_for_update().get_or_create(
         hub=hub,
+        origem=origem,
         retaguarda_id=retaguarda_id,
         defaults=defaults,
     )
@@ -87,7 +92,7 @@ def atualizar_recebimento_por_payload(hub, payload, *, detalhado=False):
     ]
     if recebimento_uuid and criado:
         update_fields.append("recebimento_uuid")
-    recebimento.origem = str(payload.get("origem") or "")
+    recebimento.origem = origem
     recebimento.status_retaguarda = str(payload.get("status") or "")
     recebimento.empresa_retaguarda_id = hub.empresa_id
     recebimento.loja_retaguarda_id = loja.get("id") or hub.loja_id
@@ -96,7 +101,7 @@ def atualizar_recebimento_por_payload(hub, payload, *, detalhado=False):
     recebimento.fornecedor_nome = str(fornecedor.get("nome") or "")[:150]
     recebimento.fornecedor_documento = str(fornecedor.get("documento") or "")[:20]
     recebimento.documento_fiscal = payload.get("documento_fiscal") or {}
-    recebimento.pedidos = payload.get("pedidos") or []
+    recebimento.pedidos = _pedidos_payload(payload)
     recebimento.resumo = payload.get("resumo") or {}
     recebimento.contrato_retorno = payload.get("contrato_retorno") or {}
     recebimento.recebido_central_em = agora
@@ -121,7 +126,10 @@ def finalizar_recebimento(terminal, operador, sessao_operador, *, recebimento_id
             return recebimento
         if recebimento.status_local == RecebimentoMercadoriaHub.STATUS_LOCAL_CONFLITO:
             raise RecebimentoConflictError("Recebimento em conflito deve ser reconciliado antes de nova conferência.")
-        if recebimento.status_retaguarda and recebimento.status_retaguarda != "EM_CONFERENCIA":
+        if recebimento.origem == ORIGEM_DISTRIBUICAO:
+            if recebimento.status_retaguarda and recebimento.status_retaguarda != "TRANS":
+                raise RecebimentoConflictError("Distribuição deve estar em trânsito na Central.")
+        elif recebimento.status_retaguarda and recebimento.status_retaguarda != "EM_CONFERENCIA":
             raise RecebimentoConflictError("Recebimento deve estar em conferência na Central.")
 
         itens_locais = {
@@ -233,7 +241,8 @@ def rejeitar_movimentos_recebimento_pendentes(recebimento, *, mensagem="", agora
 def serializar_recebimento(recebimento, detalhado=False):
     payload = {
         "local_id": recebimento.pk,
-        "id": recebimento.retaguarda_id,
+        "id": recebimento.pk,
+        "retaguarda_id": recebimento.retaguarda_id,
         "recebimento_uuid": str(recebimento.recebimento_uuid),
         "origem": recebimento.origem,
         "status_retaguarda": recebimento.status_retaguarda,
@@ -259,7 +268,7 @@ def serializar_recebimento(recebimento, detalhado=False):
     if detalhado:
         payload["itens"] = [
             serializar_item_recebimento(item)
-            for item in recebimento.itens.select_related("catalogo_item").order_by("id")
+            for item in recebimento.itens.select_related("catalogo_item", "recebimento").order_by("id")
         ]
         payload["contrato_retorno"] = recebimento.contrato_retorno
         payload["resposta_central"] = recebimento.resposta_central
@@ -267,7 +276,7 @@ def serializar_recebimento(recebimento, detalhado=False):
 
 
 def serializar_item_recebimento(item):
-    return {
+    payload = {
         "conferencia_item_id": item.conferencia_item_id,
         "pedido_id": item.pedido_retaguarda_id,
         "pedido_item_id": item.pedido_item_retaguarda_id,
@@ -283,6 +292,10 @@ def serializar_item_recebimento(item):
         "diferenca": f"{item.diferenca:.3f}",
         "situacao": item.situacao,
     }
+    if item.recebimento.origem == ORIGEM_DISTRIBUICAO:
+        payload["transito_id"] = item.conferencia_item_id
+        payload["quantidade_enviada"] = f"{item.quantidade_esperada:.3f}"
+    return payload
 
 
 def _atualizar_itens_recebimento(recebimento, itens_payload):
@@ -292,13 +305,13 @@ def _atualizar_itens_recebimento(recebimento, itens_payload):
     for row in itens_payload:
         if not isinstance(row, dict):
             raise RecebimentoValidationError("Item do recebimento inválido.")
-        conferencia_item_id = _inteiro_obrigatorio(row.get("conferencia_item_id"), "conferencia_item_id")
+        conferencia_item_id = _inteiro_obrigatorio(row.get("conferencia_item_id") or row.get("transito_id"), "conferencia_item_id")
         recebidos.add(conferencia_item_id)
         sku_id = _inteiro_obrigatorio(row.get("sku_retaguarda_id"), "sku_retaguarda_id")
         catalogo_item = CatalogoItemHub.objects.filter(hub=recebimento.hub, retaguarda_sku_id=sku_id).first()
-        cor = row.get("cor") or {}
-        tamanho = row.get("tamanho") or {}
-        quantidade_esperada = _decimal(row.get("quantidade_esperada")).quantize(QUANTIDADE_ESTOQUE)
+        cor = _variacao_payload(row.get("cor"))
+        tamanho = _variacao_payload(row.get("tamanho"))
+        quantidade_esperada = _decimal(row.get("quantidade_esperada", row.get("quantidade_enviada"))).quantize(QUANTIDADE_ESTOQUE)
         quantidade_recebida = _decimal(row.get("quantidade_recebida")).quantize(QUANTIDADE_ESTOQUE)
         diferenca = _decimal(row.get("diferenca", quantidade_recebida - quantidade_esperada)).quantize(QUANTIDADE_ESTOQUE)
         RecebimentoMercadoriaItemHub.objects.update_or_create(
@@ -306,7 +319,7 @@ def _atualizar_itens_recebimento(recebimento, itens_payload):
             conferencia_item_id=conferencia_item_id,
             defaults={
                 "catalogo_item": catalogo_item,
-                "pedido_retaguarda_id": row.get("pedido_id"),
+                "pedido_retaguarda_id": row.get("pedido_id") or _pedido_distribuicao_id(recebimento),
                 "pedido_item_retaguarda_id": row.get("pedido_item_id"),
                 "retaguarda_produto_id": _inteiro_obrigatorio(row.get("produto_retaguarda_id"), "produto_retaguarda_id"),
                 "retaguarda_sku_id": sku_id,
@@ -331,7 +344,10 @@ def _normalizar_itens_conferencia(itens_payload, itens_locais):
     for row in itens_payload:
         if not isinstance(row, dict):
             raise RecebimentoValidationError("Item de conferência inválido.")
-        conferencia_item_id = _inteiro_obrigatorio(row.get("conferencia_item_id") or row.get("id"), "conferencia_item_id")
+        conferencia_item_id = _inteiro_obrigatorio(
+            row.get("conferencia_item_id") or row.get("transito_id") or row.get("id"),
+            "conferencia_item_id",
+        )
         if conferencia_item_id in recebidos:
             raise RecebimentoValidationError("Item de conferência duplicado.")
         item = itens_locais.get(conferencia_item_id)
@@ -346,6 +362,8 @@ def _normalizar_itens_conferencia(itens_payload, itens_locais):
         quantidade = _decimal(row.get("quantidade_recebida")).quantize(QUANTIDADE_ESTOQUE)
         if quantidade < 0:
             raise RecebimentoValidationError("Quantidade recebida não pode ser negativa.")
+        if item.recebimento.origem == ORIGEM_DISTRIBUICAO and quantidade > item.quantidade_esperada:
+            raise RecebimentoValidationError("Quantidade recebida não pode ser superior à enviada.")
         recebidos[conferencia_item_id] = quantidade
     if set(recebidos.keys()) != set(itens_locais.keys()):
         raise RecebimentoValidationError("Payload deve conter todos os itens da conferência.")
@@ -412,7 +430,7 @@ def _atualizar_bloqueio_sem_estoque(catalogo_item):
 def _obter_recebimento(hub, recebimento_id):
     recebimento = (
         RecebimentoMercadoriaHub.objects
-        .filter(hub=hub, retaguarda_id=recebimento_id)
+        .filter(hub=hub, pk=recebimento_id)
         .first()
     )
     if not recebimento:
@@ -423,7 +441,7 @@ def _obter_recebimento(hub, recebimento_id):
 def _obter_recebimento_bloqueado(hub, recebimento_id):
     recebimento = (
         RecebimentoMercadoriaHub.objects.select_for_update()
-        .filter(hub=hub, retaguarda_id=recebimento_id)
+        .filter(hub=hub, pk=recebimento_id)
         .first()
     )
     if not recebimento:
@@ -450,3 +468,25 @@ def _inteiro_obrigatorio(valor, campo):
     if inteiro <= 0:
         raise RecebimentoValidationError(f"{campo} inválido.")
     return inteiro
+
+
+def _pedidos_payload(payload):
+    if payload.get("origem") == ORIGEM_DISTRIBUICAO:
+        pedido = payload.get("pedido_distribuicao") or {}
+        return [pedido] if pedido else []
+    return payload.get("pedidos") or []
+
+
+def _pedido_distribuicao_id(recebimento):
+    if recebimento.origem != ORIGEM_DISTRIBUICAO:
+        return None
+    pedidos = recebimento.pedidos or []
+    if not pedidos:
+        return recebimento.retaguarda_id
+    return (pedidos[0] or {}).get("id") or recebimento.retaguarda_id
+
+
+def _variacao_payload(value):
+    if isinstance(value, dict):
+        return value
+    return {"nome": value or ""}

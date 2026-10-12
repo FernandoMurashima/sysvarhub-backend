@@ -20,5 +20,6 @@ class Command(BaseCommand):
             raise CommandError(str(exc)) from exc
         self.stdout.write(self.style.SUCCESS("Recebimentos sincronizados com sucesso."))
         self.stdout.write(f"Versao: {resultado['versao']}")
-        self.stdout.write(f"Recebimentos: {resultado['recebimentos']}")
+        self.stdout.write(f"Recebimentos fornecedor: {resultado['recebimentos']}")
+        self.stdout.write(f"Recebimentos distribuicao: {resultado['recebimentos_distribuicao']}")
         self.stdout.write(f"Pendentes locais: {resultado['pendentes_locais']}")

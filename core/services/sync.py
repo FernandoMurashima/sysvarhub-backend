@@ -19,6 +19,7 @@ from core.models import (
     VendaPagamentoHub,
 )
 from core.services.recebimentos import (
+    ORIGEM_DISTRIBUICAO,
     aplicar_movimentos_recebimento_confirmado,
     rejeitar_movimentos_recebimento_pendentes,
 )
@@ -29,6 +30,7 @@ TIPO_VENDA_FINALIZADA = "VENDA_FINALIZADA"
 TIPO_NFCE_ATUALIZADA = "NFCE_ATUALIZADA"
 TIPO_DEVOLUCAO_FINALIZADA = "DEVOLUCAO_FINALIZADA"
 TIPO_RECEBIMENTO_LOJA_CONFERIDO = "RECEBIMENTO_LOJA_CONFERIDO"
+TIPO_DISTRIBUICAO_LOJA_CONFERIDA = "DISTRIBUICAO_LOJA_CONFERIDA"
 STATUS_CONFIRMADOS = {"PROCESSADO", "DUPLICADO"}
 SEGREDOS_BLOQUEADOS = {"certificado", "private_key", "chave_privada", "senha", "csc", "token_csc"}
 
@@ -86,15 +88,17 @@ def enfileirar_recebimento_conferido(recebimento):
         .prefetch_related("itens")
         .get(pk=recebimento.pk)
     )
+    tipo = TIPO_DISTRIBUICAO_LOJA_CONFERIDA if recebimento.origem == ORIGEM_DISTRIBUICAO else TIPO_RECEBIMENTO_LOJA_CONFERIDO
     payload = payload_recebimento_conferido(recebimento)
+    chave_prefixo = "DISTRIBUICAO" if recebimento.origem == ORIGEM_DISTRIBUICAO else "RECEBIMENTO"
     return _criar_ou_atualizar_evento(
         hub=recebimento.hub,
-        tipo=TIPO_RECEBIMENTO_LOJA_CONFERIDO,
-        chave=f"RECEBIMENTO:{recebimento.retaguarda_id}:CONFERIDO",
+        tipo=tipo,
+        chave=f"{chave_prefixo}:{recebimento.retaguarda_id}:CONFERIDO",
         payload=payload,
         evento_uuid=_uuid_deterministico(
             recebimento.hub_id,
-            TIPO_RECEBIMENTO_LOJA_CONFERIDO,
+            tipo,
             str(recebimento.retaguarda_id),
         ),
     )
@@ -255,6 +259,34 @@ def payload_devolucao_finalizada(devolucao):
 
 
 def payload_recebimento_conferido(recebimento):
+    if recebimento.origem == ORIGEM_DISTRIBUICAO:
+        payload = {
+            "pedido_distribuicao_id": recebimento.retaguarda_id,
+            "loja_destino_id": recebimento.loja_retaguarda_id,
+            "operador_retaguarda_usuario_id": (
+                recebimento.operador_conferencia.retaguarda_usuario_id
+                if recebimento.operador_conferencia_id
+                else None
+            ),
+            "itens": [
+                {
+                    "transito_id": item.conferencia_item_id,
+                    "sku_retaguarda_id": item.retaguarda_sku_id,
+                    "ean": item.ean13,
+                    "quantidade_recebida": f"{item.quantidade_recebida:.3f}",
+                }
+                for item in recebimento.itens.order_by("id")
+            ],
+        }
+        documento = recebimento.documento_fiscal or {}
+        if documento.get("numero"):
+            payload["nfe_numero"] = documento.get("numero")
+        if documento.get("chave_acesso"):
+            payload["nfe_chave"] = documento.get("chave_acesso")
+        if recebimento.observacao_divergencia:
+            payload["observacao_divergencia"] = recebimento.observacao_divergencia
+        return payload
+
     payload = {
         "recebimento_id": recebimento.retaguarda_id,
         "operador_retaguarda_usuario_id": (
@@ -432,15 +464,18 @@ def _canonicalizar_devolucao_confirmada(evento, resultado, agora):
 
 
 def _marcar_recebimento_confirmado(evento, resultado, agora):
-    if evento.tipo != TIPO_RECEBIMENTO_LOJA_CONFERIDO:
+    if evento.tipo not in {TIPO_RECEBIMENTO_LOJA_CONFERIDO, TIPO_DISTRIBUICAO_LOJA_CONFERIDA}:
         return
-    recebimento_id = (evento.payload or {}).get("recebimento_id")
+    recebimento_id = (evento.payload or {}).get("recebimento_id") or (evento.payload or {}).get("pedido_distribuicao_id")
     if not recebimento_id:
         return
     mapeamento = resultado.get("mapeamento") or {}
+    origem = ORIGEM_DISTRIBUICAO if evento.tipo == TIPO_DISTRIBUICAO_LOJA_CONFERIDA else None
+    filtros = {"hub": evento.hub, "retaguarda_id": recebimento_id}
+    if origem:
+        filtros["origem"] = origem
     recebimento = RecebimentoMercadoriaHub.objects.filter(
-        hub=evento.hub,
-        retaguarda_id=recebimento_id,
+        **filtros,
     ).first()
     if not recebimento:
         return
@@ -500,12 +535,16 @@ def _marcar_devolucao_em_conflito(evento, mensagem):
 
 
 def _marcar_recebimento_em_conflito(evento, mensagem, agora):
-    if evento.tipo != TIPO_RECEBIMENTO_LOJA_CONFERIDO:
+    if evento.tipo not in {TIPO_RECEBIMENTO_LOJA_CONFERIDO, TIPO_DISTRIBUICAO_LOJA_CONFERIDA}:
         return
-    recebimento_id = (evento.payload or {}).get("recebimento_id")
+    recebimento_id = (evento.payload or {}).get("recebimento_id") or (evento.payload or {}).get("pedido_distribuicao_id")
     if not recebimento_id:
         return
-    recebimento = RecebimentoMercadoriaHub.objects.filter(hub=evento.hub, retaguarda_id=recebimento_id).first()
+    origem = ORIGEM_DISTRIBUICAO if evento.tipo == TIPO_DISTRIBUICAO_LOJA_CONFERIDA else None
+    filtros = {"hub": evento.hub, "retaguarda_id": recebimento_id}
+    if origem:
+        filtros["origem"] = origem
+    recebimento = RecebimentoMercadoriaHub.objects.filter(**filtros).first()
     if not recebimento:
         return
     rejeitar_movimentos_recebimento_pendentes(recebimento, mensagem=mensagem, agora=agora)

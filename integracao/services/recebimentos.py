@@ -13,13 +13,39 @@ class RecebimentosValidationError(Exception):
 
 
 def sincronizar_recebimentos(hub, resposta, client=None):
+    resultado = _sincronizar_lista(
+        hub,
+        resposta,
+        client=client,
+        detalhe_method="recebimento_detalhe",
+    )
+    distribuicao = {"recebimentos": 0}
+    if client and hasattr(client, "recebimentos_distribuicao"):
+        resposta_distribuicao = client.recebimentos_distribuicao(token=hub.retaguarda_token)
+        distribuicao = _sincronizar_lista(
+            hub,
+            resposta_distribuicao,
+            client=client,
+            detalhe_method="recebimento_distribuicao_detalhe",
+        )
+    resultado["recebimentos_distribuicao"] = distribuicao["recebimentos"]
+    resultado["recebimentos_total"] = resultado["recebimentos"] + distribuicao["recebimentos"]
+    resultado["pendentes_locais"] = RecebimentoMercadoriaHub.objects.filter(
+        hub=hub,
+        status_local=RecebimentoMercadoriaHub.STATUS_LOCAL_PENDENTE,
+    ).count()
+    return resultado
+
+
+def _sincronizar_lista(hub, resposta, *, client=None, detalhe_method="recebimento_detalhe"):
     dados = _validar_resposta(hub, resposta)
     recebidos = []
     for recebimento in dados["recebimentos"]:
-        local = atualizar_recebimento_por_payload(hub, recebimento, detalhado=False)
+        detalhado = isinstance(recebimento.get("itens"), list)
+        local = atualizar_recebimento_por_payload(hub, recebimento, detalhado=detalhado)
         recebidos.append(local.retaguarda_id)
-        if client and local.status_local == RecebimentoMercadoriaHub.STATUS_LOCAL_PENDENTE:
-            detalhe = client.recebimento_detalhe(token=hub.retaguarda_token, recebimento_id=local.retaguarda_id)
+        if client and local.status_local == RecebimentoMercadoriaHub.STATUS_LOCAL_PENDENTE and not detalhado:
+            detalhe = getattr(client, detalhe_method)(token=hub.retaguarda_token, recebimento_id=local.retaguarda_id)
             sincronizar_recebimento_detalhe(hub, detalhe)
     return {
         "versao": resposta["recebimentos_versao"],

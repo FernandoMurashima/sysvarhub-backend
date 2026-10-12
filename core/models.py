@@ -2208,11 +2208,12 @@ class RecebimentoMercadoriaHub(models.Model):
         verbose_name_plural = "Recebimentos de mercadoria do Hub"
         ordering = ("-recebido_central_em", "-id")
         constraints = [
-            models.UniqueConstraint(fields=["hub", "retaguarda_id"], name="uniq_rec_hub_ret"),
+            models.UniqueConstraint(fields=["hub", "origem", "retaguarda_id"], name="uniq_rec_hub_orig_ret"),
         ]
         indexes = [
             models.Index(fields=["hub", "status_local"], name="idx_rec_hub_status"),
             models.Index(fields=["hub", "status_retaguarda"], name="idx_rec_hub_status_ret"),
+            models.Index(fields=["hub", "origem"], name="idx_rec_hub_origem"),
         ]
 
     def __str__(self):

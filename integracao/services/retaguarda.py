@@ -182,6 +182,25 @@ class RetaguardaClient:
             headers={"Authorization": f"Hub {token}"},
         )
 
+    def recebimentos_distribuicao(self, *, token, status="TRANS"):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        qs = f"?{parse.urlencode({'status': status})}" if status else ""
+        return self._request_json(
+            f"api/hub/distribuicao/recebimentos/{qs}",
+            method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
+    def recebimento_distribuicao_detalhe(self, *, token, recebimento_id):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._request_json(
+            f"api/hub/distribuicao/recebimentos/{recebimento_id}/",
+            method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
     def clientes(self, *, token):
         if not token:
             raise RetaguardaError("Token da retaguarda não informado.")
