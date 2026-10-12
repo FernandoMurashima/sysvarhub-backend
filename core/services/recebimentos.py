@@ -239,6 +239,7 @@ def rejeitar_movimentos_recebimento_pendentes(recebimento, *, mensagem="", agora
 
 
 def serializar_recebimento(recebimento, detalhado=False):
+    unidade_origem = _unidade_origem_payload(recebimento)
     payload = {
         "local_id": recebimento.pk,
         "id": recebimento.pk,
@@ -247,6 +248,8 @@ def serializar_recebimento(recebimento, detalhado=False):
         "origem": recebimento.origem,
         "status_retaguarda": recebimento.status_retaguarda,
         "status_local": recebimento.status_local,
+        "unidade_origem": unidade_origem,
+        "loja_origem": unidade_origem,
         "loja": {
             "id": recebimento.loja_retaguarda_id,
             "nome": recebimento.loja_nome,
@@ -490,3 +493,24 @@ def _variacao_payload(value):
     if isinstance(value, dict):
         return value
     return {"nome": value or ""}
+
+
+def _unidade_origem_payload(recebimento):
+    if recebimento.origem != ORIGEM_DISTRIBUICAO:
+        return None
+    contrato = recebimento.contrato_retorno if isinstance(recebimento.contrato_retorno, dict) else {}
+    unidade = contrato.get("unidade_origem") or contrato.get("loja_origem")
+    if not isinstance(unidade, dict):
+        return None
+    nome = str(unidade.get("nome") or unidade.get("apelido") or "").strip()
+    apelido = str(unidade.get("apelido") or "").strip()
+    documento = str(unidade.get("documento") or "").strip()
+    unidade_id = unidade.get("id")
+    if not (unidade_id or nome or apelido or documento):
+        return None
+    return {
+        "id": unidade_id,
+        "nome": nome or apelido,
+        "apelido": apelido,
+        "documento": documento,
+    }
