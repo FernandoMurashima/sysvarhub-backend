@@ -2257,6 +2257,14 @@ class RecebimentoMercadoriaItemHub(models.Model):
 
 class RecebimentoMercadoriaMovimentoEstoqueHub(models.Model):
     TIPO_ENTRADA_RECEBIMENTO = "ENTRADA_RECEBIMENTO"
+    STATUS_PENDENTE = "PENDENTE"
+    STATUS_APLICADO = "APLICADO"
+    STATUS_REJEITADO = "REJEITADO"
+    STATUS_CHOICES = [
+        (STATUS_PENDENTE, "Pendente"),
+        (STATUS_APLICADO, "Aplicado"),
+        (STATUS_REJEITADO, "Rejeitado"),
+    ]
 
     movimento_uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     recebimento = models.ForeignKey(RecebimentoMercadoriaHub, on_delete=models.PROTECT, related_name="movimentos_estoque")
@@ -2271,6 +2279,10 @@ class RecebimentoMercadoriaMovimentoEstoqueHub(models.Model):
     quantidade = models.DecimalField(max_digits=14, decimal_places=3)
     saldo_anterior = models.DecimalField(max_digits=14, decimal_places=3, default=0)
     saldo_posterior = models.DecimalField(max_digits=14, decimal_places=3, default=0)
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default=STATUS_PENDENTE, db_index=True)
+    aplicado_em = models.DateTimeField(null=True, blank=True)
+    rejeitado_em = models.DateTimeField(null=True, blank=True)
+    mensagem_status = models.CharField(max_length=255, blank=True, default="")
     sincronizado_central_em = models.DateTimeField(null=True, blank=True)
     criado_em = models.DateTimeField(auto_now_add=True)
 
@@ -2280,6 +2292,7 @@ class RecebimentoMercadoriaMovimentoEstoqueHub(models.Model):
         ordering = ("criado_em", "id")
         indexes = [
             models.Index(fields=["hub", "retaguarda_sku_id"], name="idx_rec_mov_hub_sku"),
+            models.Index(fields=["hub", "status"], name="idx_rec_mov_hub_status"),
             models.Index(fields=["sincronizado_central_em"], name="idx_rec_mov_hub_sync"),
         ]
 

@@ -119,6 +119,8 @@ def finalizar_recebimento(terminal, operador, sessao_operador, *, recebimento_id
             return recebimento
         if recebimento.status_local == RecebimentoMercadoriaHub.STATUS_LOCAL_CONFERIDO:
             return recebimento
+        if recebimento.status_local == RecebimentoMercadoriaHub.STATUS_LOCAL_CONFLITO:
+            raise RecebimentoConflictError("Recebimento em conflito deve ser reconciliado antes de nova conferência.")
         if recebimento.status_retaguarda and recebimento.status_retaguarda != "EM_CONFERENCIA":
             raise RecebimentoConflictError("Recebimento deve estar em conferência na Central.")
 
@@ -142,7 +144,7 @@ def finalizar_recebimento(terminal, operador, sessao_operador, *, recebimento_id
         if possui_divergencia and not observacao_divergencia:
             raise RecebimentoValidationError("Informe observacao_divergencia para recebimento divergente.")
 
-        _efetivar_estoque_local(recebimento)
+        _registrar_movimentos_estoque_pendentes(recebimento)
         agora = timezone.now()
         recebimento.status_local = RecebimentoMercadoriaHub.STATUS_LOCAL_CONFERIDO
         recebimento.observacao_divergencia = observacao_divergencia
@@ -150,7 +152,6 @@ def finalizar_recebimento(terminal, operador, sessao_operador, *, recebimento_id
         recebimento.terminal_conferencia = terminal_bloqueado
         recebimento.sessao_operador_conferencia = sessao_operador
         recebimento.conferido_em = agora
-        recebimento.estoque_efetivado_em = recebimento.estoque_efetivado_em or agora
         recebimento.mensagem_sync = ""
         recebimento.save(update_fields=[
             "status_local",
@@ -159,7 +160,6 @@ def finalizar_recebimento(terminal, operador, sessao_operador, *, recebimento_id
             "terminal_conferencia",
             "sessao_operador_conferencia",
             "conferido_em",
-            "estoque_efetivado_em",
             "mensagem_sync",
             "atualizado_em",
         ])
@@ -168,6 +168,66 @@ def finalizar_recebimento(terminal, operador, sessao_operador, *, recebimento_id
         recebimento.evento_sync = evento
         recebimento.save(update_fields=["evento_sync", "atualizado_em"])
     return recebimento
+
+
+def aplicar_movimentos_recebimento_confirmado(recebimento, *, agora=None):
+    agora = agora or timezone.now()
+    with transaction.atomic():
+        recebimento = RecebimentoMercadoriaHub.objects.select_for_update().get(pk=recebimento.pk)
+        movimentos = list(
+            RecebimentoMercadoriaMovimentoEstoqueHub.objects.select_for_update()
+            .select_related("catalogo_item")
+            .filter(recebimento=recebimento)
+            .order_by("id")
+        )
+        aplicou = False
+        for movimento in movimentos:
+            if movimento.status != RecebimentoMercadoriaMovimentoEstoqueHub.STATUS_PENDENTE:
+                continue
+            catalogo_item = CatalogoItemHub.objects.select_for_update().get(pk=movimento.catalogo_item_id)
+            saldo_anterior = catalogo_item.estoque_fisico
+            catalogo_item.estoque_fisico = (catalogo_item.estoque_fisico + movimento.quantidade).quantize(QUANTIDADE_ESTOQUE)
+            catalogo_item.estoque_disponivel = (catalogo_item.estoque_disponivel + movimento.quantidade).quantize(QUANTIDADE_ESTOQUE)
+            _atualizar_bloqueio_sem_estoque(catalogo_item)
+            catalogo_item.save(update_fields=["estoque_fisico", "estoque_disponivel", "motivos_bloqueio", "vendavel", "atualizado_em"])
+            movimento.saldo_anterior = saldo_anterior
+            movimento.saldo_posterior = catalogo_item.estoque_fisico
+            movimento.status = RecebimentoMercadoriaMovimentoEstoqueHub.STATUS_APLICADO
+            movimento.aplicado_em = agora
+            movimento.sincronizado_central_em = agora
+            movimento.mensagem_status = ""
+            movimento.save(update_fields=[
+                "saldo_anterior",
+                "saldo_posterior",
+                "status",
+                "aplicado_em",
+                "sincronizado_central_em",
+                "mensagem_status",
+            ])
+            aplicou = True
+        if aplicou and recebimento.estoque_efetivado_em is None:
+            recebimento.estoque_efetivado_em = agora
+            recebimento.save(update_fields=["estoque_efetivado_em", "atualizado_em"])
+
+
+def rejeitar_movimentos_recebimento_pendentes(recebimento, *, mensagem="", agora=None):
+    agora = agora or timezone.now()
+    mensagem = str(mensagem or "")[:255]
+    with transaction.atomic():
+        movimentos = (
+            RecebimentoMercadoriaMovimentoEstoqueHub.objects.select_for_update()
+            .filter(recebimento=recebimento)
+            .order_by("id")
+        )
+        for movimento in movimentos:
+            if movimento.status == RecebimentoMercadoriaMovimentoEstoqueHub.STATUS_PENDENTE:
+                movimento.status = RecebimentoMercadoriaMovimentoEstoqueHub.STATUS_REJEITADO
+                movimento.rejeitado_em = agora
+                movimento.mensagem_status = mensagem
+                movimento.save(update_fields=["status", "rejeitado_em", "mensagem_status"])
+            elif movimento.status == RecebimentoMercadoriaMovimentoEstoqueHub.STATUS_APLICADO:
+                movimento.mensagem_status = mensagem or "Movimento aplicado antes do conflito; exige reconciliacao manual segura."
+                movimento.save(update_fields=["mensagem_status"])
 
 
 def serializar_recebimento(recebimento, detalhado=False):
@@ -292,9 +352,7 @@ def _normalizar_itens_conferencia(itens_payload, itens_locais):
     return recebidos
 
 
-def _efetivar_estoque_local(recebimento):
-    if recebimento.estoque_efetivado_em:
-        return
+def _registrar_movimentos_estoque_pendentes(recebimento):
     itens = list(
         RecebimentoMercadoriaItemHub.objects.select_for_update()
         .filter(recebimento=recebimento)
@@ -316,15 +374,7 @@ def _efetivar_estoque_local(recebimento):
             ).first()
         if catalogo_item is None:
             raise RecebimentoConflictError(f"SKU {item.retaguarda_sku_id} não encontrado no catálogo local.")
-        saldo_anterior = catalogo_item.estoque_fisico
         quantidade = item.quantidade_recebida.quantize(QUANTIDADE_ESTOQUE)
-        catalogo_item.estoque_fisico = (catalogo_item.estoque_fisico + quantidade).quantize(QUANTIDADE_ESTOQUE)
-        catalogo_item.estoque_disponivel = (catalogo_item.estoque_disponivel + quantidade).quantize(QUANTIDADE_ESTOQUE)
-        if catalogo_item.estoque_disponivel > 0:
-            catalogo_item.motivos_bloqueio = [motivo for motivo in (catalogo_item.motivos_bloqueio or []) if motivo != "SEM_ESTOQUE"]
-            if catalogo_item.preco_venda and catalogo_item.preco_venda > 0 and not catalogo_item.motivos_bloqueio:
-                catalogo_item.vendavel = True
-        catalogo_item.save(update_fields=["estoque_fisico", "estoque_disponivel", "motivos_bloqueio", "vendavel", "atualizado_em"])
         item.catalogo_item = catalogo_item
         item.save(update_fields=["catalogo_item", "atualizado_em"])
         RecebimentoMercadoriaMovimentoEstoqueHub.objects.get_or_create(
@@ -338,10 +388,25 @@ def _efetivar_estoque_local(recebimento):
                 "ean13": item.ean13,
                 "referencia": item.referencia,
                 "quantidade": quantidade,
-                "saldo_anterior": saldo_anterior,
+                "saldo_anterior": catalogo_item.estoque_fisico,
                 "saldo_posterior": catalogo_item.estoque_fisico,
+                "status": RecebimentoMercadoriaMovimentoEstoqueHub.STATUS_PENDENTE,
             },
         )
+
+
+def _atualizar_bloqueio_sem_estoque(catalogo_item):
+    motivos = list(catalogo_item.motivos_bloqueio or [])
+    if catalogo_item.estoque_disponivel > 0:
+        motivos = [motivo for motivo in motivos if motivo != "SEM_ESTOQUE"]
+    elif "SEM_ESTOQUE" not in motivos:
+        motivos.append("SEM_ESTOQUE")
+    catalogo_item.motivos_bloqueio = motivos
+    catalogo_item.vendavel = (
+        catalogo_item.ativo
+        and bool(catalogo_item.preco_venda and catalogo_item.preco_venda > 0)
+        and not motivos
+    )
 
 
 def _obter_recebimento(hub, recebimento_id):

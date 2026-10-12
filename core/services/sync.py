@@ -12,12 +12,15 @@ from core.models import (
     EventoSyncHub,
     NFCeHub,
     RecebimentoMercadoriaHub,
-    RecebimentoMercadoriaMovimentoEstoqueHub,
     ValeTrocaHub,
     ValeTrocaMovimentoHub,
     VendaDevolucaoHub,
     VendaHub,
     VendaPagamentoHub,
+)
+from core.services.recebimentos import (
+    aplicar_movimentos_recebimento_confirmado,
+    rejeitar_movimentos_recebimento_pendentes,
 )
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaError
 
@@ -314,6 +317,7 @@ def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=Non
         resultado = resultados.get(evento.chave_idempotencia, {})
         status = resultado.get("status")
         if status in STATUS_CONFIRMADOS:
+            _marcar_recebimento_confirmado(evento, resultado, agora)
             evento.status = EventoSyncHub.STATUS_SINCRONIZADO
             evento.sincronizado_em = agora
             evento.resposta = resultado
@@ -321,15 +325,14 @@ def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=Non
             evento.save(update_fields=["status", "sincronizado_em", "resposta", "ultimo_erro", "atualizado_em"])
             _marcar_beneficios_centralizados(evento, agora)
             _canonicalizar_devolucao_confirmada(evento, resultado, agora)
-            _marcar_recebimento_confirmado(evento, resultado, agora)
             contadores["sincronizados"] += 1
         elif status == "CONFLITO":
             evento.status = EventoSyncHub.STATUS_CONFLITO
             evento.resposta = resultado
             evento.ultimo_erro = resultado.get("mensagem", "CONFLITO")[:255]
-            evento.save(update_fields=["status", "resposta", "ultimo_erro", "atualizado_em"])
             _marcar_devolucao_em_conflito(evento, evento.ultimo_erro)
-            _marcar_recebimento_em_conflito(evento, evento.ultimo_erro)
+            _marcar_recebimento_em_conflito(evento, evento.ultimo_erro, agora)
+            evento.save(update_fields=["status", "resposta", "ultimo_erro", "atualizado_em"])
             contadores["conflitos"] += 1
         else:
             _marcar_retry(evento, resultado.get("mensagem", "ERRO"), agora, resposta=resultado)
@@ -435,10 +438,14 @@ def _marcar_recebimento_confirmado(evento, resultado, agora):
     if not recebimento_id:
         return
     mapeamento = resultado.get("mapeamento") or {}
-    atualizados = RecebimentoMercadoriaHub.objects.filter(
+    recebimento = RecebimentoMercadoriaHub.objects.filter(
         hub=evento.hub,
         retaguarda_id=recebimento_id,
-    ).update(
+    ).first()
+    if not recebimento:
+        return
+    aplicar_movimentos_recebimento_confirmado(recebimento, agora=agora)
+    RecebimentoMercadoriaHub.objects.filter(pk=recebimento.pk).update(
         status_local=RecebimentoMercadoriaHub.STATUS_LOCAL_SINCRONIZADO,
         status_retaguarda=mapeamento.get("status") or "CONCLUIDO",
         confirmado_central_em=agora,
@@ -446,12 +453,6 @@ def _marcar_recebimento_confirmado(evento, resultado, agora):
         mensagem_sync="",
         resposta_central=resultado,
     )
-    if atualizados:
-        RecebimentoMercadoriaMovimentoEstoqueHub.objects.filter(
-            hub=evento.hub,
-            recebimento__retaguarda_id=recebimento_id,
-            sincronizado_central_em__isnull=True,
-        ).update(sincronizado_central_em=agora)
 
 
 def _dependencias_devolucao_venda(venda):
@@ -498,13 +499,17 @@ def _marcar_devolucao_em_conflito(evento, mensagem):
     )
 
 
-def _marcar_recebimento_em_conflito(evento, mensagem):
+def _marcar_recebimento_em_conflito(evento, mensagem, agora):
     if evento.tipo != TIPO_RECEBIMENTO_LOJA_CONFERIDO:
         return
     recebimento_id = (evento.payload or {}).get("recebimento_id")
     if not recebimento_id:
         return
-    RecebimentoMercadoriaHub.objects.filter(hub=evento.hub, retaguarda_id=recebimento_id).update(
+    recebimento = RecebimentoMercadoriaHub.objects.filter(hub=evento.hub, retaguarda_id=recebimento_id).first()
+    if not recebimento:
+        return
+    rejeitar_movimentos_recebimento_pendentes(recebimento, mensagem=mensagem, agora=agora)
+    RecebimentoMercadoriaHub.objects.filter(pk=recebimento.pk).update(
         status_local=RecebimentoMercadoriaHub.STATUS_LOCAL_CONFLITO,
         mensagem_sync=mensagem[:255],
         resposta_central=evento.resposta or {},
