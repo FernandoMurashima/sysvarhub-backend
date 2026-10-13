@@ -1510,6 +1510,12 @@ class VendaPagamentoHub(models.Model):
     ORIGEM_CHOICES = [
         (ORIGEM_MANUAL, "Manual"),
     ]
+    CASHBACK_ORIGEM_LOCAL = "LOCAL"
+    CASHBACK_ORIGEM_CENTRAL = "CENTRAL"
+    CASHBACK_ORIGEM_CHOICES = [
+        (CASHBACK_ORIGEM_LOCAL, "Local"),
+        (CASHBACK_ORIGEM_CENTRAL, "Central"),
+    ]
     STATUS_ATIVO = "ATIVO"
     STATUS_REMOVIDO = "REMOVIDO"
     STATUS_CHOICES = [
@@ -1555,6 +1561,9 @@ class VendaPagamentoHub(models.Model):
     vale_troca_documento = models.CharField(max_length=80, blank=True, default="")
     vale_troca_reserva_id = models.PositiveBigIntegerField(null=True, blank=True)
     vale_troca_valor_reservado = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    cashback_origem = models.CharField(max_length=10, choices=CASHBACK_ORIGEM_CHOICES, default=CASHBACK_ORIGEM_LOCAL)
+    cashback_reserva_id = models.PositiveBigIntegerField(null=True, blank=True)
+    cashback_valor_reservado = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     origem_captura = models.CharField(max_length=10, choices=ORIGEM_CHOICES, default=ORIGEM_MANUAL)
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_ATIVO)
     terminal_inclusao = models.ForeignKey(Terminal, on_delete=models.PROTECT, related_name="pagamentos_incluidos")

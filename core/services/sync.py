@@ -152,38 +152,42 @@ def payload_venda_finalizada(venda):
             }
             for item in venda.itens.order_by("id")
         ],
-        "pagamentos": [
-            {
-                "codigo": pagamento.codigo,
-                "descricao": pagamento.descricao,
-                "valor": f"{pagamento.valor:.2f}",
-                "autorizacao": pagamento.autorizacao,
-                "tipo": pagamento.tipo,
-                "forma_pagamento_id": pagamento.retaguarda_forma_pagamento_id,
-                "forma_pagamento_condicao_id": pagamento.retaguarda_forma_pagamento_condicao_id,
-                "prazo_pagamento_id": pagamento.retaguarda_prazo_pagamento_id,
-                "prazo_codigo": pagamento.prazo_codigo,
-                "prazo_descricao": pagamento.prazo_descricao,
-                "num_parcelas": pagamento.num_parcelas,
-                "taxa_percentual": f"{pagamento.taxa_percentual:.4f}",
-                "taxa_fixa": f"{pagamento.taxa_fixa:.2f}",
-                "parcelas": [
-                    {
-                        "ordem": parcela.ordem,
-                        "dias": parcela.dias,
-                        "percentual": f"{parcela.percentual:.6f}" if parcela.percentual is not None else None,
-                        "valor_fixo": f"{parcela.valor_fixo:.2f}" if parcela.valor_fixo is not None else None,
-                    }
-                    for parcela in pagamento.parcelas_snapshot.order_by("ordem", "id")
-                ],
-                "vale_troca_documento": pagamento.vale_troca_documento,
-                "vale_troca_retaguarda_id": pagamento.vale_troca_retaguarda_id,
-                "vale_troca_reserva_id": pagamento.vale_troca_reserva_id,
-                "operacao_uuid": str(pagamento.operacao_uuid),
-            }
-            for pagamento in pagamentos
-        ],
+        "pagamentos": [_payload_pagamento_venda_finalizada(pagamento) for pagamento in pagamentos],
     }
+
+
+def _payload_pagamento_venda_finalizada(pagamento):
+    payload = {
+        "codigo": pagamento.codigo,
+        "descricao": pagamento.descricao,
+        "valor": f"{pagamento.valor:.2f}",
+        "autorizacao": pagamento.autorizacao,
+        "tipo": pagamento.tipo,
+        "forma_pagamento_id": pagamento.retaguarda_forma_pagamento_id,
+        "forma_pagamento_condicao_id": pagamento.retaguarda_forma_pagamento_condicao_id,
+        "prazo_pagamento_id": pagamento.retaguarda_prazo_pagamento_id,
+        "prazo_codigo": pagamento.prazo_codigo,
+        "prazo_descricao": pagamento.prazo_descricao,
+        "num_parcelas": pagamento.num_parcelas,
+        "taxa_percentual": f"{pagamento.taxa_percentual:.4f}",
+        "taxa_fixa": f"{pagamento.taxa_fixa:.2f}",
+        "parcelas": [
+            {
+                "ordem": parcela.ordem,
+                "dias": parcela.dias,
+                "percentual": f"{parcela.percentual:.6f}" if parcela.percentual is not None else None,
+                "valor_fixo": f"{parcela.valor_fixo:.2f}" if parcela.valor_fixo is not None else None,
+            }
+            for parcela in pagamento.parcelas_snapshot.order_by("ordem", "id")
+        ],
+        "vale_troca_documento": pagamento.vale_troca_documento,
+        "vale_troca_retaguarda_id": pagamento.vale_troca_retaguarda_id,
+        "vale_troca_reserva_id": pagamento.vale_troca_reserva_id,
+        "operacao_uuid": str(pagamento.operacao_uuid),
+    }
+    if pagamento.tipo == "CASHBACK" and pagamento.cashback_origem == "CENTRAL":
+        payload["cashback_reserva_id"] = pagamento.cashback_reserva_id
+    return payload
 
 
 def payload_nfce_atualizada(nfce):

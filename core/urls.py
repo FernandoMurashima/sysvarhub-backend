@@ -6,6 +6,8 @@ from core.api import (
     CaixaMovimentacoesView,
     CaixaResumoView,
     CaixaStatusView,
+    CashbackOnlinePagamentoView,
+    CashbackOnlineSaldoView,
     CashbackPagamentoView,
     DevolucaoConsultarView,
     DevolucaoClienteVendasView,
@@ -92,6 +94,8 @@ urlpatterns = [
     path("venda/item/<uuid:item_uuid>/", VendaItemDetalheView.as_view(), name="terminal-venda-item-detalhe"),
     path("venda/pagamento/", VendaPagamentoView.as_view(), name="terminal-venda-pagamento"),
     path("venda/pagamento/cashback/", CashbackPagamentoView.as_view(), name="terminal-venda-pagamento-cashback"),
+    path("venda/pagamento/cashback-online/", CashbackOnlinePagamentoView.as_view(), name="terminal-venda-pagamento-cashback-online"),
+    path("venda/cashback-online/saldo/", CashbackOnlineSaldoView.as_view(), name="terminal-venda-cashback-online-saldo"),
     path("venda/pagamento/vale-troca/", ValeTrocaPagamentoView.as_view(), name="terminal-venda-pagamento-vale-troca"),
     path(
         "venda/pagamento/<uuid:pagamento_uuid>/",

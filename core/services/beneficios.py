@@ -90,18 +90,19 @@ def validar_cashback(venda, valor, *, total_cashback=None, bloquear_saldo=False)
     config = cashback_config_ativa(venda.hub)
     valor = money(valor)
     total_cashback = money(total_cashback if total_cashback is not None else total_cashback_ativo(venda) + valor)
+    total_cashback_local = money(total_cashback_local_ativo(venda) + valor)
     if not config:
         raise ValueError("Não existe regra de cashback ativa.")
     if cliente_padrao(venda) and not config.consumidor_final_participa:
         raise ValueError("Cashback exige cliente identificado.")
-    if total_cashback > saldo_cashback_offline(venda, bloquear=bloquear_saldo):
+    if total_cashback_local > saldo_cashback_offline(venda, bloquear=bloquear_saldo):
         raise ValueError("O cashback informado é maior que o saldo disponível do cliente.")
     if total_cashback > money(venda.total):
         raise ValueError("O cashback não pode ser maior que o total da venda.")
     outros = _total_pago_outros(venda, "CASHBACK")
     if total_cashback > money(max(ZERO, venda.total - outros)):
         raise ValueError("Cashback não pode gerar troco; use apenas o saldo pendente da venda.")
-    if config.valor_minimo_uso and valor < money(config.valor_minimo_uso):
+    if valor > ZERO and config.valor_minimo_uso and valor < money(config.valor_minimo_uso):
         raise ValueError("O valor de cashback usado é menor que o mínimo configurado.")
     limite = money(venda.total * Decimal(config.limite_uso_percentual or 0) / Decimal("100"))
     if total_cashback > limite:
@@ -115,6 +116,52 @@ def total_cashback_ativo(venda):
         .get("total")
         or ZERO
     )
+
+
+def total_cashback_local_ativo(venda):
+    return money(
+        venda.pagamentos.filter(
+            status="ATIVO",
+            tipo="CASHBACK",
+            cashback_origem="LOCAL",
+        )
+        .aggregate(total=models.Sum("valor"))
+        .get("total")
+        or ZERO
+    )
+
+
+def total_cashback_central_ativo(venda):
+    return money(
+        venda.pagamentos.filter(
+            status="ATIVO",
+            tipo="CASHBACK",
+            cashback_origem="CENTRAL",
+        )
+        .aggregate(total=models.Sum("valor"))
+        .get("total")
+        or ZERO
+    )
+
+
+def validar_cashback_central(venda, valor):
+    config = cashback_config_ativa(venda.hub)
+    valor = money(valor)
+    total_cashback = money(total_cashback_ativo(venda) + valor)
+    if not config:
+        raise ValueError("Não existe regra de cashback ativa.")
+    if cliente_padrao(venda) and not config.consumidor_final_participa:
+        raise ValueError("Cashback exige cliente identificado.")
+    if total_cashback > money(venda.total):
+        raise ValueError("O cashback não pode ser maior que o total da venda.")
+    outros = _total_pago_outros(venda, "CASHBACK")
+    if total_cashback > money(max(ZERO, venda.total - outros)):
+        raise ValueError("Cashback não pode gerar troco; use apenas o saldo pendente da venda.")
+    if config.valor_minimo_uso and valor < money(config.valor_minimo_uso):
+        raise ValueError("O valor de cashback usado é menor que o mínimo configurado.")
+    limite = money(venda.total * Decimal(config.limite_uso_percentual or 0) / Decimal("100"))
+    if total_cashback > limite:
+        raise ValueError("O cashback usado ultrapassa o limite permitido para a venda.")
 
 
 def validar_vale_troca(venda, valor, autorizacao=""):
@@ -166,15 +213,23 @@ def aplicar_promocao(catalogo_item, quantidade):
 
 def registrar_beneficios_venda(venda, pagamentos):
     with transaction.atomic():
-        total_cashback = money(sum((p.valor for p in pagamentos if (p.tipo or "").upper() == "CASHBACK"), ZERO))
-        if total_cashback > ZERO and not CashbackMovimentoHub.objects.filter(venda=venda, tipo=CashbackMovimentoHub.TIPO_DEBITO).exists():
+        total_cashback_local = money(sum(
+            (
+                p.valor
+                for p in pagamentos
+                if (p.tipo or "").upper() == "CASHBACK"
+                and getattr(p, "cashback_origem", "LOCAL") == "LOCAL"
+            ),
+            ZERO,
+        ))
+        if total_cashback_local > ZERO and not CashbackMovimentoHub.objects.filter(venda=venda, tipo=CashbackMovimentoHub.TIPO_DEBITO).exists():
             CashbackMovimentoHub.objects.create(
                 hub=venda.hub,
                 cliente_uuid=venda.cliente_uuid,
                 cliente_retaguarda_id=venda.cliente_retaguarda_id,
                 venda=venda,
                 tipo=CashbackMovimentoHub.TIPO_DEBITO,
-                valor=total_cashback,
+                valor=total_cashback_local,
                 observacao=f"Uso na venda Hub {venda.venda_uuid}",
             )
         for pagamento in pagamentos:

@@ -709,6 +709,7 @@ def adicionar_pagamento_cashback(
             gera_recebivel_bancario=False,
             valor=valor,
             autorizacao="",
+            cashback_origem=VendaPagamentoHub.CASHBACK_ORIGEM_LOCAL,
             origem_captura=VendaPagamentoHub.ORIGEM_MANUAL,
             status=VendaPagamentoHub.STATUS_ATIVO,
             terminal_inclusao=terminal_bloqueado,
@@ -749,6 +750,9 @@ def remover_pagamento(terminal, operador, sessao_operador, *, pagamento_uuid):
         if (pagamento.tipo or "").upper() == "VALE_TROCA" and pagamento.vale_troca_reserva_id:
             from core.services.vales_troca import liberar_reserva_pagamento_vale_troca
             liberar_reserva_pagamento_vale_troca(pagamento)
+        if (pagamento.tipo or "").upper() == CASHBACK and pagamento.cashback_origem == VendaPagamentoHub.CASHBACK_ORIGEM_CENTRAL:
+            from core.services.cashback_online import liberar_reserva_pagamento_cashback
+            liberar_reserva_pagamento_cashback(pagamento)
 
         pagamento.status = VendaPagamentoHub.STATUS_REMOVIDO
         pagamento.removido_em = timezone.now()
@@ -819,15 +823,25 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
             raise VendaConflictError("Valor do pagamento excede o valor pendente.")
         total_cashback = calcular_total_cashback_lista(pagamentos)
         if total_cashback > ZERO_2:
-            bloquear_cliente_cashback(venda)
+            total_cashback_local = money(sum(
+                (
+                    pagamento.valor
+                    for pagamento in pagamentos
+                    if (pagamento.tipo or "").upper() == CASHBACK
+                    and pagamento.cashback_origem == VendaPagamentoHub.CASHBACK_ORIGEM_LOCAL
+                ),
+                ZERO_2,
+            ))
+            if total_cashback_local > ZERO_2:
+                bloquear_cliente_cashback(venda)
             try:
                 validar_pagamento_beneficio(
                     venda,
                     None,
-                    total_cashback,
+                    ZERO_2,
                     tipo=CASHBACK,
                     total_beneficio=total_cashback,
-                    bloquear_saldo=True,
+                    bloquear_saldo=total_cashback_local > ZERO_2,
                 )
             except ValueError as exc:
                 raise VendaConflictError(str(exc)) from exc
@@ -1491,7 +1505,7 @@ def dados_item(item, quantidade_anterior, quantidade_nova):
 
 
 def dados_pagamento(pagamento):
-    return {
+    dados = {
         "pagamento_uuid": str(pagamento.pagamento_uuid),
         "forma_id": pagamento.forma_pagamento_id,
         "codigo": pagamento.codigo,
@@ -1499,6 +1513,10 @@ def dados_pagamento(pagamento):
         "valor": f"{pagamento.valor:.2f}",
         "status": pagamento.status,
     }
+    if (pagamento.tipo or "").upper() == CASHBACK:
+        dados["cashback_origem"] = pagamento.cashback_origem
+        dados["cashback_reserva_id"] = pagamento.cashback_reserva_id
+    return dados
 
 
 def dados_cliente_evento(venda):
@@ -1667,7 +1685,7 @@ def serializar_item(item):
 
 
 def serializar_pagamento(pagamento):
-    return {
+    dados = {
         "uuid": str(pagamento.pagamento_uuid),
         "forma_pagamento_id": pagamento.forma_pagamento_id,
         "forma_retaguarda_id": pagamento.retaguarda_forma_pagamento_id,
@@ -1686,6 +1704,11 @@ def serializar_pagamento(pagamento):
         "origem_captura": pagamento.origem_captura,
         "criado_em": pagamento.criado_em.isoformat(),
     }
+    if (pagamento.tipo or "").upper() == CASHBACK:
+        dados["cashback_origem"] = pagamento.cashback_origem
+        dados["cashback_reserva_id"] = pagamento.cashback_reserva_id
+        dados["cashback_valor_reservado"] = f"{pagamento.cashback_valor_reservado:.2f}"
+    return dados
 
 
 def serializar_prazo_pagamento(prazo):

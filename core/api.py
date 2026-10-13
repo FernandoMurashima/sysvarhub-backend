@@ -105,6 +105,7 @@ from core.services.vendas import (
     venda_atual,
 )
 from core.services.vales_troca import adicionar_pagamento_vale_troca, consultar_vale_troca_online, listar_vales_troca_online_disponiveis
+from core.services.cashback_online import adicionar_pagamento_cashback_online, consultar_cashback_online_venda
 from core.services.danfe_nfce import DanfeNFCeErroDominio, montar_dados_danfe_nfce
 from core.services.devolucoes import (
     consultar_venda_para_devolucao,
@@ -975,6 +976,51 @@ class CashbackPagamentoView(APIView):
     def post(self, request):
         try:
             venda, criado = adicionar_pagamento_cashback(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                venda_uuid=request.data.get("venda_uuid"),
+                operacao_uuid=request.data.get("operacao_uuid"),
+                valor=request.data.get("valor"),
+            )
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {"venda": serializar_venda(venda)},
+            status=status.HTTP_201_CREATED if criado else status.HTTP_200_OK,
+        )
+
+
+class CashbackOnlineSaldoView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def get(self, request):
+        try:
+            payload = consultar_cashback_online_venda(request.sysvar_terminal, request.query_params.get("venda_uuid"))
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(payload)
+
+
+class CashbackOnlinePagamentoView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request):
+        try:
+            venda, criado = adicionar_pagamento_cashback_online(
                 request.sysvar_terminal,
                 request.sysvar_operador,
                 request.sysvar_operador_sessao,

@@ -301,6 +301,42 @@ class RetaguardaClient:
             headers={"Authorization": f"Hub {token}"},
         )
 
+    def cashback_saldo(self, *, token, cliente_id):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._request_json(
+            f"api/hub/cashback/saldo/?cliente_id={parse.quote(str(cliente_id or ''))}",
+            method="GET",
+            headers={"Authorization": f"Hub {token}"},
+        )
+
+    def cashback_reservar_venda(self, *, token, payload):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._post_json(
+            "api/hub/cashback/reservar-venda/",
+            payload,
+            headers={"Authorization": f"Hub {token}"},
+        )
+
+    def cashback_cancelar_reserva(self, *, token, payload):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._post_json(
+            "api/hub/cashback/cancelar-reserva/",
+            payload,
+            headers={"Authorization": f"Hub {token}"},
+        )
+
+    def cashback_cancelar_venda(self, *, token, venda_uuid):
+        if not token:
+            raise RetaguardaError("Token da retaguarda não informado.")
+        return self._post_json(
+            "api/hub/cashback/cancelar-venda/",
+            {"venda_uuid": str(venda_uuid)},
+            headers={"Authorization": f"Hub {token}"},
+        )
+
     def sync_push(self, *, token, eventos):
         if not token:
             raise RetaguardaError("Token da retaguarda não informado.")
