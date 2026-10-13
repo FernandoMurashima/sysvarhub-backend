@@ -1166,6 +1166,41 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(pagamento.cashback_reserva_id, 55)
         self.assertEqual(pagamento.cashback_valor_reservado, Decimal("30.00"))
 
+    def test_mesma_operacao_nao_troca_cashback_local_por_central(self):
+        cliente = self.criar_cliente(retaguarda_id=123)
+        self.criar_cashback_disponivel(cliente, saldo="100.00")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        operacao_uuid = uuid.uuid4()
+        local = self.pagar_cashback(venda_uuid, "30.00", operacao_uuid=operacao_uuid)
+
+        with patch("core.services.cashback_online.RetaguardaClient") as client_cls:
+            central = self.pagar_cashback_online(venda_uuid, "30.00", operacao_uuid=operacao_uuid)
+
+        self.assertEqual(local.status_code, 201, local.data)
+        self.assertEqual(central.status_code, 409)
+        client_cls.return_value.cashback_reservar_venda.assert_not_called()
+        self.assertEqual(VendaPagamentoHub.objects.count(), 1)
+        self.assertEqual(VendaPagamentoHub.objects.get().cashback_origem, VendaPagamentoHub.CASHBACK_ORIGEM_LOCAL)
+
+    def test_mesma_operacao_nao_troca_cashback_central_por_local(self):
+        cliente = self.criar_cliente(retaguarda_id=123)
+        self.criar_cashback_disponivel(cliente, saldo="100.00")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        operacao_uuid = uuid.uuid4()
+        with patch("core.services.cashback_online.RetaguardaClient") as client_cls:
+            client_cls.return_value.cashback_reservar_venda.return_value = {
+                "reserva": {"id": 56, "cliente_id": 123, "valor": "30.00", "status": "RESERVADA"}
+            }
+            central = self.pagar_cashback_online(venda_uuid, "30.00", operacao_uuid=operacao_uuid)
+        local = self.pagar_cashback(venda_uuid, "30.00", operacao_uuid=operacao_uuid)
+
+        self.assertEqual(central.status_code, 201, central.data)
+        self.assertEqual(local.status_code, 409)
+        self.assertEqual(VendaPagamentoHub.objects.count(), 1)
+        self.assertEqual(VendaPagamentoHub.objects.get().cashback_origem, VendaPagamentoHub.CASHBACK_ORIGEM_CENTRAL)
+
     def test_cashback_online_central_indisponivel_nao_vira_offline(self):
         cliente = self.criar_cliente(retaguarda_id=123)
         self.criar_cashback_disponivel(cliente, saldo="100.00")
@@ -1195,6 +1230,44 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
 
         self.assertEqual(resposta.status_code, 409)
         self.assertIn("outro cliente", resposta.data["detail"])
+        self.assertFalse(VendaPagamentoHub.objects.exists())
+
+    def test_cashback_online_falha_local_apos_reserva_cancela_reserva(self):
+        cliente = self.criar_cliente(retaguarda_id=123)
+        self.criar_cashback_disponivel(cliente, saldo="0.00")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        with patch("core.services.cashback_online.RetaguardaClient") as client_cls, patch("core.services.cashback_online.VendaPagamentoHub.objects.create") as create:
+            client_cls.return_value.cashback_reservar_venda.return_value = {
+                "reserva": {"id": 90, "cliente_id": 123, "valor": "30.00", "status": "RESERVADA"}
+            }
+            create.side_effect = RuntimeError("falha local")
+            resposta = self.pagar_cashback_online(venda_uuid, "30.00")
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertIn("foi cancelada na Central", resposta.data["detail"])
+        self.assertIn("falha local", resposta.data["detail"])
+        client_cls.return_value.cashback_cancelar_reserva.assert_called_once()
+        self.assertFalse(VendaPagamentoHub.objects.exists())
+
+    def test_cashback_online_falha_local_e_falha_compensacao_informa_reserva(self):
+        cliente = self.criar_cliente(retaguarda_id=123)
+        self.criar_cashback_disponivel(cliente, saldo="0.00")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        with patch("core.services.cashback_online.RetaguardaClient") as client_cls, patch("core.services.cashback_online.VendaPagamentoHub.objects.create") as create:
+            client_cls.return_value.cashback_reservar_venda.return_value = {
+                "reserva": {"id": 91, "cliente_id": 123, "valor": "30.00", "status": "RESERVADA"}
+            }
+            client_cls.return_value.cashback_cancelar_reserva.side_effect = RetaguardaError("central offline")
+            create.side_effect = RuntimeError("falha local")
+            resposta = self.pagar_cashback_online(venda_uuid, "30.00")
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertIn("Reserva 91", resposta.data["detail"])
+        self.assertIn("não foi cancelada automaticamente", resposta.data["detail"])
+        self.assertIn("falha local", resposta.data["detail"])
+        client_cls.return_value.cashback_cancelar_reserva.assert_called_once()
         self.assertFalse(VendaPagamentoHub.objects.exists())
 
     def test_venda_mista_cashback_local_central_pix_debita_apenas_local_e_sync_reserva_online(self):

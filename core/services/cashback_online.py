@@ -29,6 +29,17 @@ def _client(hub):
     return RetaguardaClient(hub.retaguarda_url)
 
 
+def _cancelar_reserva_confirmada(hub, *, reserva_id, venda_uuid, operacao_uuid):
+    _client(hub).cashback_cancelar_reserva(
+        token=hub.retaguarda_token,
+        payload={
+            "reserva_id": reserva_id,
+            "venda_uuid": str(venda_uuid),
+            "operacao_uuid": str(operacao_uuid),
+        },
+    )
+
+
 def consultar_cashback_online_venda(terminal, venda_uuid):
     venda_uuid = validar_uuid_obrigatorio(venda_uuid, "Venda inválida.")
     with transaction.atomic():
@@ -117,28 +128,49 @@ def adicionar_pagamento_cashback_online(terminal, operador, sessao_operador, *, 
         if str(reserva.get("status") or "") != "RESERVADA":
             raise VendaConflictError("Reserva de Cashback não está ativa.")
 
-        pagamento = VendaPagamentoHub.objects.create(
-            operacao_uuid=operacao_uuid,
-            venda=venda,
-            forma_pagamento=None,
-            retaguarda_forma_pagamento_id=None,
-            codigo=CASHBACK,
-            descricao="Cashback Online",
-            tipo=CASHBACK,
-            num_parcelas=1,
-            gera_recebivel_bancario=False,
-            valor=valor,
-            autorizacao="",
-            cashback_origem=VendaPagamentoHub.CASHBACK_ORIGEM_CENTRAL,
-            cashback_reserva_id=reserva_id,
-            cashback_valor_reservado=valor,
-            origem_captura=VendaPagamentoHub.ORIGEM_MANUAL,
-            status=VendaPagamentoHub.STATUS_ATIVO,
-            terminal_inclusao=terminal_bloqueado,
-            operador_inclusao=operador,
-            sessao_operador_inclusao=sessao_operador,
-        )
-        registrar_evento(venda, VendaEventoHub.TIPO_PAGAMENTO_ADICIONADO, terminal_bloqueado, operador, sessao_operador, dados_pagamento(pagamento))
+        try:
+            pagamento = VendaPagamentoHub.objects.create(
+                operacao_uuid=operacao_uuid,
+                venda=venda,
+                forma_pagamento=None,
+                retaguarda_forma_pagamento_id=None,
+                codigo=CASHBACK,
+                descricao="Cashback Online",
+                tipo=CASHBACK,
+                num_parcelas=1,
+                gera_recebivel_bancario=False,
+                valor=valor,
+                autorizacao="",
+                cashback_origem=VendaPagamentoHub.CASHBACK_ORIGEM_CENTRAL,
+                cashback_reserva_id=reserva_id,
+                cashback_valor_reservado=valor,
+                origem_captura=VendaPagamentoHub.ORIGEM_MANUAL,
+                status=VendaPagamentoHub.STATUS_ATIVO,
+                terminal_inclusao=terminal_bloqueado,
+                operador_inclusao=operador,
+                sessao_operador_inclusao=sessao_operador,
+            )
+            registrar_evento(venda, VendaEventoHub.TIPO_PAGAMENTO_ADICIONADO, terminal_bloqueado, operador, sessao_operador, dados_pagamento(pagamento))
+        except Exception as exc:
+            transaction.set_rollback(True)
+            try:
+                _cancelar_reserva_confirmada(
+                    terminal_bloqueado.hub,
+                    reserva_id=reserva_id,
+                    venda_uuid=venda.venda_uuid,
+                    operacao_uuid=operacao_uuid,
+                )
+            except RetaguardaError as cancel_exc:
+                raise VendaConflictError(
+                    "Falha ao registrar pagamento de Cashback online após reserva confirmada. "
+                    f"Reserva {reserva_id} da operação {operacao_uuid} não foi cancelada automaticamente: {cancel_exc}. "
+                    f"Falha original: {exc}"
+                ) from exc
+            raise VendaConflictError(
+                "Falha ao registrar pagamento de Cashback online após reserva confirmada. "
+                f"Reserva {reserva_id} da operação {operacao_uuid} foi cancelada na Central. "
+                f"Falha original: {exc}"
+            ) from exc
     return venda, True
 
 
@@ -148,13 +180,11 @@ def liberar_reserva_pagamento_cashback(pagamento):
     if pagamento.cashback_origem != VendaPagamentoHub.CASHBACK_ORIGEM_CENTRAL or not pagamento.cashback_reserva_id:
         return
     try:
-        _client(pagamento.venda.hub).cashback_cancelar_reserva(
-            token=pagamento.venda.hub.retaguarda_token,
-            payload={
-                "reserva_id": pagamento.cashback_reserva_id,
-                "venda_uuid": str(pagamento.venda.venda_uuid),
-                "operacao_uuid": str(pagamento.operacao_uuid),
-            },
+        _cancelar_reserva_confirmada(
+            pagamento.venda.hub,
+            reserva_id=pagamento.cashback_reserva_id,
+            venda_uuid=pagamento.venda.venda_uuid,
+            operacao_uuid=pagamento.operacao_uuid,
         )
     except RetaguardaError as exc:
         raise VendaConflictError(f"Não foi possível liberar reserva de Cashback na Central: {exc}") from exc

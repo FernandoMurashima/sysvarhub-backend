@@ -677,6 +677,8 @@ def adicionar_pagamento_cashback(
             )
             if (pagamento_existente.tipo or "").upper() != CASHBACK:
                 raise VendaConflictError(ERRO_OPERACAO_PAGAMENTO_DIVERGENTE)
+            if pagamento_existente.cashback_origem != VendaPagamentoHub.CASHBACK_ORIGEM_LOCAL:
+                raise VendaConflictError(ERRO_OPERACAO_PAGAMENTO_DIVERGENTE)
             return venda, False
 
         if venda.vendedor_retaguarda_id is None:
