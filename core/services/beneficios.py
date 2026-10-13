@@ -75,8 +75,8 @@ def saldo_vale_troca(venda):
     return money(vales_abertos(venda, apenas_utilizaveis_offline=True).aggregate(total=Sum("saldo")).get("total") or ZERO)
 
 
-def validar_pagamento_beneficio(venda, forma, valor, autorizacao=""):
-    tipo = (forma.tipo or "").upper()
+def validar_pagamento_beneficio(venda, forma, valor, autorizacao="", tipo=None):
+    tipo = (tipo or getattr(forma, "tipo", "") or "").upper()
     if tipo == "CASHBACK":
         return validar_cashback(venda, valor)
     if tipo in ("TROCA", "VALE_TROCA"):

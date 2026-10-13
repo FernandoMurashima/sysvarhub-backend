@@ -87,6 +87,7 @@ from core.services.vendas import (
     VendaValidationError,
     adicionar_item,
     adicionar_pagamento,
+    adicionar_pagamento_cashback,
     alterar_quantidade_item,
     cancelar_venda,
     finalizar_venda,
@@ -951,6 +952,35 @@ class VendaPagamentoView(APIView):
                 prazo_pagamento_id=request.data.get("prazo_pagamento_id"),
                 valor=request.data.get("valor"),
                 autorizacao=request.data.get("autorizacao") or "",
+            )
+        except VendaNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except VendaValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except VendaConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except VendaError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {"venda": serializar_venda(venda)},
+            status=status.HTTP_201_CREATED if criado else status.HTTP_200_OK,
+        )
+
+
+class CashbackPagamentoView(APIView):
+    authentication_classes = [TerminalOperadorAuthentication]
+    permission_classes = [IsOperadorAuthenticated]
+
+    def post(self, request):
+        try:
+            venda, criado = adicionar_pagamento_cashback(
+                request.sysvar_terminal,
+                request.sysvar_operador,
+                request.sysvar_operador_sessao,
+                venda_uuid=request.data.get("venda_uuid"),
+                operacao_uuid=request.data.get("operacao_uuid"),
+                valor=request.data.get("valor"),
             )
         except VendaNotFoundError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)

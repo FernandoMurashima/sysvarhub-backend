@@ -45,6 +45,7 @@ QUANTIDADE_DECIMAL = Decimal("1")
 QUANTIDADE_ESTOQUE = Decimal("0.001")
 VALOR_PAGAMENTO_MAXIMO = Decimal("9999999999999999.99")
 DINHEIRO = "DINHEIRO"
+CASHBACK = "CASHBACK"
 ERRO_PAGAMENTO_ALTERAR_VENDA = "Remova os pagamentos antes de alterar a venda."
 ERRO_OPERACAO_PAGAMENTO_DIVERGENTE = "Operação de pagamento já utilizada com dados diferentes."
 
@@ -641,6 +642,90 @@ def adicionar_pagamento(
     return venda, True
 
 
+def adicionar_pagamento_cashback(
+    terminal,
+    operador,
+    sessao_operador,
+    *,
+    venda_uuid,
+    operacao_uuid,
+    valor,
+):
+    venda_uuid = validar_uuid_obrigatorio(venda_uuid, "Venda inválida.")
+    operacao_uuid = validar_uuid_obrigatorio(operacao_uuid, "Operação inválida.")
+    valor = validar_valor_pagamento(valor)
+
+    with transaction.atomic():
+        terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
+        obter_sessao_caixa_terminal(terminal_bloqueado)
+        venda = obter_venda_terminal_por_uuid_bloqueada(terminal_bloqueado, venda_uuid)
+        if venda.status != VendaHub.STATUS_ABERTA:
+            raise VendaConflictError("Venda não está aberta.")
+
+        pagamento_existente = (
+            VendaPagamentoHub.objects.select_for_update()
+            .filter(venda=venda, operacao_uuid=operacao_uuid)
+            .first()
+        )
+        if pagamento_existente:
+            validar_retry_pagamento(
+                pagamento_existente,
+                forma_pagamento_id=None,
+                prazo_pagamento_id=None,
+                valor=valor,
+                autorizacao="",
+            )
+            if (pagamento_existente.tipo or "").upper() != CASHBACK:
+                raise VendaConflictError(ERRO_OPERACAO_PAGAMENTO_DIVERGENTE)
+            return venda, False
+
+        if venda.vendedor_retaguarda_id is None:
+            raise VendaConflictError("Selecione um vendedor antes de registrar pagamentos.")
+
+        try:
+            validar_pagamento_beneficio(venda, None, valor, tipo=CASHBACK)
+        except ValueError as exc:
+            raise VendaConflictError(str(exc)) from exc
+
+        total_pago_atual = calcular_total_pago(venda)
+        pendente = calcular_pendente(venda, total_pago_atual)
+        if pendente <= ZERO_2:
+            raise VendaConflictError("Venda já está paga.")
+        if tem_troco(venda, total_pago_atual):
+            raise VendaConflictError("Venda já possui troco.")
+        if valor > pendente:
+            raise VendaConflictError("Cashback não pode gerar troco; use apenas o saldo pendente da venda.")
+
+        pagamento = VendaPagamentoHub.objects.create(
+            operacao_uuid=operacao_uuid,
+            venda=venda,
+            forma_pagamento=None,
+            retaguarda_forma_pagamento_id=None,
+            codigo=CASHBACK,
+            descricao="Cashback",
+            tipo=CASHBACK,
+            num_parcelas=1,
+            gera_recebivel_bancario=False,
+            valor=valor,
+            autorizacao="",
+            origem_captura=VendaPagamentoHub.ORIGEM_MANUAL,
+            status=VendaPagamentoHub.STATUS_ATIVO,
+            terminal_inclusao=terminal_bloqueado,
+            operador_inclusao=operador,
+            sessao_operador_inclusao=sessao_operador,
+        )
+        registrar_evento(
+            venda,
+            VendaEventoHub.TIPO_PAGAMENTO_ADICIONADO,
+            terminal_bloqueado,
+            operador,
+            sessao_operador,
+            dados_pagamento(pagamento),
+        )
+
+    return venda, True
+
+
 def remover_pagamento(terminal, operador, sessao_operador, *, pagamento_uuid):
     pagamento_uuid = validar_uuid_obrigatorio(pagamento_uuid, "Pagamento inválido.")
     with transaction.atomic():
@@ -735,7 +820,13 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
             if (pagamento.tipo or "").upper() == "VALE_TROCA":
                 continue
             try:
-                validar_pagamento_beneficio(venda, pagamento.forma_pagamento, pagamento.valor, pagamento.autorizacao)
+                validar_pagamento_beneficio(
+                    venda,
+                    pagamento.forma_pagamento,
+                    pagamento.valor,
+                    pagamento.autorizacao,
+                    tipo=pagamento.tipo,
+                )
             except ValueError as exc:
                 raise VendaConflictError(str(exc)) from exc
 

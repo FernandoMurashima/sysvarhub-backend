@@ -178,6 +178,35 @@ class PagamentoHubTestMixin(VendaHubTestMixin):
             format="json",
         )
 
+    def pagar_cashback(self, venda_uuid, valor="30.00", operacao_uuid=None):
+        return self.client.post(
+            "/api/terminal/venda/pagamento/cashback/",
+            {
+                "venda_uuid": venda_uuid,
+                "operacao_uuid": str(operacao_uuid or uuid.uuid4()),
+                "valor": valor,
+            },
+            format="json",
+        )
+
+    def criar_cashback_disponivel(self, cliente, saldo="200.00", **config_overrides):
+        dados_config = {
+            "hub": self.hub,
+            "retaguarda_id": 8000 + CashbackConfigHub.objects.count(),
+            "ativo": True,
+            "percentual": Decimal("0.0000"),
+            "sincronizado_em": timezone.now(),
+        }
+        dados_config.update(config_overrides)
+        CashbackConfigHub.objects.create(**dados_config)
+        return CashbackMovimentoHub.objects.create(
+            hub=self.hub,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            tipo=CashbackMovimentoHub.TIPO_CREDITO,
+            valor=Decimal(saldo),
+        )
+
     def finalizar(self, venda_uuid):
         return self.client.post(
             "/api/terminal/venda/finalizar/",
@@ -872,6 +901,111 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
 
         self.assertEqual(resposta.status_code, 201)
         self.assertEqual(resposta.data["venda"]["troco"], "0.10")
+
+    def test_adicionar_cashback_sem_forma_comercial_cadastrada(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(cliente)
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+
+        resposta = self.pagar_cashback(venda_uuid, "30.00")
+
+        pagamento = VendaPagamentoHub.objects.get()
+        self.assertEqual(resposta.status_code, 201)
+        self.assertIsNone(pagamento.forma_pagamento)
+        self.assertEqual(pagamento.codigo, "CASHBACK")
+        self.assertEqual(pagamento.tipo, "CASHBACK")
+        self.assertFalse(pagamento.gera_recebivel_bancario)
+
+    def test_cashback_sem_forma_comercial_valida_saldo_minimo_limite_e_troco(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(
+            cliente,
+            saldo="500.00",
+            valor_minimo_uso=Decimal("10.00"),
+            limite_uso_percentual=Decimal("50.0000"),
+        )
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+
+        minimo = self.pagar_cashback(venda_uuid, "5.00")
+        limite = self.pagar_cashback(venda_uuid, "120.00")
+        saldo = self.pagar_cashback(venda_uuid, "600.00")
+        permitido = self.pagar_cashback(venda_uuid, "50.00")
+        segundo_cashback = self.pagar_cashback(venda_uuid, "60.00")
+
+        self.assertEqual(minimo.status_code, 409)
+        self.assertEqual(minimo.data["detail"], "O valor de cashback usado é menor que o mínimo configurado.")
+        self.assertEqual(limite.status_code, 409)
+        self.assertEqual(limite.data["detail"], "O cashback usado ultrapassa o limite permitido para a venda.")
+        self.assertEqual(saldo.status_code, 409)
+        self.assertEqual(saldo.data["detail"], "O cashback informado é maior que o saldo disponível do cliente.")
+        self.assertEqual(permitido.status_code, 201)
+        self.assertEqual(segundo_cashback.status_code, 201)
+
+    def test_cashback_sem_forma_comercial_nao_gera_troco(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(cliente, saldo="500.00")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        self.pagar(venda_uuid, self.pix, "150.00")
+
+        resposta = self.pagar_cashback(venda_uuid, "60.00")
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(resposta.data["detail"], "Cashback não pode gerar troco; use apenas o saldo pendente da venda.")
+
+    def test_retry_cashback_sem_forma_comercial_nao_duplica(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(cliente)
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        operacao_uuid = uuid.uuid4()
+
+        primeira = self.pagar_cashback(venda_uuid, "30.00", operacao_uuid=operacao_uuid)
+        segunda = self.pagar_cashback(venda_uuid, "30.00", operacao_uuid=operacao_uuid)
+        divergente = self.pagar_cashback(venda_uuid, "31.00", operacao_uuid=operacao_uuid)
+
+        self.assertEqual(primeira.status_code, 201)
+        self.assertEqual(segunda.status_code, 200)
+        self.assertEqual(divergente.status_code, 409)
+        self.assertEqual(VendaPagamentoHub.objects.count(), 1)
+        self.assertEqual(
+            VendaEventoHub.objects.filter(tipo=VendaEventoHub.TIPO_PAGAMENTO_ADICIONADO).count(),
+            1,
+        )
+
+    def test_venda_mista_com_cashback_sem_forma_comercial_finaliza(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(cliente, saldo="50.00", percentual=Decimal("5.0000"))
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+
+        cashback = self.pagar_cashback(venda_uuid, "30.00")
+        pix = self.pagar(venda_uuid, self.pix, "169.90")
+        VendaHub.objects.filter(venda_uuid=venda_uuid).update(documento="VMISTA01")
+        finalizacao = self.finalizar(venda_uuid)
+
+        self.assertEqual(cashback.status_code, 201)
+        self.assertEqual(pix.status_code, 201)
+        self.assertEqual(finalizacao.status_code, 200, finalizacao.data)
+        self.assertTrue(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_DEBITO, valor=Decimal("30.00")).exists())
+
+    def test_payload_sync_cashback_sem_forma_comercial_mantem_tipo_reconhecivel(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(cliente)
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        self.pagar_cashback(venda_uuid, "30.00")
+        self.pagar(venda_uuid, self.pix, "169.90")
+
+        evento = enfileirar_venda_finalizada(VendaHub.objects.get(venda_uuid=venda_uuid))
+        cashback_payload = next(pagamento for pagamento in evento.payload["pagamentos"] if pagamento["tipo"] == "CASHBACK")
+
+        self.assertEqual(cashback_payload["codigo"], "CASHBACK")
+        self.assertEqual(cashback_payload["descricao"], "Cashback")
+        self.assertIsNone(cashback_payload["forma_pagamento_id"])
+        self.assertEqual(cashback_payload["valor"], "30.00")
 
     def test_multiplos_pagamentos(self):
         venda_uuid = self.criar_venda_com_item()
