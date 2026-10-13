@@ -6,6 +6,7 @@ from django.db import connection, transaction
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
+from rest_framework.test import APIClient
 
 from core.models import (
     CatalogoItemHub,
@@ -932,7 +933,8 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         limite = self.pagar_cashback(venda_uuid, "120.00")
         saldo = self.pagar_cashback(venda_uuid, "600.00")
         permitido = self.pagar_cashback(venda_uuid, "50.00")
-        segundo_cashback = self.pagar_cashback(venda_uuid, "60.00")
+        segundo_cashback = self.pagar_cashback(venda_uuid, "40.00")
+        acumulado_limite = self.pagar_cashback(venda_uuid, "10.00")
 
         self.assertEqual(minimo.status_code, 409)
         self.assertEqual(minimo.data["detail"], "O valor de cashback usado é menor que o mínimo configurado.")
@@ -942,6 +944,21 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(saldo.data["detail"], "O cashback informado é maior que o saldo disponível do cliente.")
         self.assertEqual(permitido.status_code, 201)
         self.assertEqual(segundo_cashback.status_code, 201)
+        self.assertEqual(acumulado_limite.status_code, 409)
+        self.assertEqual(acumulado_limite.data["detail"], "O cashback usado ultrapassa o limite permitido para a venda.")
+
+    def test_cashback_sem_forma_comercial_rejeita_soma_acima_do_saldo(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(cliente, saldo="80.00")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+
+        primeiro = self.pagar_cashback(venda_uuid, "50.00")
+        segundo = self.pagar_cashback(venda_uuid, "31.00")
+
+        self.assertEqual(primeiro.status_code, 201)
+        self.assertEqual(segundo.status_code, 409)
+        self.assertEqual(segundo.data["detail"], "O cashback informado é maior que o saldo disponível do cliente.")
 
     def test_cashback_sem_forma_comercial_nao_gera_troco(self):
         cliente = self.criar_cliente()
@@ -990,6 +1007,87 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(pix.status_code, 201)
         self.assertEqual(finalizacao.status_code, 200, finalizacao.data)
         self.assertTrue(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_DEBITO, valor=Decimal("30.00")).exists())
+
+    def test_multiplos_cashbacks_geram_debito_unico_total_e_finalizacao_idempotente(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(cliente, saldo="100.00")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        self.pagar_cashback(venda_uuid, "30.00")
+        self.pagar_cashback(venda_uuid, "20.00")
+        self.pagar(venda_uuid, self.pix, "149.90")
+        VendaHub.objects.filter(venda_uuid=venda_uuid).update(documento="VCASH01")
+
+        primeira = self.finalizar(venda_uuid)
+        segunda = self.finalizar(venda_uuid)
+
+        debitos = CashbackMovimentoHub.objects.filter(venda__venda_uuid=venda_uuid, tipo=CashbackMovimentoHub.TIPO_DEBITO)
+        self.assertEqual(primeira.status_code, 200, primeira.data)
+        self.assertEqual(segunda.status_code, 200, segunda.data)
+        self.assertEqual(debitos.count(), 1)
+        self.assertEqual(debitos.get().valor, Decimal("50.00"))
+
+    def test_cashback_revalida_saldo_na_finalizacao_em_disputa_de_terminais(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(cliente, saldo="80.00")
+        venda_uuid_1 = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        self.pagar_cashback(venda_uuid_1, "80.00")
+        self.pagar(venda_uuid_1, self.pix, "119.90")
+        VendaHub.objects.filter(venda_uuid=venda_uuid_1).update(documento="VCASH02")
+
+        terminal_2 = configurar_terminal(self.hub, "PDV-02", "PDV 02", 29)
+        token_terminal_2 = terminal_2.gerar_token()
+        terminal_2.save()
+        sessao_operador_2, token_operador_2 = self.criar_sessao_operador(terminal_2, self.operador)
+        cliente_2 = APIClient()
+        cliente_2.credentials(
+            HTTP_AUTHORIZATION=f"Terminal {token_terminal_2}",
+            HTTP_X_SYSVAR_OPERADOR_SESSION=token_operador_2,
+        )
+        cliente_2.post("/api/terminal/venda/iniciar/", {}, format="json")
+        venda_2 = cliente_2.post(
+            "/api/terminal/venda/item/",
+            {"sku_id": self.catalogo_item.retaguarda_sku_id, "quantidade": 1},
+            format="json",
+        ).data["venda"]["uuid"]
+        cliente_2.put("/api/terminal/venda/cliente/", {"cliente_uuid": str(cliente.cliente_uuid)}, format="json")
+        vendedor = self.criar_vendedor_pagamento(retaguarda_id=9902)
+        cliente_2.put("/api/terminal/venda/vendedor/", {"vendedor_id": vendedor.retaguarda_id}, format="json")
+        pagamento_cashback_2 = cliente_2.post(
+            "/api/terminal/venda/pagamento/cashback/",
+            {"venda_uuid": venda_2, "operacao_uuid": str(uuid.uuid4()), "valor": "80.00"},
+            format="json",
+        )
+        pagamento_pix_2 = cliente_2.post(
+            "/api/terminal/venda/pagamento/",
+            {
+                "venda_uuid": venda_2,
+                "operacao_uuid": str(uuid.uuid4()),
+                "forma_pagamento_id": self.pix.id,
+                "valor": "119.90",
+            },
+            format="json",
+        )
+        VendaHub.objects.filter(venda_uuid=venda_2).update(documento="VCASH03")
+
+        primeira = self.finalizar(venda_uuid_1)
+        segunda = cliente_2.post("/api/terminal/venda/finalizar/", {"venda_uuid": venda_2}, format="json")
+
+        self.assertEqual(pagamento_cashback_2.status_code, 201)
+        self.assertEqual(pagamento_pix_2.status_code, 201)
+        self.assertEqual(primeira.status_code, 200, primeira.data)
+        self.assertEqual(segunda.status_code, 409)
+        self.assertEqual(segunda.data["detail"], "O cashback informado é maior que o saldo disponível do cliente.")
+        self.assertEqual(
+            CashbackMovimentoHub.objects.filter(cliente_retaguarda_id=cliente.retaguarda_id, tipo=CashbackMovimentoHub.TIPO_DEBITO).count(),
+            1,
+        )
+        saldo = sum(
+            mov.valor if mov.tipo == CashbackMovimentoHub.TIPO_CREDITO else -mov.valor
+            for mov in CashbackMovimentoHub.objects.filter(cliente_retaguarda_id=cliente.retaguarda_id)
+        )
+        self.assertEqual(saldo, Decimal("0.00"))
 
     def test_payload_sync_cashback_sem_forma_comercial_mantem_tipo_reconhecivel(self):
         cliente = self.criar_cliente()

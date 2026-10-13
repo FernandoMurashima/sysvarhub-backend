@@ -682,8 +682,9 @@ def adicionar_pagamento_cashback(
         if venda.vendedor_retaguarda_id is None:
             raise VendaConflictError("Selecione um vendedor antes de registrar pagamentos.")
 
+        bloquear_cliente_cashback(venda)
         try:
-            validar_pagamento_beneficio(venda, None, valor, tipo=CASHBACK)
+            validar_pagamento_beneficio(venda, None, valor, tipo=CASHBACK, bloquear_saldo=True)
         except ValueError as exc:
             raise VendaConflictError(str(exc)) from exc
 
@@ -816,8 +817,22 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
             raise VendaConflictError("Pagamento insuficiente.")
         if total_pago > venda.total and not any(pagamento.tipo == DINHEIRO for pagamento in pagamentos):
             raise VendaConflictError("Valor do pagamento excede o valor pendente.")
+        total_cashback = calcular_total_cashback_lista(pagamentos)
+        if total_cashback > ZERO_2:
+            bloquear_cliente_cashback(venda)
+            try:
+                validar_pagamento_beneficio(
+                    venda,
+                    None,
+                    total_cashback,
+                    tipo=CASHBACK,
+                    total_beneficio=total_cashback,
+                    bloquear_saldo=True,
+                )
+            except ValueError as exc:
+                raise VendaConflictError(str(exc)) from exc
         for pagamento in pagamentos:
-            if (pagamento.tipo or "").upper() == "VALE_TROCA":
+            if (pagamento.tipo or "").upper() in ("CASHBACK", "VALE_TROCA"):
                 continue
             try:
                 validar_pagamento_beneficio(
@@ -1383,6 +1398,19 @@ def validar_retry_pagamento(pagamento, *, forma_pagamento_id, prazo_pagamento_id
         raise VendaConflictError(ERRO_OPERACAO_PAGAMENTO_DIVERGENTE)
 
 
+def bloquear_cliente_cashback(venda):
+    if venda.cliente_retaguarda_id:
+        ClienteHub.objects.select_for_update().filter(
+            hub=venda.hub,
+            retaguarda_id=venda.cliente_retaguarda_id,
+        ).first()
+    elif venda.cliente_uuid:
+        ClienteHub.objects.select_for_update().filter(
+            hub=venda.hub,
+            cliente_uuid=venda.cliente_uuid,
+        ).first()
+
+
 def obter_venda_terminal_por_uuid_bloqueada(terminal, venda_uuid):
     venda = (
         VendaHub.objects.select_for_update()
@@ -1407,6 +1435,11 @@ def calcular_total_pago(venda):
 
 def calcular_total_pago_lista(pagamentos):
     total = sum((pagamento.valor for pagamento in pagamentos), ZERO_2)
+    return money(total)
+
+
+def calcular_total_cashback_lista(pagamentos):
+    total = sum((pagamento.valor for pagamento in pagamentos if (pagamento.tipo or "").upper() == CASHBACK), ZERO_2)
     return money(total)
 
 
