@@ -201,7 +201,7 @@ def consultar_venda_para_devolucao_por_documento_local(terminal, documento):
     if not termo:
         raise VendaValidationError("Informe a venda ou cupom para devolução.")
     qs = VendaHub.objects.filter(hub=terminal.hub, status=VendaHub.STATUS_FINALIZADA).prefetch_related("itens")
-    filtros = models.Q()
+    filtros = models.Q(documento="".join(termo.split()))
     try:
         filtros |= models.Q(venda_uuid=uuid.UUID(termo))
     except (TypeError, ValueError, AttributeError):
@@ -349,6 +349,7 @@ def serializar_venda_devolucao(venda):
     }
     return {
         "uuid": str(venda.venda_uuid),
+        "documento": venda.documento,
         "cliente": {"id": venda.cliente_retaguarda_id, "uuid": str(venda.cliente_uuid) if venda.cliente_uuid else None, "nome": venda.cliente_nome},
         "total": f"{venda.total:.2f}",
         "itens": [
