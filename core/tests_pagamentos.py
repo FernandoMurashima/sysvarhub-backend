@@ -14,6 +14,7 @@ from core.models import (
     CashbackMovimentoHub,
     ConfiguracaoFiscalHub,
     EventoSyncHub,
+    FaixaNumeracaoDevolucaoHub,
     EstoqueMovimentoHub,
     FaixaNumeracaoVendaHub,
     FormaPagamentoCondicaoHub,
@@ -36,9 +37,10 @@ from core.models import (
     VendaDevolucaoHub,
 )
 from core.services.caixa import fechar_caixa
+from core.services.devolucoes import finalizar_devolucao_manual_offline
 from core.services.sync import enfileirar_venda_finalizada, sincronizar_eventos_pendentes
 from core.services.terminais import configurar_terminal
-from core.services.vendas import calcular_disponivel_local, listar_formas_pagamento
+from core.services.vendas import VendaConflictError, calcular_disponivel_local, listar_formas_pagamento
 from core.tests_caixa import criar_hub
 from core.tests_vendas import VendaHubTestMixin
 from integracao.services.retaguarda import RetaguardaError
@@ -59,6 +61,11 @@ FISCAL_ITEM_NFCE = {
 MENSAGEM_CASHBACK_VALE_TROCA = (
     "Cashback não pode ser usado junto com Vale-Troca. "
     "Realize a venda com Cashback separadamente da troca."
+)
+MENSAGEM_DEVOLUCAO_MANUAL_OFFLINE = (
+    "Não é possível realizar esta troca offline. "
+    "A venda original não está registrada nesta loja. "
+    "Aguarde a conexão com a Central."
 )
 
 
@@ -627,6 +634,7 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
 
     def test_devolucao_gera_vale_local_e_evento_sync(self):
         cliente = self.criar_cliente()
+        FaixaNumeracaoDevolucaoHub.objects.create(hub=self.hub, inicio=1, fim=9999, proximo_numero=1)
         venda_uuid = self.criar_venda_com_item()
         self.put_cliente(cliente)
         self.assertEqual(self.pagar(venda_uuid, self.dinheiro, "199.90").status_code, 201)
@@ -648,6 +656,136 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(VendaDevolucaoHub.objects.count(), 1)
         self.assertEqual(ValeTrocaHub.objects.filter(documento__startswith="VT-HUB-").count(), 1)
         self.assertEqual(EventoSyncHub.objects.filter(tipo="DEVOLUCAO_FINALIZADA").count(), 1)
+
+    def test_devolucao_manual_offline_sem_venda_local_bloqueada_sem_efeitos(self):
+        cliente = self.criar_cliente()
+        estoque_fisico = self.catalogo_item.estoque_fisico
+        estoque_disponivel = self.catalogo_item.estoque_disponivel
+
+        resposta = self.client.post(
+            "/api/terminal/devolucoes/finalizar/",
+            {
+                "documento_venda": "VENDA-OUTRA-LOJA",
+                "motivo": "Troca manual offline",
+                "itens": [
+                    {
+                        "sku_retaguarda_id": self.catalogo_item.retaguarda_sku_id,
+                        "ean": self.catalogo_item.ean13,
+                        "descricao": self.catalogo_item.descricao,
+                        "quantidade": 1,
+                        "valor_liquido": "199.90",
+                        "cliente_uuid": str(cliente.cliente_uuid),
+                        "cliente_documento": cliente.documento,
+                    }
+                ],
+            },
+            format="json",
+        )
+
+        self.catalogo_item.refresh_from_db()
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(resposta.data["detail"], MENSAGEM_DEVOLUCAO_MANUAL_OFFLINE)
+        self.assertEqual(VendaDevolucaoHub.objects.count(), 0)
+        self.assertEqual(ValeTrocaHub.objects.count(), 0)
+        self.assertEqual(ValeTrocaMovimentoHub.objects.count(), 0)
+        self.assertEqual(EventoSyncHub.objects.filter(tipo="DEVOLUCAO_FINALIZADA").count(), 0)
+        self.assertEqual(EstoqueMovimentoHub.objects.count(), 0)
+        self.assertEqual(self.catalogo_item.estoque_fisico, estoque_fisico)
+        self.assertEqual(self.catalogo_item.estoque_disponivel, estoque_disponivel)
+
+    def test_finalizar_devolucao_manual_offline_direto_bloqueado_sem_efeitos(self):
+        cliente = self.criar_cliente()
+        estoque_fisico = self.catalogo_item.estoque_fisico
+        estoque_disponivel = self.catalogo_item.estoque_disponivel
+
+        with self.assertRaisesMessage(VendaConflictError, MENSAGEM_DEVOLUCAO_MANUAL_OFFLINE):
+            finalizar_devolucao_manual_offline(
+                self.terminal,
+                self.operador,
+                documento_venda="MANUAL-SEM-VENDA",
+                motivo="Troca manual offline",
+                itens=[
+                    {
+                        "sku_retaguarda_id": self.catalogo_item.retaguarda_sku_id,
+                        "ean": self.catalogo_item.ean13,
+                        "descricao": self.catalogo_item.descricao,
+                        "quantidade": 1,
+                        "valor_liquido": "199.90",
+                        "cliente_uuid": str(cliente.cliente_uuid),
+                    }
+                ],
+            )
+
+        self.catalogo_item.refresh_from_db()
+        self.assertEqual(VendaDevolucaoHub.objects.count(), 0)
+        self.assertEqual(ValeTrocaHub.objects.count(), 0)
+        self.assertEqual(ValeTrocaMovimentoHub.objects.count(), 0)
+        self.assertEqual(EventoSyncHub.objects.filter(tipo="DEVOLUCAO_FINALIZADA").count(), 0)
+        self.assertEqual(EstoqueMovimentoHub.objects.count(), 0)
+        self.assertEqual(self.catalogo_item.estoque_fisico, estoque_fisico)
+        self.assertEqual(self.catalogo_item.estoque_disponivel, estoque_disponivel)
+
+    def test_devolucao_online_preservada_para_venda_validada_na_central(self):
+        cliente = self.criar_cliente(retaguarda_id=123)
+        payload_central = {
+            "devolucao": {
+                "id": 901,
+                "documento": "DEVONLINE01",
+                "valor_total": "50.00",
+                "motivo": "Troca online",
+                "cliente": {"id": cliente.retaguarda_id},
+                "venda_origem": {
+                    "id": 501,
+                    "documento": "VENDA-501",
+                    "cliente": {"id": cliente.retaguarda_id},
+                    "loja_origem": {"id": 99, "nome": "Outra Loja"},
+                },
+                "itens": [
+                    {
+                        "sku": self.catalogo_item.retaguarda_sku_id,
+                        "produto": self.catalogo_item.retaguarda_produto_id,
+                        "ean": self.catalogo_item.ean13,
+                        "descricao": self.catalogo_item.descricao,
+                        "quantidade": 1,
+                        "preco_unitario": "50.00",
+                        "total_item": "50.00",
+                    }
+                ],
+                "vale_troca": {
+                    "id": 777,
+                    "documento": "VT0000777",
+                    "valor_original": "50.00",
+                    "saldo": "50.00",
+                    "status": ValeTrocaHub.STATUS_ABERTO,
+                },
+            }
+        }
+
+        with (
+            patch("core.services.devolucoes.calcular_status_central", return_value={"status": "ONLINE"}),
+            patch("core.services.devolucoes.RetaguardaClient") as client_cls,
+        ):
+            client_cls.return_value.devolucao_finalizar.return_value = payload_central
+            resposta = self.client.post(
+                "/api/terminal/devolucoes/finalizar/",
+                {
+                    "venda_id": 501,
+                    "documento_venda": "VENDA-501",
+                    "motivo": "Troca online",
+                    "itens": [{"sku_id": self.catalogo_item.retaguarda_sku_id, "quantidade": 1}],
+                },
+                format="json",
+            )
+
+        self.assertEqual(resposta.status_code, 201, resposta.data)
+        client_cls.return_value.devolucao_finalizar.assert_called_once()
+        devolucao = VendaDevolucaoHub.objects.get()
+        self.assertEqual(devolucao.retaguarda_id, 901)
+        self.assertEqual(devolucao.venda_origem_retaguarda_id, 501)
+        vale = ValeTrocaHub.objects.get()
+        self.assertEqual(vale.retaguarda_id, 777)
+        self.assertEqual(vale.documento, "VT0000777")
+        self.assertEqual(vale.saldo, Decimal("50.00"))
 
     def test_consulta_beneficios_nao_bloqueia_e_separa_saldos_offline_retaguarda(self):
         cliente = self.criar_cliente(cashback_saldo_retaguarda=Decimal("80.00"))

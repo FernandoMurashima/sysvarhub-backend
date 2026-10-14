@@ -12,6 +12,13 @@ from core.services.vendas import VendaConflictError, VendaNotFoundError, VendaVa
 from integracao.services.retaguarda import RetaguardaClient, RetaguardaCredencialInvalidaError, RetaguardaError
 
 
+ERRO_DEVOLUCAO_MANUAL_OFFLINE_SEM_VENDA_LOCAL = (
+    "Não é possível realizar esta troca offline. "
+    "A venda original não está registrada nesta loja. "
+    "Aguarde a conexão com a Central."
+)
+
+
 def _exigir_central_online(hub):
     status = calcular_status_central(hub)
     if status["status"] != CENTRAL_STATUS_ONLINE:
@@ -213,14 +220,7 @@ def finalizar_devolucao(terminal, operador, *, venda_uuid=None, venda_id=None, d
     if not venda_id and venda_uuid:
         return finalizar_devolucao_local(terminal, operador, venda_uuid=venda_uuid, itens=itens, motivo=motivo, devolucao_uuid=devolucao_uuid)
     if not venda_id and not venda_uuid:
-        return finalizar_devolucao_manual_offline(
-            terminal,
-            operador,
-            documento_venda=documento_venda,
-            itens=itens,
-            motivo=motivo,
-            devolucao_uuid=devolucao_uuid,
-        )
+        raise VendaConflictError(ERRO_DEVOLUCAO_MANUAL_OFFLINE_SEM_VENDA_LOCAL)
     return finalizar_devolucao_online(
         terminal,
         operador,
@@ -339,103 +339,7 @@ def finalizar_devolucao_local(terminal, operador, *, venda_uuid, itens, motivo="
 
 
 def finalizar_devolucao_manual_offline(terminal, operador, *, documento_venda="", itens, motivo="", devolucao_uuid=None):
-    _exigir_central_offline(terminal.hub)
-    if not itens:
-        raise VendaValidationError("Informe os itens da devolução.")
-    documento_venda = str(documento_venda or "").strip()
-    if not documento_venda:
-        raise VendaValidationError("Informe o documento/cupom original.")
-    devolucao_uuid = uuid.UUID(str(devolucao_uuid or uuid.uuid4()))
-    with transaction.atomic():
-        existente = VendaDevolucaoHub.objects.select_for_update().filter(hub=terminal.hub, devolucao_uuid=devolucao_uuid).first()
-        if existente:
-            return existente
-        cliente = _cliente_manual(terminal.hub, itens)
-        linhas = []
-        total = Decimal("0.00")
-        for entrada in itens:
-            catalogo = _catalogo_manual(terminal.hub, entrada)
-            quantidade = int(entrada.get("quantidade") or 0)
-            if quantidade <= 0:
-                raise VendaValidationError("Quantidade devolvida inválida.")
-            valor_liquido = money(Decimal(str(entrada.get("valor_liquido") or entrada.get("total_item") or 0)))
-            if valor_liquido <= 0:
-                raise VendaValidationError("Valor líquido original do item é obrigatório.")
-            total = money(total + valor_liquido)
-            linhas.append((entrada, catalogo, quantidade, valor_liquido))
-        if total <= 0:
-            raise VendaValidationError("Valor da devolução inválido.")
-        try:
-            documento = consumir_documento_devolucao(terminal.hub)
-        except NumeracaoDevolucaoHubError as exc:
-            raise VendaConflictError(str(exc)) from exc
-
-        dados_origem = {
-            "documento_original": documento_venda,
-            "loja_origem_retaguarda_id": _int_or_none((itens[0] or {}).get("loja_origem_retaguarda_id")),
-            "loja_origem_nome": str((itens[0] or {}).get("loja_origem_nome") or "")[:150],
-            "data_venda_original": str((itens[0] or {}).get("data_venda_original") or ""),
-            "cliente_documento": cliente.documento,
-            "cliente_nome": cliente.nome_cliente,
-        }
-        devolucao = VendaDevolucaoHub.objects.create(
-            devolucao_uuid=devolucao_uuid,
-            hub=terminal.hub,
-            documento=documento,
-            venda_origem=None,
-            venda_origem_documento=documento_venda,
-            loja_origem_retaguarda_id=dados_origem["loja_origem_retaguarda_id"],
-            loja_origem_nome=dados_origem["loja_origem_nome"],
-            operador=operador,
-            terminal=terminal,
-            cliente_uuid=cliente.cliente_uuid,
-            cliente_retaguarda_id=cliente.retaguarda_id,
-            motivo=str(motivo or "")[:255],
-            valor_total=total,
-            origem=VendaDevolucaoHub.ORIGEM_MANUAL_OUTRA_LOJA,
-            dados_origem=dados_origem,
-            finalizada_em=timezone.now(),
-        )
-        for entrada, catalogo, quantidade, valor in linhas:
-            VendaDevolucaoItemHub.objects.create(
-                devolucao=devolucao,
-                venda_item=None,
-                catalogo_item=catalogo,
-                retaguarda_produto_id=catalogo.retaguarda_produto_id,
-                retaguarda_sku_id=catalogo.retaguarda_sku_id,
-                ean13=str(entrada.get("ean") or catalogo.ean13 or "")[:13],
-                descricao=str(entrada.get("descricao") or catalogo.descricao)[:200],
-                quantidade=quantidade,
-                preco_unitario=money(valor / Decimal(quantidade)),
-                desconto=Decimal("0.00"),
-                total_item=valor,
-            )
-            CatalogoItemHub.objects.filter(pk=catalogo.pk).update(
-                estoque_fisico=models.F("estoque_fisico") + Decimal(quantidade),
-                estoque_disponivel=models.F("estoque_disponivel") + Decimal(quantidade),
-            )
-        vale = ValeTrocaHub.objects.create(
-            hub=terminal.hub,
-            devolucao=devolucao,
-            cliente_uuid=cliente.cliente_uuid,
-            cliente_retaguarda_id=cliente.retaguarda_id,
-            documento=f"VT-HUB-{devolucao.devolucao_uuid.hex[:20]}",
-            valor_original=total,
-            saldo=total,
-            status=ValeTrocaHub.STATUS_ABERTO,
-            origem_devolucao_uuid=devolucao.devolucao_uuid,
-            origem=ValeTrocaHub.ORIGEM_HUB_PROVISORIO,
-            provisorio=True,
-        )
-        ValeTrocaMovimentoHub.objects.create(
-            vale=vale,
-            tipo=ValeTrocaMovimentoHub.TIPO_CREDITO,
-            valor=total,
-            saldo_apos=total,
-            observacao=f"Crédito provisório gerado pela devolução Hub {devolucao.devolucao_uuid}",
-        )
-        transaction.on_commit(lambda devolucao_id=devolucao.pk: enfileirar_devolucao_finalizada(VendaDevolucaoHub.objects.get(pk=devolucao_id)))
-    return devolucao
+    raise VendaConflictError(ERRO_DEVOLUCAO_MANUAL_OFFLINE_SEM_VENDA_LOCAL)
 
 
 def serializar_venda_devolucao(venda):
