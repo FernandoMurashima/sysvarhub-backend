@@ -27,7 +27,7 @@ from core.models import (
     VendedorHub,
 )
 from core.services.caixa import obter_caixa_terminal, obter_sessao_caixa_aberta
-from core.services.beneficios import aplicar_promocao, registrar_beneficios_venda, validar_pagamento_beneficio
+from core.services.beneficios import aplicar_promocao, registrar_beneficios_venda, validar_cashback_vale_troca_exclusivos, validar_pagamento_beneficio
 from core.services.operadores import serializar_operador
 from core.services.nfce import (
     NFCeErroDominio,
@@ -817,6 +817,10 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
         )
         if not pagamentos:
             raise VendaConflictError("Venda sem pagamento.")
+        try:
+            validar_cashback_vale_troca_exclusivos(venda, pagamentos=pagamentos)
+        except ValueError as exc:
+            raise VendaConflictError(str(exc)) from exc
 
         total_pago = calcular_total_pago_lista(pagamentos)
         if total_pago < venda.total:

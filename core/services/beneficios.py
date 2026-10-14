@@ -9,6 +9,11 @@ from core.models import CashbackConfigHub, CashbackMovimentoHub, PromocaoHub, Va
 
 
 ZERO = Decimal("0.00")
+ERRO_CASHBACK_VALE_TROCA = (
+    "Cashback não pode ser usado junto com Vale-Troca. "
+    "Realize a venda com Cashback separadamente da troca."
+)
+TIPOS_VALE_TROCA = {"TROCA", "VALE_TROCA"}
 
 
 def money(valor):
@@ -91,6 +96,7 @@ def validar_cashback(venda, valor, *, total_cashback=None, bloquear_saldo=False)
     valor = money(valor)
     total_cashback = money(total_cashback if total_cashback is not None else total_cashback_ativo(venda) + valor)
     total_cashback_local = money(total_cashback_local_ativo(venda) + valor)
+    validar_cashback_vale_troca_exclusivos(venda, novo_tipo="CASHBACK")
     if not config:
         raise ValueError("Não existe regra de cashback ativa.")
     if cliente_padrao(venda) and not config.consumidor_final_participa:
@@ -148,6 +154,7 @@ def validar_cashback_central(venda, valor):
     config = cashback_config_ativa(venda.hub)
     valor = money(valor)
     total_cashback = money(total_cashback_ativo(venda) + valor)
+    validar_cashback_vale_troca_exclusivos(venda, novo_tipo="CASHBACK")
     if not config:
         raise ValueError("Não existe regra de cashback ativa.")
     if cliente_padrao(venda) and not config.consumidor_final_participa:
@@ -165,6 +172,7 @@ def validar_cashback_central(venda, valor):
 
 
 def validar_vale_troca(venda, valor, autorizacao=""):
+    validar_cashback_vale_troca_exclusivos(venda, novo_tipo="VALE_TROCA")
     if cliente_padrao(venda):
         raise ValueError("Troca exige cliente identificado.")
     documento = str(autorizacao or "").strip()
@@ -213,6 +221,7 @@ def aplicar_promocao(catalogo_item, quantidade):
 
 def registrar_beneficios_venda(venda, pagamentos):
     with transaction.atomic():
+        validar_cashback_vale_troca_exclusivos(venda, pagamentos=pagamentos)
         total_cashback_local = money(sum(
             (
                 p.valor
@@ -242,6 +251,8 @@ def registrar_beneficios_venda(venda, pagamentos):
 def _gerar_cashback(venda, pagamentos):
     config = cashback_config_ativa(venda.hub)
     if not config or (cliente_padrao(venda) and not config.consumidor_final_participa):
+        return
+    if any(pagamento_e_vale_troca(pagamento) for pagamento in pagamentos):
         return
     usado = sum((p.valor for p in pagamentos if (p.tipo or "").upper() == "CASHBACK"), ZERO)
     base_itens = sum(
@@ -294,6 +305,32 @@ def _filtrar_cliente(qs, venda):
     if venda.cliente_retaguarda_id:
         return qs.filter(cliente_retaguarda_id=venda.cliente_retaguarda_id)
     return qs.filter(cliente_uuid=venda.cliente_uuid)
+
+
+def pagamento_e_cashback(pagamento):
+    return (getattr(pagamento, "tipo", "") or "").upper() == "CASHBACK"
+
+
+def pagamento_e_vale_troca(pagamento):
+    tipo = (getattr(pagamento, "tipo", "") or "").upper()
+    return tipo in TIPOS_VALE_TROCA or bool(
+        getattr(pagamento, "vale_troca_documento", "")
+        or getattr(pagamento, "vale_troca_reserva_id", None)
+    )
+
+
+def validar_cashback_vale_troca_exclusivos(venda, *, pagamentos=None, novo_tipo=None):
+    novo_tipo = (novo_tipo or "").upper()
+    if pagamentos is None:
+        pagamentos = list(venda.pagamentos.filter(status="ATIVO"))
+    tem_cashback = any(pagamento_e_cashback(pagamento) for pagamento in pagamentos)
+    tem_vale_troca = any(pagamento_e_vale_troca(pagamento) for pagamento in pagamentos)
+    if novo_tipo == "CASHBACK":
+        tem_cashback = True
+    if novo_tipo in TIPOS_VALE_TROCA:
+        tem_vale_troca = True
+    if tem_cashback and tem_vale_troca:
+        raise ValueError(ERRO_CASHBACK_VALE_TROCA)
 
 
 def _total_pago_outros(venda, *tipos_excluidos):

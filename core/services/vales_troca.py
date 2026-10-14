@@ -4,7 +4,7 @@ import re
 from django.db import transaction
 
 from core.models import ValeTrocaHub, VendaEventoHub, VendaHub, VendaPagamentoHub
-from core.services.beneficios import vales_abertos
+from core.services.beneficios import validar_cashback_vale_troca_exclusivos, vales_abertos
 from core.services.vendas import (
     DINHEIRO,
     ZERO_2,
@@ -99,15 +99,19 @@ def adicionar_pagamento_vale_troca(terminal, operador, sessao_operador, *, venda
         venda = obter_venda_terminal_por_uuid_bloqueada(terminal_bloqueado, venda_uuid)
         if venda.status != VendaHub.STATUS_ABERTA:
             raise VendaConflictError("Venda não está aberta.")
-        if not venda.cliente_retaguarda_id:
-            raise VendaConflictError("Vale-Troca exige cliente identificado.")
-        if venda.cliente_padrao:
-            raise VendaConflictError("Vale-Troca não pode ser usado para Consumidor Final.")
         existente = VendaPagamentoHub.objects.select_for_update().filter(venda=venda, operacao_uuid=operacao_uuid).first()
         if existente:
             if existente.tipo != TIPO_VALE_TROCA or existente.vale_troca_documento != documento or money(existente.valor) != valor:
                 raise VendaConflictError("Operação de Vale-Troca já utilizada com dados diferentes.")
             return venda, False
+        try:
+            validar_cashback_vale_troca_exclusivos(venda, novo_tipo=TIPO_VALE_TROCA)
+        except ValueError as exc:
+            raise VendaConflictError(str(exc)) from exc
+        if not venda.cliente_retaguarda_id:
+            raise VendaConflictError("Vale-Troca exige cliente identificado.")
+        if venda.cliente_padrao:
+            raise VendaConflictError("Vale-Troca não pode ser usado para Consumidor Final.")
         total_pago_atual = calcular_total_pago(venda)
         pendente = calcular_pendente(venda, total_pago_atual)
         if pendente <= ZERO_2:

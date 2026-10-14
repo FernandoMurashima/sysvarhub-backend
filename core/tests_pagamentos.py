@@ -15,6 +15,7 @@ from core.models import (
     ConfiguracaoFiscalHub,
     EventoSyncHub,
     EstoqueMovimentoHub,
+    FaixaNumeracaoVendaHub,
     FormaPagamentoCondicaoHub,
     FormaPagamentoFiscalMapHub,
     FormaPagamentoHub,
@@ -55,6 +56,10 @@ FISCAL_ITEM_NFCE = {
     "cst_cofins": "01",
     "aliq_cofins": "0.0000",
 }
+MENSAGEM_CASHBACK_VALE_TROCA = (
+    "Cashback não pode ser usado junto com Vale-Troca. "
+    "Realize a venda com Cashback separadamente da troca."
+)
 
 
 class PagamentoHubTestMixin(VendaHubTestMixin):
@@ -67,6 +72,7 @@ class PagamentoHubTestMixin(VendaHubTestMixin):
         self.prazo_1x = self.criar_prazo("30D", 1, [30])
         self.prazo_2x = self.criar_prazo("30-60", 2, [30, 60])
         self.tef = self.criar_forma("TEF", "CARTAO", tef_habilitado=True)
+        FaixaNumeracaoVendaHub.objects.create(hub=self.hub, inicio=1, fim=9999, proximo_numero=1)
 
     def criar_forma(self, codigo, tipo, **overrides):
         dados = {
@@ -201,6 +207,18 @@ class PagamentoHubTestMixin(VendaHubTestMixin):
             format="json",
         )
 
+    def pagar_vale_troca(self, venda_uuid, documento="VT-HUB-11111111111111111111", valor="40.00", operacao_uuid=None):
+        return self.client.post(
+            "/api/terminal/venda/pagamento/vale-troca/",
+            {
+                "venda_uuid": venda_uuid,
+                "operacao_uuid": str(operacao_uuid or uuid.uuid4()),
+                "documento": documento,
+                "valor": valor,
+            },
+            format="json",
+        )
+
     def criar_cashback_disponivel(self, cliente, saldo="200.00", **config_overrides):
         dados_config = {
             "hub": self.hub,
@@ -218,6 +236,20 @@ class PagamentoHubTestMixin(VendaHubTestMixin):
             tipo=CashbackMovimentoHub.TIPO_CREDITO,
             valor=Decimal(saldo),
         )
+
+    def criar_vale_troca(self, cliente, documento="VT-HUB-11111111111111111111", saldo="40.00", **overrides):
+        dados = {
+            "hub": self.hub,
+            "cliente_uuid": cliente.cliente_uuid,
+            "cliente_retaguarda_id": cliente.retaguarda_id,
+            "documento": documento,
+            "valor_original": Decimal(saldo),
+            "saldo": Decimal(saldo),
+            "status": ValeTrocaHub.STATUS_ABERTO,
+            "provisorio": True,
+        }
+        dados.update(overrides)
+        return ValeTrocaHub.objects.create(**dados)
 
     def finalizar(self, venda_uuid):
         return self.client.post(
@@ -327,7 +359,7 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(item.desconto, Decimal("39.98"))
         self.assertEqual(item.total_item, Decimal("359.82"))
 
-    def test_cashback_e_vale_validam_saldo_e_geram_movimentos(self):
+    def test_cashback_local_e_vale_troca_comercial_nao_podem_ser_usados_juntos(self):
         cliente = self.criar_cliente()
         CashbackConfigHub.objects.create(
             hub=self.hub,
@@ -344,14 +376,11 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
             tipo=CashbackMovimentoHub.TIPO_CREDITO,
             valor=Decimal("30.00"),
         )
-        vale = ValeTrocaHub.objects.create(
-            hub=self.hub,
-            cliente_uuid=cliente.cliente_uuid,
-            cliente_retaguarda_id=cliente.retaguarda_id,
+        vale = self.criar_vale_troca(
+            cliente,
             documento="VT-1",
-            valor_original=Decimal("40.00"),
-            saldo=Decimal("40.00"),
-            status=ValeTrocaHub.STATUS_ABERTO,
+            saldo="40.00",
+            provisorio=False,
         )
         cashback = self.criar_forma("CBK", "CASHBACK")
         troca = self.criar_forma("TRO", "TROCA")
@@ -370,14 +399,78 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
             },
             format="json",
         )
-        self.assertEqual(resposta_troca.status_code, 201)
-        self.assertEqual(self.pagar(venda_uuid, self.dinheiro, "129.90").status_code, 201)
-        self.assertEqual(self.finalizar(venda_uuid).status_code, 200)
+
+        vale.refresh_from_db()
+        self.assertEqual(resposta_troca.status_code, 409)
+        self.assertEqual(resposta_troca.data["detail"], MENSAGEM_CASHBACK_VALE_TROCA)
+        self.assertEqual(vale.saldo, Decimal("40.00"))
+        self.assertFalse(ValeTrocaMovimentoHub.objects.exists())
+
+    def test_vale_troca_antes_do_cashback_local_bloqueia_cashback(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(cliente, saldo="30.00")
+        self.criar_vale_troca(cliente)
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+
+        self.assertEqual(self.pagar_vale_troca(venda_uuid).status_code, 201)
+        resposta = self.pagar_cashback(venda_uuid, "30.00")
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(resposta.data["detail"], MENSAGEM_CASHBACK_VALE_TROCA)
+        self.assertEqual(VendaPagamentoHub.objects.count(), 1)
+
+    def test_cashback_antes_do_vale_troca_dedicado_bloqueia_vale(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(cliente, saldo="30.00")
+        vale = self.criar_vale_troca(cliente)
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+
+        self.assertEqual(self.pagar_cashback(venda_uuid, "30.00").status_code, 201)
+        resposta = self.pagar_vale_troca(venda_uuid)
+
+        vale.refresh_from_db()
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(resposta.data["detail"], MENSAGEM_CASHBACK_VALE_TROCA)
+        self.assertEqual(vale.saldo, Decimal("40.00"))
+
+    def test_cashback_central_com_vale_troca_bloqueado_sem_reservar_na_central(self):
+        cliente = self.criar_cliente(retaguarda_id=123)
+        self.criar_cashback_disponivel(cliente, saldo="0.00")
+        self.criar_vale_troca(cliente)
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        self.assertEqual(self.pagar_vale_troca(venda_uuid).status_code, 201)
+
+        with patch("core.services.cashback_online.RetaguardaClient") as client_cls:
+            resposta = self.pagar_cashback_online(venda_uuid, "30.00")
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(resposta.data["detail"], MENSAGEM_CASHBACK_VALE_TROCA)
+        client_cls.return_value.cashback_reservar_venda.assert_not_called()
+
+    def test_venda_com_vale_troca_nao_gera_cashback_novo(self):
+        cliente = self.criar_cliente()
+        CashbackConfigHub.objects.create(
+            hub=self.hub,
+            retaguarda_id=4,
+            ativo=True,
+            percentual=Decimal("10.0000"),
+            sincronizado_em=timezone.now(),
+        )
+        vale = self.criar_vale_troca(cliente)
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+
+        self.assertEqual(self.pagar_vale_troca(venda_uuid).status_code, 201)
+        self.assertEqual(self.pagar(venda_uuid, self.dinheiro, "159.90").status_code, 201)
+        finalizacao = self.finalizar(venda_uuid)
+        self.assertEqual(finalizacao.status_code, 200, finalizacao.data)
 
         vale.refresh_from_db()
         self.assertEqual(vale.saldo, Decimal("0.00"))
-        self.assertTrue(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_DEBITO).exists())
-        self.assertTrue(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_CREDITO).exists())
+        self.assertFalse(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_CREDITO).exists())
 
     def test_vale_troca_exige_autorizacao_documento(self):
         cliente = self.criar_cliente()
@@ -1270,6 +1363,119 @@ class VendaPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(pix.status_code, 201)
         self.assertEqual(finalizacao.status_code, 200, finalizacao.data)
         self.assertTrue(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_DEBITO, valor=Decimal("30.00")).exists())
+        self.assertTrue(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_CREDITO, valor=Decimal("8.50")).exists())
+
+    def test_finalizacao_rejeita_combinacao_invalida_persistida_previamente(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(cliente, saldo="30.00")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        venda = VendaHub.objects.get(venda_uuid=venda_uuid)
+        VendaPagamentoHub.objects.create(
+            operacao_uuid=uuid.uuid4(),
+            venda=venda,
+            forma_pagamento=None,
+            codigo="CASHBACK",
+            descricao="Cashback",
+            tipo="CASHBACK",
+            num_parcelas=1,
+            valor=Decimal("30.00"),
+            terminal_inclusao=self.terminal,
+            operador_inclusao=self.operador,
+            sessao_operador_inclusao=self.sessao_operador,
+        )
+        VendaPagamentoHub.objects.create(
+            operacao_uuid=uuid.uuid4(),
+            venda=venda,
+            forma_pagamento=None,
+            codigo="VT",
+            descricao="Vale-Troca",
+            tipo="VALE_TROCA",
+            num_parcelas=1,
+            valor=Decimal("40.00"),
+            autorizacao="VT-HUB-11111111111111111111",
+            vale_troca_documento="VT-HUB-11111111111111111111",
+            terminal_inclusao=self.terminal,
+            operador_inclusao=self.operador,
+            sessao_operador_inclusao=self.sessao_operador,
+        )
+        VendaPagamentoHub.objects.create(
+            operacao_uuid=uuid.uuid4(),
+            venda=venda,
+            forma_pagamento=self.dinheiro,
+            retaguarda_forma_pagamento_id=self.dinheiro.retaguarda_id,
+            codigo=self.dinheiro.codigo,
+            descricao=self.dinheiro.descricao,
+            tipo=self.dinheiro.tipo,
+            num_parcelas=1,
+            valor=Decimal("129.90"),
+            terminal_inclusao=self.terminal,
+            operador_inclusao=self.operador,
+            sessao_operador_inclusao=self.sessao_operador,
+        )
+
+        resposta = self.finalizar(venda_uuid)
+
+        self.assertEqual(resposta.status_code, 409)
+        self.assertEqual(resposta.data["detail"], MENSAGEM_CASHBACK_VALE_TROCA)
+        self.assertFalse(CashbackMovimentoHub.objects.filter(tipo=CashbackMovimentoHub.TIPO_DEBITO).exists())
+        self.assertFalse(ValeTrocaMovimentoHub.objects.exists())
+
+    def test_retry_cashback_existente_preservado_mesmo_com_venda_antiga_invalida(self):
+        cliente = self.criar_cliente()
+        self.criar_cashback_disponivel(cliente, saldo="30.00")
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        operacao_uuid = uuid.uuid4()
+        self.assertEqual(self.pagar_cashback(venda_uuid, "30.00", operacao_uuid=operacao_uuid).status_code, 201)
+        venda = VendaHub.objects.get(venda_uuid=venda_uuid)
+        VendaPagamentoHub.objects.create(
+            operacao_uuid=uuid.uuid4(),
+            venda=venda,
+            forma_pagamento=None,
+            codigo="VT",
+            descricao="Vale-Troca",
+            tipo="VALE_TROCA",
+            num_parcelas=1,
+            valor=Decimal("40.00"),
+            autorizacao="VT-HUB-11111111111111111111",
+            vale_troca_documento="VT-HUB-11111111111111111111",
+            terminal_inclusao=self.terminal,
+            operador_inclusao=self.operador,
+            sessao_operador_inclusao=self.sessao_operador,
+        )
+
+        retry = self.pagar_cashback(venda_uuid, "30.00", operacao_uuid=operacao_uuid)
+
+        self.assertEqual(retry.status_code, 200, retry.data)
+        self.assertEqual(VendaPagamentoHub.objects.filter(tipo="CASHBACK").count(), 1)
+
+    def test_retry_vale_troca_existente_preservado_mesmo_com_venda_antiga_invalida(self):
+        cliente = self.criar_cliente()
+        self.criar_vale_troca(cliente)
+        venda_uuid = self.criar_venda_com_item()
+        self.put_cliente(cliente)
+        operacao_uuid = uuid.uuid4()
+        self.assertEqual(self.pagar_vale_troca(venda_uuid, operacao_uuid=operacao_uuid).status_code, 201)
+        venda = VendaHub.objects.get(venda_uuid=venda_uuid)
+        VendaPagamentoHub.objects.create(
+            operacao_uuid=uuid.uuid4(),
+            venda=venda,
+            forma_pagamento=None,
+            codigo="CASHBACK",
+            descricao="Cashback",
+            tipo="CASHBACK",
+            num_parcelas=1,
+            valor=Decimal("30.00"),
+            terminal_inclusao=self.terminal,
+            operador_inclusao=self.operador,
+            sessao_operador_inclusao=self.sessao_operador,
+        )
+
+        retry = self.pagar_vale_troca(venda_uuid, operacao_uuid=operacao_uuid)
+
+        self.assertEqual(retry.status_code, 200, retry.data)
+        self.assertEqual(VendaPagamentoHub.objects.filter(tipo="VALE_TROCA").count(), 1)
 
     def test_multiplos_cashbacks_geram_debito_unico_total_e_finalizacao_idempotente(self):
         cliente = self.criar_cliente()
