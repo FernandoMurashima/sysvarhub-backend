@@ -6,7 +6,7 @@ from django.db import models, transaction
 from django.db.models import Case, DecimalField, Sum, Value, When
 from django.utils import timezone
 
-from core.models import CashbackConfigHub, CashbackMovimentoHub, PromocaoHub, ValeTrocaHub, ValeTrocaMovimentoHub, VendaDevolucaoHub
+from core.models import CashbackConfigHub, CashbackMovimentoHub, EventoSyncHub, PromocaoHub, ValeTrocaHub, ValeTrocaMovimentoHub, VendaDevolucaoHub
 
 
 ZERO = Decimal("0.00")
@@ -188,6 +188,11 @@ def vincular_credito_provisorio(venda, documento, devolucao_uuid):
         identificador = uuid.UUID(str(devolucao_uuid))
     except (ValueError, TypeError, AttributeError) as exc:
         raise ValueError("Informe o UUID da devolução vinculada à troca.") from exc
+    evento = EventoSyncHub.objects.select_for_update().filter(
+        hub=venda.hub, chave_idempotencia=f"DEVOLUCAO:{identificador}:FINALIZADA",
+    ).first()
+    if evento and (evento.tentativas or evento.status != EventoSyncHub.STATUS_PENDENTE):
+        raise ValueError("Devolução já enviada à Central. Aguarde o Vale-Troca oficial para realizar a troca online.")
     devolucao = VendaDevolucaoHub.objects.select_for_update().filter(
         pk=vale.devolucao_id, devolucao_uuid=identificador, hub=venda.hub,
         origem=VendaDevolucaoHub.ORIGEM_VENDA_LOCAL,
@@ -196,6 +201,8 @@ def vincular_credito_provisorio(venda, documento, devolucao_uuid):
     ).first()
     if not devolucao or vale.origem_devolucao_uuid != identificador:
         raise ValueError("Crédito não pertence à devolução local informada.")
+    if devolucao.confirmado_central_em:
+        raise ValueError("Devolução já enviada à Central. Aguarde o Vale-Troca oficial para realizar a troca online.")
     if venda.status != "ABERTA" or venda.pk == devolucao.venda_origem_id:
         raise ValueError("Venda de troca inválida.")
     for registro in (devolucao, vale, devolucao.venda_origem):

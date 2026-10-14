@@ -1,4 +1,6 @@
 import uuid
+from copy import deepcopy
+from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -38,7 +40,7 @@ from core.models import (
 )
 from core.services.caixa import fechar_caixa
 from core.services.devolucoes import finalizar_devolucao_manual_offline
-from core.services.sync import enfileirar_venda_finalizada, sincronizar_eventos_pendentes
+from core.services.sync import enfileirar_devolucao_finalizada, enfileirar_venda_finalizada, sincronizar_eventos_pendentes
 from core.services.terminais import configurar_terminal
 from core.services.vendas import VendaConflictError, calcular_disponivel_local, listar_formas_pagamento
 from core.tests_caixa import criar_hub
@@ -2649,3 +2651,229 @@ class VendaFinalizacaoTests(PagamentoHubTestMixin, TransactionTestCase):
 
         self.assertIsNone(atual.data["venda"])
         self.assertEqual(nova.status_code, 201)
+
+
+class TrocaOfflineSyncTests(PagamentoHubTestMixin, TestCase):
+    preparar_troca = CreditoProvisorioTrocaTests.preparar_troca
+    aplicar_credito = CreditoProvisorioTrocaTests.aplicar_credito
+
+    def preparar_sync(self, preco="95.00", consumo="95.00", *, finalizar=True):
+        venda_uuid = self.preparar_troca(preco)
+        self.evento_origem = enfileirar_venda_finalizada(self.devolucao.venda_origem)
+        self.evento_devolucao = enfileirar_devolucao_finalizada(self.devolucao)
+        self.snapshot_inicial = deepcopy(self.evento_devolucao.payload)
+        self.assertNotIn("valor_consumido_offline", self.snapshot_inicial)
+        self.assertEqual(self.aplicar_credito(venda_uuid, consumo).status_code, 201)
+        self.venda_troca = VendaHub.objects.get(venda_uuid=venda_uuid)
+        self.pagamento = self.venda_troca.pagamentos.get(tipo="VALE_TROCA")
+        if finalizar:
+            complemento = Decimal(preco) - Decimal(consumo)
+            if complemento:
+                self.assertEqual(self.pagar(venda_uuid, self.pix, str(complemento)).status_code, 201)
+            self.assertEqual(self.finalizar(venda_uuid).status_code, 200)
+            self.evento_venda = enfileirar_venda_finalizada(self.venda_troca)
+        self.devolucao.refresh_from_db()
+        self.vale.refresh_from_db()
+
+    def client_central(self):
+        teste = self
+
+        class Central:
+            def __init__(self):
+                self.enviados = []
+                self.processados = set()
+                self.consumos = 0
+                self.saldo = Decimal("100.00")
+                self.alteracao = {}
+
+            def sync_push(self, *, token, eventos):
+                self.enviados.extend(deepcopy(eventos))
+                resultados = []
+                for evento in eventos:
+                    payload = evento["payload"]
+                    duplicado = evento["evento_uuid"] in self.processados
+                    mapeamento = {}
+                    if evento["tipo"] == "DEVOLUCAO_FINALIZADA":
+                        mapeamento = {
+                            "devolucao_retaguarda_id": 501, "documento": payload["documento"],
+                            "vale_documento": "VT0000501", "vale_retaguarda_id": 901, "valor_total": "100.00",
+                        }
+                        if payload.get("valor_consumido_offline"):
+                            mapeamento.update({campo: payload[campo] for campo in (
+                                "venda_troca_uuid", "operacao_uuid", "valor_consumido_offline",
+                            )})
+                            mapeamento["vale_reserva_id"] = 801
+                        mapeamento.update(self.alteracao)
+                    elif hasattr(teste, "venda_troca") and payload["venda_uuid"] == str(teste.venda_troca.venda_uuid):
+                        pagamento = next(p for p in payload["pagamentos"] if p["tipo"] in ("TROCA", "VALE_TROCA"))
+                        teste.assertEqual(pagamento["vale_troca_documento"], "VT0000501")
+                        teste.assertEqual(pagamento["vale_troca_reserva_id"], 801)
+                        teste.assertEqual(pagamento["devolucao_uuid"], str(teste.devolucao.devolucao_uuid))
+                        if not duplicado:
+                            self.consumos += 1
+                            self.saldo -= Decimal(pagamento["valor"])
+                    self.processados.add(evento["evento_uuid"])
+                    resultados.append({"chave_idempotencia": evento["chave_idempotencia"],
+                                       "status": "DUPLICADO" if duplicado else "PROCESSADO", "mapeamento": mapeamento})
+                return {"resultados": resultados}
+
+        return Central()
+
+    def ciclo(self, client, minuto=0, **kwargs):
+        return sincronizar_eventos_pendentes(self.hub, client=client, agora=timezone.now() + timedelta(minutes=minuto), **kwargs)
+
+    def exercitar_troca(self, preco, consumo, saldo):
+        self.preparar_sync(preco, consumo)
+        client = self.client_central()
+        ids = (self.evento_devolucao.evento_uuid, self.evento_venda.evento_uuid)
+        self.assertEqual(self.ciclo(client)["sincronizados"], 1)
+        self.assertEqual([e["tipo"] for e in client.enviados], ["VENDA_FINALIZADA"])
+        self.assertEqual(self.ciclo(client, 2)["sincronizados"], 1)
+        self.evento_devolucao.refresh_from_db()
+        definitivo = deepcopy(self.evento_devolucao.payload)
+        self.assertEqual(definitivo["valor_consumido_offline"], consumo)
+        self.assertEqual(definitivo["venda_troca_uuid"], str(self.venda_troca.venda_uuid))
+        self.assertEqual(definitivo["operacao_uuid"], str(self.pagamento.operacao_uuid))
+        self.assertEqual(self.ciclo(client, 4)["sincronizados"], 1)
+        self.evento_venda.refresh_from_db()
+        self.vale.refresh_from_db()
+        self.assertEqual(self.vale.valor_original, Decimal("100.00"))
+        self.assertEqual(self.vale.saldo, Decimal(saldo))
+        self.assertFalse(self.vale.provisorio)
+        self.assertEqual(client.saldo, Decimal(saldo))
+        self.assertEqual(self.vale.movimentos.filter(tipo="CREDITO").count(), 1)
+        self.assertEqual(self.vale.movimentos.filter(tipo="USO").count(), 1)
+        self.assertEqual(client.consumos, 1)
+        payload_venda = deepcopy(self.evento_venda.payload)
+        for evento in (self.evento_devolucao, self.evento_venda):
+            EventoSyncHub.objects.filter(pk=evento.pk).update(status="ERRO", proxima_tentativa_em=None)
+            self.assertEqual(self.ciclo(client, 6, evento_ids=[evento.pk])["sincronizados"], 1)
+            evento.refresh_from_db()
+            self.assertEqual(evento.resposta["status"], "DUPLICADO")
+        self.assertEqual(self.evento_devolucao.payload, definitivo)
+        self.assertEqual(self.evento_venda.payload, payload_venda)
+        self.assertEqual((self.evento_devolucao.evento_uuid, self.evento_venda.evento_uuid), ids)
+        self.assertEqual(self.vale.movimentos.filter(tipo="USO").count(), 1)
+        self.assertEqual(client.consumos, 1)
+        outra = self.criar_venda_com_item()
+        self.put_cliente(self.cliente_troca)
+        with patch("core.services.vales_troca.RetaguardaClient") as central:
+            central.return_value.vale_troca_consultar.side_effect = RetaguardaError("offline")
+            self.assertEqual(self.aplicar_credito(outra, "5.00").status_code, 409)
+
+    def test_troca_95_saldo_5_retry_devolucao_e_venda(self):
+        self.exercitar_troca("95.00", "95.00", "5.00")
+
+    def test_troca_100_saldo_zero(self):
+        self.exercitar_troca("100.00", "100.00", "0.00")
+
+    def test_troca_105_complemento_pix(self):
+        self.exercitar_troca("105.00", "100.00", "0.00")
+
+    def test_sem_troca_sincroniza_e_bloqueia_vinculo_posterior(self):
+        venda = self.preparar_troca()
+        enfileirar_venda_finalizada(self.devolucao.venda_origem)
+        evento = enfileirar_devolucao_finalizada(self.devolucao)
+        client = self.client_central()
+        self.ciclo(client)
+        self.assertEqual(self.ciclo(client, 2)["sincronizados"], 1)
+        evento.refresh_from_db()
+        self.vale.refresh_from_db()
+        self.assertNotIn("venda_troca_uuid", evento.payload)
+        self.assertEqual(self.vale.saldo, Decimal("100.00"))
+        with patch("core.services.vales_troca.RetaguardaClient") as central:
+            central.return_value.vale_troca_consultar.side_effect = RetaguardaError("offline")
+            self.assertEqual(self.aplicar_credito(venda).status_code, 409)
+
+    def test_devolucao_transmitida_nao_aceita_novo_vinculo_nem_muda_snapshot(self):
+        venda = self.preparar_troca()
+        enfileirar_venda_finalizada(self.devolucao.venda_origem)
+        evento = enfileirar_devolucao_finalizada(self.devolucao)
+        client = self.client_central()
+        self.ciclo(client)
+        with patch.object(client, "sync_push", side_effect=RetaguardaError("offline")):
+            self.assertEqual(self.ciclo(client, 2)["erros"], 1)
+        evento.refresh_from_db()
+        snapshot = deepcopy(evento.payload)
+        self.assertEqual(evento.tentativas, 1)
+        self.assertEqual(self.aplicar_credito(venda).status_code, 409)
+        self.assertEqual(enfileirar_devolucao_finalizada(self.devolucao).payload, snapshot)
+        self.assertEqual(self.ciclo(client, 4)["sincronizados"], 1)
+        evento.refresh_from_db()
+        self.assertEqual(evento.payload, snapshot)
+        self.assertFalse(self.vale.movimentos.filter(tipo="USO").exists())
+
+    def test_troca_aberta_aguarda_consume_apenas_apos_finalizacao(self):
+        self.preparar_sync(finalizar=False)
+        client = self.client_central()
+        self.ciclo(client)
+        self.assertEqual(self.ciclo(client, 2)["enviados"], 0)
+        self.evento_devolucao.refresh_from_db()
+        self.assertEqual(self.evento_devolucao.tentativas, 0)
+        self.assertEqual(self.finalizar(str(self.venda_troca.venda_uuid)).status_code, 200)
+        enfileirar_venda_finalizada(self.venda_troca)
+        self.assertEqual(self.ciclo(client, 4)["sincronizados"], 1)
+
+    def test_falha_local_retry_duplicado_preserva_payload_e_historico(self):
+        self.preparar_sync()
+        client = self.client_central()
+        self.ciclo(client)
+        with patch("core.services.sync._conciliar_vale_provisorio_confirmado", side_effect=RuntimeError("falha local")):
+            self.assertEqual(self.ciclo(client, 2)["erros"], 1)
+        self.evento_devolucao.refresh_from_db()
+        snapshot = deepcopy(self.evento_devolucao.payload)
+        self.assertEqual(self.evento_devolucao.status, "ERRO")
+        self.assertEqual(self.evento_devolucao.resposta["mapeamento"]["vale_reserva_id"], 801)
+        self.assertEqual(self.ciclo(client, 4)["sincronizados"], 1)
+        self.evento_devolucao.refresh_from_db()
+        self.assertEqual(self.evento_devolucao.resposta["status"], "DUPLICADO")
+        self.assertEqual(self.evento_devolucao.payload, snapshot)
+        self.assertEqual(self.ciclo(client, 6)["sincronizados"], 1)
+        self.assertEqual(self.vale.movimentos.filter(tipo="USO").count(), 1)
+
+    def test_retorno_divergente_bloqueia_venda_sem_efeitos_parciais(self):
+        self.preparar_sync()
+        client = self.client_central()
+        self.ciclo(client)
+        for minuto, alteracao in enumerate([
+            {"operacao_uuid": str(uuid.uuid4())},
+            {"venda_troca_uuid": str(uuid.uuid4())},
+            {"valor_consumido_offline": "96.00"},
+            {"vale_reserva_id": None},
+            {"vale_documento": "VT-HUB-INDEVIDO"},
+            {"vale_retaguarda_id": None},
+            {"devolucao_retaguarda_id": None},
+        ], 1):
+            with self.subTest(alteracao=alteracao):
+                client.alteracao = alteracao
+                self.assertEqual(self.ciclo(client, minuto * 2)["erros"], 1)
+                self.pagamento.refresh_from_db()
+                self.vale.refresh_from_db()
+                self.assertIsNone(self.pagamento.vale_troca_reserva_id)
+                self.assertTrue(self.vale.provisorio)
+                self.assertEqual(self.vale.saldo, Decimal("5.00"))
+                self.evento_venda.refresh_from_db()
+                self.assertEqual(self.evento_venda.tentativas, 0)
+        client.alteracao = {}
+        self.ciclo(client, 16)
+        self.assertEqual(self.ciclo(client, 18)["sincronizados"], 1)
+
+    def test_perda_resposta_conexao_retry_automatico(self):
+        self.preparar_sync()
+        client = self.client_central()
+        self.ciclo(client)
+        original = client.sync_push
+
+        def perder_resposta(**kwargs):
+            original(**kwargs)
+            raise RetaguardaError("conexão interrompida após envio")
+
+        with patch.object(client, "sync_push", side_effect=perder_resposta):
+            self.assertEqual(self.ciclo(client, 2)["erros"], 1)
+        self.evento_devolucao.refresh_from_db()
+        snapshot = deepcopy(self.evento_devolucao.payload)
+        self.assertEqual(self.ciclo(client, 4)["sincronizados"], 1)
+        self.evento_devolucao.refresh_from_db()
+        self.assertEqual(self.evento_devolucao.resposta["status"], "DUPLICADO")
+        self.assertEqual(self.evento_devolucao.payload, snapshot)
+        self.assertEqual(self.ciclo(client, 6)["sincronizados"], 1)
