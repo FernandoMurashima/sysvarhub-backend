@@ -48,6 +48,10 @@ DINHEIRO = "DINHEIRO"
 CASHBACK = "CASHBACK"
 ERRO_PAGAMENTO_ALTERAR_VENDA = "Remova os pagamentos antes de alterar a venda."
 ERRO_OPERACAO_PAGAMENTO_DIVERGENTE = "Operação de pagamento já utilizada com dados diferentes."
+ERRO_CASHBACK_LOCAL_BLOQUEADO = (
+    "Cashback exige autorização ONLINE da Central. "
+    "Utilize o pagamento Cashback Online; o saldo LOCAL não pode ser utilizado."
+)
 
 
 class VendaError(Exception):
@@ -550,6 +554,8 @@ def adicionar_pagamento(
         )
         if not forma:
             raise VendaValidationError("Forma de pagamento inválida.")
+        if (forma.tipo or "").upper() == CASHBACK:
+            raise VendaConflictError(ERRO_CASHBACK_LOCAL_BLOQUEADO)
         prazo = None
         condicao_parcelamento = None
         if forma.permite_parcelamento:
@@ -686,53 +692,7 @@ def adicionar_pagamento_cashback(
                 raise VendaConflictError(ERRO_OPERACAO_PAGAMENTO_DIVERGENTE)
             return venda, False
 
-        if venda.vendedor_retaguarda_id is None:
-            raise VendaConflictError("Selecione um vendedor antes de registrar pagamentos.")
-
-        bloquear_cliente_cashback(venda)
-        try:
-            validar_pagamento_beneficio(venda, None, valor, tipo=CASHBACK, bloquear_saldo=True)
-        except ValueError as exc:
-            raise VendaConflictError(str(exc)) from exc
-
-        total_pago_atual = calcular_total_pago(venda)
-        pendente = calcular_pendente(venda, total_pago_atual)
-        if pendente <= ZERO_2:
-            raise VendaConflictError("Venda já está paga.")
-        if tem_troco(venda, total_pago_atual):
-            raise VendaConflictError("Venda já possui troco.")
-        if valor > pendente:
-            raise VendaConflictError("Cashback não pode gerar troco; use apenas o saldo pendente da venda.")
-
-        pagamento = VendaPagamentoHub.objects.create(
-            operacao_uuid=operacao_uuid,
-            venda=venda,
-            forma_pagamento=None,
-            retaguarda_forma_pagamento_id=None,
-            codigo=CASHBACK,
-            descricao="Cashback",
-            tipo=CASHBACK,
-            num_parcelas=1,
-            gera_recebivel_bancario=False,
-            valor=valor,
-            autorizacao="",
-            cashback_origem=VendaPagamentoHub.CASHBACK_ORIGEM_LOCAL,
-            origem_captura=VendaPagamentoHub.ORIGEM_MANUAL,
-            status=VendaPagamentoHub.STATUS_ATIVO,
-            terminal_inclusao=terminal_bloqueado,
-            operador_inclusao=operador,
-            sessao_operador_inclusao=sessao_operador,
-        )
-        registrar_evento(
-            venda,
-            VendaEventoHub.TIPO_PAGAMENTO_ADICIONADO,
-            terminal_bloqueado,
-            operador,
-            sessao_operador,
-            dados_pagamento(pagamento),
-        )
-
-    return venda, True
+        raise VendaConflictError(ERRO_CASHBACK_LOCAL_BLOQUEADO)
 
 
 def remover_pagamento(terminal, operador, sessao_operador, *, pagamento_uuid):

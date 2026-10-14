@@ -1,4 +1,5 @@
-from decimal import Decimal
+import uuid
+from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
 
@@ -117,15 +118,28 @@ def adicionar_pagamento_cashback_online(terminal, operador, sessao_operador, *, 
             )
         except RetaguardaError as exc:
             raise VendaConflictError(f"Central ONLINE obrigatória para reservar Cashback: {exc}") from exc
-        reserva = resposta.get("reserva") or {}
-        reserva_id = reserva.get("id")
-        if not reserva_id:
+        reserva = resposta.get("reserva") if isinstance(resposta, dict) else None
+        if not isinstance(reserva, dict):
             raise VendaConflictError("Reserva de Cashback não retornada pela Central.")
-        if int(reserva.get("cliente_id") or 0) != int(venda.cliente_retaguarda_id):
+        reserva_id = reserva.get("id")
+        if type(reserva_id) is not int or reserva_id <= 0:
+            raise VendaConflictError("Identificação da reserva de Cashback inválida.")
+        cliente_id = reserva.get("cliente_id")
+        if type(cliente_id) is not int or cliente_id <= 0:
+            raise VendaConflictError("Cliente da reserva de Cashback inválido.")
+        try:
+            valor_reservado = Decimal(str(reserva.get("valor")))
+            venda_reservada = uuid.UUID(str(reserva.get("venda_uuid")))
+            operacao_reservada = uuid.UUID(str(reserva.get("operacao_uuid")))
+        except (ValueError, TypeError, InvalidOperation) as exc:
+            raise VendaConflictError("Reserva de Cashback inválida retornada pela Central.") from exc
+        if cliente_id != venda.cliente_retaguarda_id:
             raise VendaConflictError("Reserva de Cashback pertence a outro cliente.")
-        if money(Decimal(str(reserva.get("valor") or "0.00"))) != valor:
+        if venda_reservada != venda.venda_uuid or operacao_reservada != operacao_uuid:
+            raise VendaConflictError("Reserva de Cashback pertence a outra venda ou operação.")
+        if not valor_reservado.is_finite() or valor_reservado != valor:
             raise VendaConflictError("Valor da reserva de Cashback diverge do pagamento.")
-        if str(reserva.get("status") or "") != "RESERVADA":
+        if reserva.get("status") != "RESERVADA":
             raise VendaConflictError("Reserva de Cashback não está ativa.")
 
         try:
