@@ -953,6 +953,7 @@ class VendaPagamentoView(APIView):
                 prazo_pagamento_id=request.data.get("prazo_pagamento_id"),
                 valor=request.data.get("valor"),
                 autorizacao=request.data.get("autorizacao") or "",
+                devolucao_uuid=request.data.get("devolucao_uuid"),
             )
         except VendaNotFoundError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
@@ -1109,6 +1110,7 @@ class ValeTrocaPagamentoView(APIView):
                 operacao_uuid=request.data.get("operacao_uuid"),
                 documento=request.data.get("documento"),
                 valor=request.data.get("valor"),
+                devolucao_uuid=request.data.get("devolucao_uuid"),
             )
         except VendaNotFoundError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)

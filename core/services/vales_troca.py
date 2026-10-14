@@ -4,7 +4,7 @@ import re
 from django.db import transaction
 
 from core.models import ValeTrocaHub, VendaEventoHub, VendaHub, VendaPagamentoHub
-from core.services.beneficios import validar_cashback_vale_troca_exclusivos, vales_abertos
+from core.services.beneficios import validar_cashback_vale_troca_exclusivos, vales_abertos, vincular_credito_provisorio
 from core.services.vendas import (
     DINHEIRO,
     ZERO_2,
@@ -83,9 +83,11 @@ def listar_vales_troca_online_disponiveis(terminal, venda_uuid=None):
         return {"vales_troca": vales}
 
 
-def adicionar_pagamento_vale_troca(terminal, operador, sessao_operador, *, venda_uuid, operacao_uuid, documento, valor):
+def adicionar_pagamento_vale_troca(terminal, operador, sessao_operador, *, venda_uuid, operacao_uuid, documento, valor, devolucao_uuid=None):
     venda_uuid = validar_uuid_obrigatorio(venda_uuid, "Venda inválida.")
     operacao_uuid = validar_uuid_obrigatorio(operacao_uuid, "Operação inválida.")
+    if devolucao_uuid is not None:
+        devolucao_uuid = validar_uuid_obrigatorio(devolucao_uuid, "Devolução inválida.")
     documento = validar_autorizacao(documento).upper()
     valor = validar_valor_pagamento(valor)
     if not documento:
@@ -103,12 +105,16 @@ def adicionar_pagamento_vale_troca(terminal, operador, sessao_operador, *, venda
         if existente:
             if existente.tipo != TIPO_VALE_TROCA or existente.vale_troca_documento != documento or money(existente.valor) != valor:
                 raise VendaConflictError("Operação de Vale-Troca já utilizada com dados diferentes.")
+            if devolucao_uuid and not venda.devolucoes_troca.filter(devolucao_uuid=devolucao_uuid, vale_troca__documento=documento).exists():
+                raise VendaConflictError("Devolução diferente no retry do pagamento.")
             return venda, False
         try:
             validar_cashback_vale_troca_exclusivos(venda, novo_tipo=TIPO_VALE_TROCA)
         except ValueError as exc:
             raise VendaConflictError(str(exc)) from exc
-        if not venda.cliente_retaguarda_id:
+        if not venda.cliente_retaguarda_id and not (
+            DOCUMENTO_CREDITO_PROVISORIO_RE.match(documento) and venda.cliente_uuid
+        ):
             raise VendaConflictError("Vale-Troca exige cliente identificado.")
         if venda.cliente_padrao:
             raise VendaConflictError("Vale-Troca não pode ser usado para Consumidor Final.")
@@ -120,7 +126,14 @@ def adicionar_pagamento_vale_troca(terminal, operador, sessao_operador, *, venda
             raise VendaConflictError("Venda já possui troco.")
         if valor > pendente:
             raise VendaConflictError("Valor do Vale-Troca excede o valor pendente.")
+        if DOCUMENTO_CREDITO_PROVISORIO_RE.match(documento):
+            try:
+                vincular_credito_provisorio(venda, documento, devolucao_uuid)
+            except ValueError as exc:
+                raise VendaConflictError(str(exc)) from exc
         credito_local = _credito_provisorio_local(venda, documento)
+        if DOCUMENTO_CREDITO_PROVISORIO_RE.match(documento) and not credito_local:
+            raise VendaConflictError("Crédito provisório indisponível para esta troca.")
         if credito_local:
             consulta = {
                 "id": None,
@@ -138,7 +151,7 @@ def adicionar_pagamento_vale_troca(terminal, operador, sessao_operador, *, venda
         if VendaPagamentoHub.objects.filter(venda=venda, status=VendaPagamentoHub.STATUS_ATIVO, vale_troca_documento=documento_oficial).exists():
             raise VendaConflictError("O mesmo Vale-Troca não pode ser usado duas vezes na venda.")
         cliente = consulta.get("cliente") or {}
-        if int(cliente.get("id") or 0) != int(venda.cliente_retaguarda_id):
+        if int(cliente.get("id") or 0) != int(venda.cliente_retaguarda_id or 0):
             raise VendaConflictError("Vale-Troca pertence a outro cliente.")
         saldo_disponivel = money(Decimal(str(consulta.get("saldo_disponivel") or "0.00")))
         if consulta.get("status") != "ABERTO" or saldo_disponivel <= ZERO_2:
@@ -169,6 +182,12 @@ def adicionar_pagamento_vale_troca(terminal, operador, sessao_operador, *, venda
 
 
 def preparar_reservas_vale_troca(venda, pagamentos):
+    for pagamento in pagamentos:
+        if (pagamento.tipo or "").upper() not in ("TROCA", TIPO_VALE_TROCA):
+            continue
+        documento = pagamento.vale_troca_documento or pagamento.autorizacao
+        if DOCUMENTO_CREDITO_PROVISORIO_RE.match(documento or "") and not _credito_provisorio_local(venda, documento):
+            raise VendaConflictError("Crédito provisório indisponível para esta troca.")
     vales = [
         p for p in pagamentos
         if (p.tipo or "").upper() == TIPO_VALE_TROCA and not _credito_provisorio_local(venda, p.vale_troca_documento or p.autorizacao)
@@ -222,18 +241,7 @@ def _credito_provisorio_local(venda, documento):
     documento = str(documento or "").strip().upper()
     if not DOCUMENTO_CREDITO_PROVISORIO_RE.match(documento):
         return None
-    qs = ValeTrocaHub.objects.filter(
-        hub=venda.hub,
-        documento=documento,
-        status=ValeTrocaHub.STATUS_ABERTO,
-        saldo__gt=0,
-        provisorio=True,
-    )
-    if venda.cliente_retaguarda_id:
-        qs = qs.filter(cliente_retaguarda_id=venda.cliente_retaguarda_id)
-    else:
-        qs = qs.filter(cliente_uuid=venda.cliente_uuid)
-    return qs.first()
+    return vales_abertos(venda, bloquear=True, apenas_utilizaveis_offline=True).filter(documento=documento).first()
 
 
 def _vales_provisorios_payload(venda):
@@ -252,6 +260,9 @@ def _vales_provisorios_payload(venda):
             "devolucao_origem": {"id": vale.devolucao_id, "documento": "Crédito provisório"} if vale.devolucao_id else None,
             "provisorio": True,
             "rotulo": "Crédito provisório",
+            "devolucao_uuid": str(vale.devolucao.devolucao_uuid),
+            "venda_troca_uuid": str(venda.venda_uuid),
+            "valor_consumido": f"{vale.valor_original - vale.saldo:.2f}",
         }
         for vale in vales_abertos(venda, apenas_utilizaveis_offline=True).filter(provisorio=True)
     ]

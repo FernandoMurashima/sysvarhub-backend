@@ -502,6 +502,7 @@ def adicionar_pagamento(
     prazo_pagamento_id=None,
     valor,
     autorizacao="",
+    devolucao_uuid=None,
 ):
     venda_uuid = validar_uuid_obrigatorio(venda_uuid, "Venda inválida.")
     operacao_uuid = validar_uuid_obrigatorio(operacao_uuid, "Operação inválida.")
@@ -509,6 +510,8 @@ def adicionar_pagamento(
     prazo_pagamento_id = validar_inteiro_positivo_opcional(prazo_pagamento_id, "Prazo de pagamento inválido.")
     valor = validar_valor_pagamento(valor)
     autorizacao = validar_autorizacao(autorizacao)
+    if devolucao_uuid is not None:
+        devolucao_uuid = validar_uuid_obrigatorio(devolucao_uuid, "Devolução inválida.")
 
     with transaction.atomic():
         terminal_bloqueado = Terminal.objects.select_for_update().select_related("hub").get(pk=terminal.pk)
@@ -523,6 +526,8 @@ def adicionar_pagamento(
             .first()
         )
         if pagamento_existente:
+            if devolucao_uuid and not venda.devolucoes_troca.filter(devolucao_uuid=devolucao_uuid, vale_troca__documento=autorizacao).exists():
+                raise VendaConflictError("Devolução diferente no retry do pagamento.")
             validar_retry_pagamento(
                 pagamento_existente,
                 forma_pagamento_id=forma_pagamento_id,
@@ -574,7 +579,7 @@ def adicionar_pagamento(
         if forma.tef_habilitado:
             raise VendaConflictError("Forma de pagamento exige integração TEF.")
         try:
-            validar_pagamento_beneficio(venda, forma, valor, autorizacao)
+            validar_pagamento_beneficio(venda, forma, valor, autorizacao, devolucao_uuid=devolucao_uuid)
         except ValueError as exc:
             raise VendaConflictError(str(exc)) from exc
 
@@ -852,7 +857,7 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
             except ValueError as exc:
                 raise VendaConflictError(str(exc)) from exc
         for pagamento in pagamentos:
-            if (pagamento.tipo or "").upper() in ("CASHBACK", "VALE_TROCA"):
+            if (pagamento.tipo or "").upper() in ("CASHBACK", "TROCA", "VALE_TROCA"):
                 continue
             try:
                 validar_pagamento_beneficio(
@@ -1714,6 +1719,9 @@ def serializar_pagamento(pagamento):
         dados["cashback_origem"] = pagamento.cashback_origem
         dados["cashback_reserva_id"] = pagamento.cashback_reserva_id
         dados["cashback_valor_reservado"] = f"{pagamento.cashback_valor_reservado:.2f}"
+    if (pagamento.tipo or "").upper() in ("TROCA", "VALE_TROCA"):
+        devolucao = pagamento.venda.devolucoes_troca.filter(vale_troca__documento=pagamento.vale_troca_documento).first()
+        dados["devolucao_uuid"] = str(devolucao.devolucao_uuid) if devolucao else None
     return dados
 
 

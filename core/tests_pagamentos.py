@@ -324,6 +324,196 @@ class FormasPagamentoApiTests(PagamentoHubTestMixin, TestCase):
         self.assertGreaterEqual(len(payload["formas"]), 3)
 
 
+class CreditoProvisorioTrocaTests(PagamentoHubTestMixin, TestCase):
+    def preparar_troca(self, preco="95.00", cliente_retaguarda_id=123):
+        self.cliente_troca = self.criar_cliente(retaguarda_id=cliente_retaguarda_id)
+        self.catalogo_item.preco_venda = Decimal("100.00")
+        self.catalogo_item.save()
+        origem = self.criar_venda_com_item()
+        self.put_cliente(self.cliente_troca)
+        self.assertEqual(self.pagar(origem, self.dinheiro, "100.00").status_code, 201)
+        self.assertEqual(self.finalizar(origem).status_code, 200)
+        item = VendaItemHub.objects.get(venda__venda_uuid=origem)
+        FaixaNumeracaoDevolucaoHub.objects.create(hub=self.hub, inicio=1, fim=100, proximo_numero=1)
+        resposta = self.client.post("/api/terminal/devolucoes/finalizar/", {
+            "venda_uuid": origem,
+            "itens": [{"item_uuid": str(item.item_uuid), "quantidade": 1}],
+        }, format="json")
+        self.assertEqual(resposta.status_code, 201, resposta.data)
+        self.devolucao = VendaDevolucaoHub.objects.get()
+        self.vale = self.devolucao.vale_troca
+        self.catalogo_item.preco_venda = Decimal(preco)
+        self.catalogo_item.save()
+        venda = self.criar_venda_com_item()
+        self.put_cliente(self.cliente_troca)
+        return venda
+
+    def aplicar_credito(self, venda, valor="95.00", *, operacao=None, devolucao=True, tipo=None):
+        payload = {
+            "venda_uuid": venda, "operacao_uuid": str(operacao or uuid.uuid4()),
+            "documento": self.vale.documento, "valor": valor,
+        }
+        if devolucao:
+            payload["devolucao_uuid"] = str(self.devolucao.devolucao_uuid)
+        if tipo:
+            forma = FormaPagamentoHub.objects.filter(hub=self.hub, codigo=tipo).first() or self.criar_forma(tipo, tipo)
+            payload["forma_pagamento_id"] = forma.pk
+            payload["autorizacao"] = payload.pop("documento")
+        endpoint = "/api/terminal/venda/pagamento/" if tipo else "/api/terminal/venda/pagamento/vale-troca/"
+        return self.client.post(endpoint, payload, format="json")
+
+    def test_consumo_parcial_saldo_restrito_e_retry(self):
+        venda = self.preparar_troca()
+        self.assertTrue(self.vale.provisorio)
+        self.assertEqual(self.vale.valor_original, Decimal("100.00"))
+        self.assertIsNone(self.devolucao.venda_troca_id)
+        operacao = uuid.uuid4()
+        self.assertEqual(self.aplicar_credito(venda, operacao=operacao).status_code, 201)
+        self.assertEqual(self.aplicar_credito(venda, operacao=operacao).status_code, 200)
+        self.assertEqual(self.finalizar(venda).status_code, 200)
+        self.assertEqual(self.finalizar(venda).status_code, 200)
+        self.vale.refresh_from_db()
+        self.assertEqual(self.vale.saldo, Decimal("5.00"))
+        self.assertEqual(self.vale.movimentos.filter(tipo="USO").count(), 1)
+        outra = self.criar_venda_com_item()
+        self.put_cliente(self.cliente_troca)
+        self.assertEqual(self.aplicar_credito(outra, "5.00").status_code, 409)
+        for tipo in ("TROCA", "VALE_TROCA"):
+            self.assertEqual(self.aplicar_credito(outra, "5.00", tipo=tipo).status_code, 409)
+        self.assertEqual(self.vale.movimentos.get(tipo="USO").valor, Decimal("95.00"))
+
+    def test_consumo_integral(self):
+        venda = self.preparar_troca("100.00")
+        self.assertEqual(self.aplicar_credito(venda, "100.00").status_code, 201)
+        self.assertEqual(self.finalizar(venda).status_code, 200)
+        self.vale.refresh_from_db()
+        self.assertEqual(self.vale.saldo, Decimal("0.00"))
+
+    def test_cliente_local_identificado_por_uuid(self):
+        venda = self.preparar_troca(cliente_retaguarda_id=None)
+        self.assertEqual(self.aplicar_credito(venda).status_code, 201)
+        self.assertEqual(self.finalizar(venda).status_code, 200)
+        self.vale.refresh_from_db()
+        self.assertEqual(self.vale.saldo, Decimal("5.00"))
+
+    def test_forma_legada_vale_troca_vinculada(self):
+        venda = self.preparar_troca()
+        self.assertEqual(self.aplicar_credito(venda, tipo="VALE_TROCA").status_code, 201)
+        self.assertEqual(self.aplicar_credito(venda).status_code, 409)
+        self.assertEqual(self.finalizar(venda).status_code, 200)
+        self.assertEqual(self.vale.movimentos.filter(tipo="USO").count(), 1)
+
+    def test_pagamento_complementar_pix(self):
+        venda = self.preparar_troca("105.00")
+        self.assertEqual(self.aplicar_credito(venda, "100.00").status_code, 201)
+        self.assertEqual(self.pagar(venda, self.pix, "5.00").status_code, 201)
+        self.assertEqual(self.finalizar(venda).status_code, 200)
+        self.vale.refresh_from_db()
+        self.assertEqual(self.vale.saldo, Decimal("0.00"))
+
+    def test_uuid_obrigatorio_e_legados_protegidos(self):
+        venda = self.preparar_troca()
+        for tipo in (None, "TROCA", "VALE_TROCA"):
+            with self.subTest(tipo=tipo):
+                self.assertEqual(self.aplicar_credito(venda, devolucao=False, tipo=tipo).status_code, 409)
+        self.assertEqual(self.aplicar_credito(venda, tipo="TROCA").status_code, 201)
+        self.assertEqual(self.finalizar(venda).status_code, 200)
+
+    def test_cancelamento_nao_transfere_vinculo(self):
+        venda = self.preparar_troca("105.00")
+        self.assertEqual(self.aplicar_credito(venda, "100.00").status_code, 201)
+        pagamento = VendaPagamentoHub.objects.get(venda__venda_uuid=venda)
+        resposta = self.client.delete(f"/api/terminal/venda/pagamento/{pagamento.pagamento_uuid}/")
+        self.assertEqual(resposta.status_code, 200, resposta.data)
+        self.assertEqual(self.aplicar_credito(venda, "95.00").status_code, 201)
+        self.assertEqual(self.pagar(venda, self.dinheiro, "10.00").status_code, 201)
+        self.assertEqual(self.finalizar(venda).status_code, 200)
+        outra = self.criar_venda_com_item()
+        self.put_cliente(self.cliente_troca)
+        self.assertEqual(self.aplicar_credito(outra, "5.00").status_code, 409)
+
+    def test_cliente_e_hub_incorretos(self):
+        venda = self.preparar_troca()
+        outro = self.criar_cliente(retaguarda_id=999, documento="98765432100")
+        self.put_cliente(outro)
+        self.assertEqual(self.aplicar_credito(venda).status_code, 409)
+        self.put_cliente(self.cliente_troca)
+        outro_hub = criar_hub(loja_id=99)
+        self.vale.hub = outro_hub
+        self.vale.save()
+        self.assertEqual(self.aplicar_credito(venda).status_code, 409)
+        self.assertFalse(self.vale.movimentos.filter(tipo="USO").exists())
+
+    def test_provisorio_nao_exposto_como_saldo_geral(self):
+        venda = self.preparar_troca()
+        resposta = self.client.get(f"/api/terminal/clientes/{self.cliente_troca.cliente_uuid}/beneficios/")
+        self.assertEqual(resposta.data["vales_troca"], [])
+        with patch("core.services.vales_troca.RetaguardaClient") as client_cls:
+            client_cls.return_value.vale_troca_disponiveis.side_effect = RetaguardaError("offline")
+            resposta = self.client.get(f"/api/terminal/vale-troca/disponiveis/?venda_uuid={venda}")
+        self.assertEqual(resposta.status_code, 409)
+        self.vale.refresh_from_db()
+        self.assertEqual(self.vale.saldo, Decimal("100.00"))
+
+    def test_vale_oficial_exige_central_e_preserva_reserva(self):
+        venda = self.preparar_troca()
+        with patch("core.services.vales_troca.RetaguardaClient") as client_cls:
+            client = client_cls.return_value
+            client.vale_troca_consultar.return_value = {"vale_troca": {
+                "id": 77, "documento": "VT0000077", "cliente": {"id": 123},
+                "saldo_disponivel": "100.00", "status": "ABERTO",
+            }}
+            operacao = uuid.uuid4()
+            resposta = self.client.post("/api/terminal/venda/pagamento/vale-troca/", {
+                "venda_uuid": venda, "operacao_uuid": str(operacao),
+                "documento": "VT0000077", "valor": "95.00",
+            }, format="json")
+            self.assertEqual(resposta.status_code, 201, resposta.data)
+            client.vale_troca_reservar_venda.return_value = {"reservas": [{
+                "operacao_uuid": str(operacao), "id": 800, "vale_id": 77,
+            }]}
+            self.assertEqual(self.finalizar(venda).status_code, 200)
+            client.vale_troca_reservar_venda.assert_called_once()
+        self.vale.refresh_from_db()
+        self.assertEqual(self.vale.saldo, Decimal("100.00"))
+
+    def test_finalizacao_rejeita_pagamento_sem_vinculo(self):
+        venda = self.preparar_troca()
+        self.assertEqual(self.aplicar_credito(venda).status_code, 201)
+        VendaDevolucaoHub.objects.filter(pk=self.devolucao.pk).update(venda_troca=None)
+        self.assertEqual(self.finalizar(venda).status_code, 409)
+        self.vale.refresh_from_db()
+        self.assertEqual(self.vale.saldo, Decimal("100.00"))
+        self.assertFalse(self.vale.movimentos.filter(tipo="USO").exists())
+
+    def test_uuid_invalido_e_retry_divergente(self):
+        venda = self.preparar_troca()
+        operacao = uuid.uuid4()
+        resposta = self.aplicar_credito(venda, operacao=operacao)
+        self.assertEqual(resposta.status_code, 201)
+        pagamento = next(p for p in resposta.data["venda"]["pagamentos"] if p["tipo"] == "VALE_TROCA")
+        self.assertEqual(pagamento["devolucao_uuid"], str(self.devolucao.devolucao_uuid))
+        for identificador, esperado in (("invalido", 400), (str(uuid.uuid4()), 409)):
+            resposta = self.client.post("/api/terminal/venda/pagamento/vale-troca/", {
+                "venda_uuid": venda, "operacao_uuid": str(operacao),
+                "documento": self.vale.documento, "valor": "95.00",
+                "devolucao_uuid": identificador,
+            }, format="json")
+            self.assertEqual(resposta.status_code, esperado)
+        self.assertEqual(VendaPagamentoHub.objects.filter(venda__venda_uuid=venda).count(), 1)
+
+    def test_espelho_oficial_sem_sync_nao_autoriza_offline(self):
+        venda = self.preparar_troca()
+        self.vale.provisorio = False
+        self.vale.documento = "VT0000077"
+        self.vale.save()
+        self.assertEqual(self.aplicar_credito(venda, tipo="TROCA").status_code, 409)
+        with patch("core.services.vales_troca.RetaguardaClient") as client_cls:
+            client_cls.return_value.vale_troca_consultar.side_effect = RetaguardaError("offline")
+            self.assertEqual(self.aplicar_credito(venda).status_code, 409)
+        self.assertIsNone(VendaDevolucaoHub.objects.get(pk=self.devolucao.pk).venda_troca_id)
+
+
 class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
     def test_promocao_local_aplica_desconto_e_preserva_snapshot(self):
         PromocaoHub.objects.create(

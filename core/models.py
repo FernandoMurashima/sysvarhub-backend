@@ -1754,6 +1754,7 @@ class VendaDevolucaoHub(models.Model):
     hub = models.ForeignKey(HubConfig, on_delete=models.PROTECT, related_name="devolucoes")
     documento = models.CharField(max_length=11, null=True, blank=True, db_index=True)
     venda_origem = models.ForeignKey(VendaHub, on_delete=models.PROTECT, null=True, blank=True, related_name="devolucoes")
+    venda_troca = models.ForeignKey(VendaHub, on_delete=models.PROTECT, null=True, blank=True, related_name="devolucoes_troca")
     venda_origem_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True, db_index=True)
     venda_origem_documento = models.CharField(max_length=80, blank=True, default="")
     loja_origem_retaguarda_id = models.PositiveBigIntegerField(null=True, blank=True)

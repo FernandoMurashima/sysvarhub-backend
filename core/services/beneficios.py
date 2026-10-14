@@ -1,3 +1,4 @@
+import uuid
 from datetime import timedelta
 from decimal import Decimal
 
@@ -5,7 +6,7 @@ from django.db import models, transaction
 from django.db.models import Case, DecimalField, Sum, Value, When
 from django.utils import timezone
 
-from core.models import CashbackConfigHub, CashbackMovimentoHub, PromocaoHub, ValeTrocaHub, ValeTrocaMovimentoHub
+from core.models import CashbackConfigHub, CashbackMovimentoHub, PromocaoHub, ValeTrocaHub, ValeTrocaMovimentoHub, VendaDevolucaoHub
 
 
 ZERO = Decimal("0.00")
@@ -71,7 +72,13 @@ def vales_abertos(venda, *, bloquear=False, apenas_utilizaveis_offline=False):
     if bloquear:
         qs = qs.select_for_update()
     if apenas_utilizaveis_offline:
-        qs = qs.filter(sincronizado_em__isnull=True)
+        qs = qs.filter(
+            sincronizado_em__isnull=True, provisorio=True,
+            devolucao__hub=venda.hub,
+            devolucao__origem=VendaDevolucaoHub.ORIGEM_VENDA_LOCAL,
+            devolucao__venda_origem__hub=venda.hub,
+            devolucao__venda_troca_id=getattr(venda, "pk", None),
+        ).exclude(devolucao__venda_troca__isnull=True)
     qs = _filtrar_cliente(qs, venda)
     return qs.filter(models.Q(validade__isnull=True) | models.Q(validade__gte=hoje)).order_by("criado_em", "id")
 
@@ -82,11 +89,12 @@ def saldo_vale_troca(venda):
     return money(vales_abertos(venda, apenas_utilizaveis_offline=True).aggregate(total=Sum("saldo")).get("total") or ZERO)
 
 
-def validar_pagamento_beneficio(venda, forma, valor, autorizacao="", tipo=None, total_beneficio=None, bloquear_saldo=False):
+def validar_pagamento_beneficio(venda, forma, valor, autorizacao="", tipo=None, total_beneficio=None, bloquear_saldo=False, devolucao_uuid=None):
     tipo = (tipo or getattr(forma, "tipo", "") or "").upper()
     if tipo == "CASHBACK":
         return validar_cashback(venda, valor, total_cashback=total_beneficio, bloquear_saldo=bloquear_saldo)
     if tipo in ("TROCA", "VALE_TROCA"):
+        vincular_credito_provisorio(venda, autorizacao, devolucao_uuid)
         return validar_vale_troca(venda, valor, autorizacao)
     return None
 
@@ -171,6 +179,40 @@ def validar_cashback_central(venda, valor):
         raise ValueError("O cashback usado ultrapassa o limite permitido para a venda.")
 
 
+def vincular_credito_provisorio(venda, documento, devolucao_uuid):
+    documento = str(documento or "").strip().upper()
+    vale = ValeTrocaHub.objects.filter(hub=venda.hub, documento=documento, provisorio=True).first()
+    if not vale:
+        raise ValueError("Crédito provisório inválido. Vales oficiais exigem validação online na Central.")
+    try:
+        identificador = uuid.UUID(str(devolucao_uuid))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("Informe o UUID da devolução vinculada à troca.") from exc
+    devolucao = VendaDevolucaoHub.objects.select_for_update().filter(
+        pk=vale.devolucao_id, devolucao_uuid=identificador, hub=venda.hub,
+        origem=VendaDevolucaoHub.ORIGEM_VENDA_LOCAL,
+        status=VendaDevolucaoHub.STATUS_FINALIZADA,
+        venda_origem__hub=venda.hub, venda_origem__status="FINALIZADA",
+    ).first()
+    if not devolucao or vale.origem_devolucao_uuid != identificador:
+        raise ValueError("Crédito não pertence à devolução local informada.")
+    if venda.status != "ABERTA" or venda.pk == devolucao.venda_origem_id:
+        raise ValueError("Venda de troca inválida.")
+    for registro in (devolucao, vale, devolucao.venda_origem):
+        if (registro.cliente_uuid and registro.cliente_uuid != venda.cliente_uuid) or (
+            registro.cliente_retaguarda_id and registro.cliente_retaguarda_id != venda.cliente_retaguarda_id
+        ) or not (registro.cliente_uuid or registro.cliente_retaguarda_id):
+            raise ValueError("Crédito provisório pertence a outro cliente.")
+    if devolucao.venda_troca_id and devolucao.venda_troca_id != venda.pk:
+        raise ValueError("Crédito provisório já vinculado a outra venda de troca.")
+    if ValeTrocaMovimentoHub.objects.filter(vale=vale, tipo=ValeTrocaMovimentoHub.TIPO_USO).exclude(venda=venda).exists():
+        raise ValueError("Crédito provisório já utilizado em outra venda.")
+    if not devolucao.venda_troca_id:
+        devolucao.venda_troca = venda
+        devolucao.save(update_fields=["venda_troca"])
+    return vale
+
+
 def validar_vale_troca(venda, valor, autorizacao=""):
     validar_cashback_vale_troca_exclusivos(venda, novo_tipo="VALE_TROCA")
     if cliente_padrao(venda):
@@ -183,6 +225,8 @@ def validar_vale_troca(venda, valor, autorizacao=""):
         raise ValueError("Cupom de troca inválido para este cliente.")
     if money(valor) > money(vale.saldo):
         raise ValueError("O valor informado é maior que o saldo do cupom de troca selecionado.")
+    if venda.pagamentos.filter(status="ATIVO", vale_troca_documento=documento).exists():
+        raise ValueError("O mesmo crédito provisório não pode ser usado duas vezes na venda.")
     outros = _total_pago_outros(venda, "TROCA", "VALE_TROCA")
     if money(valor) > money(max(ZERO, venda.total - outros)):
         raise ValueError("Troca não pode gerar troco; use apenas o saldo pendente da venda.")
@@ -222,6 +266,13 @@ def aplicar_promocao(catalogo_item, quantidade):
 def registrar_beneficios_venda(venda, pagamentos):
     with transaction.atomic():
         validar_cashback_vale_troca_exclusivos(venda, pagamentos=pagamentos)
+        documentos_locais = [
+            str(p.vale_troca_documento or p.autorizacao or "").strip().upper()
+            for p in pagamentos
+            if (p.tipo or "").upper() in TIPOS_VALE_TROCA and not p.vale_troca_reserva_id
+        ]
+        if len(documentos_locais) != len(set(documentos_locais)):
+            raise ValueError("O mesmo crédito provisório não pode ser usado duas vezes na venda.")
         total_cashback_local = money(sum(
             (
                 p.valor
@@ -282,11 +333,21 @@ def _consumir_vale(venda, pagamento):
     documento = str(pagamento.vale_troca_documento or pagamento.autorizacao or "").strip()
     if not documento:
         raise ValueError("Selecione um cupom de troca válido para o pagamento.")
+    devolucao = venda.devolucoes_troca.filter(vale_troca__documento=documento).first()
+    vincular_credito_provisorio(venda, documento, devolucao.devolucao_uuid if devolucao else None)
+    if ValeTrocaMovimentoHub.objects.filter(
+        vale__hub=venda.hub, vale__documento=documento, venda=venda,
+        tipo=ValeTrocaMovimentoHub.TIPO_USO,
+    ).exists():
+        return
     vale = vales_abertos(venda, bloquear=True, apenas_utilizaveis_offline=True).filter(documento=documento).first()
     if not vale:
         raise ValueError("Cupom de troca inválido para este cliente.")
     if restante > money(vale.saldo):
         raise ValueError("Saldo de troca insuficiente para concluir a venda.")
+    outros = _total_pago_outros(venda, "TROCA", "VALE_TROCA")
+    if restante > money(max(ZERO, venda.total - outros)):
+        raise ValueError("Troca não pode gerar troco; use apenas o saldo pendente da venda.")
     vale.saldo = money(vale.saldo - restante)
     if vale.saldo <= ZERO:
         vale.status = ValeTrocaHub.STATUS_USADO
@@ -382,7 +443,7 @@ def consultar_beneficios_cliente(hub, cliente_uuid):
     })()
     config = cashback_config_ativa(hub)
     saldo_offline = saldo_cashback_offline(base)
-    vales = vales_abertos(base)
+    vales = vales_abertos(base).filter(provisorio=False)
     return {
         "cashback": {
             "saldo": f"{saldo_offline:.2f}",
@@ -396,7 +457,7 @@ def consultar_beneficios_cliente(hub, cliente_uuid):
                 "documento": vale.documento,
                 "saldo": f"{vale.saldo:.2f}",
                 "validade": vale.validade.isoformat() if vale.validade else None,
-                "utilizavel_offline": vale.sincronizado_em is None,
+                "utilizavel_offline": False,
             }
             for vale in vales
         ],
