@@ -469,21 +469,37 @@ def _canonicalizar_devolucao_confirmada(evento, resultado, agora):
     devolucao = VendaDevolucaoHub.objects.select_for_update().filter(hub=evento.hub, devolucao_uuid=devolucao_uuid).first()
     if not devolucao:
         return
-    documento_confirmado = resultado.get("documento") or ""
+    mapeamento = _mapeamento_devolucao_confirmada(resultado)
+    documento_confirmado = mapeamento.get("documento") or ""
     if devolucao.documento and documento_confirmado and documento_confirmado != devolucao.documento:
         raise ConciliacaoDevolucaoConflito("Central retornou documento de devolucao diferente do enviado pelo Hub.")
-    valor_confirmado = _valor_total_devolucao_confirmado(resultado)
+    valor_confirmado = _valor_total_devolucao_confirmado(mapeamento)
     vale = ValeTrocaHub.objects.select_for_update().filter(devolucao=devolucao).first()
-    if vale and valor_confirmado is None:
-        raise ValueError("Central nao retornou valor_total para conciliacao do Vale-Troca.")
     devolucao.status = VendaDevolucaoHub.STATUS_FINALIZADA
     devolucao.conflito_mensagem = ""
-    devolucao.retaguarda_id = resultado.get("devolucao_retaguarda_id") or devolucao.retaguarda_id
+    devolucao.retaguarda_id = mapeamento.get("devolucao_retaguarda_id") or devolucao.retaguarda_id
     devolucao.documento_central = documento_confirmado or devolucao.documento_central
     devolucao.confirmado_central_em = agora
     devolucao.save(update_fields=["status", "conflito_mensagem", "retaguarda_id", "documento_central", "confirmado_central_em"])
     if vale:
-        _conciliar_vale_provisorio_confirmado(vale, resultado, valor_confirmado, agora)
+        _conciliar_vale_provisorio_confirmado(vale, mapeamento, valor_confirmado, agora)
+
+
+def _mapeamento_devolucao_confirmada(resultado):
+    mapeamento = resultado.get("mapeamento")
+    if not isinstance(mapeamento, dict):
+        raise ValueError("Central nao retornou mapeamento valido para devolucao.")
+    if not mapeamento.get("devolucao_retaguarda_id"):
+        raise ValueError("Central nao retornou devolucao_retaguarda_id para devolucao.")
+    if "valor_total" not in mapeamento:
+        raise ValueError("Central nao retornou valor_total para conciliacao do Vale-Troca.")
+    valor_confirmado = _valor_total_devolucao_confirmado(mapeamento)
+    if valor_confirmado > ZERO:
+        if not str(mapeamento.get("vale_documento") or "").strip():
+            raise ValueError("Central nao retornou vale_documento para credito positivo.")
+        if not mapeamento.get("vale_retaguarda_id"):
+            raise ValueError("Central nao retornou vale_retaguarda_id para credito positivo.")
+    return mapeamento
 
 
 def _conciliar_vale_provisorio_confirmado(vale, resultado, valor_confirmado, agora):

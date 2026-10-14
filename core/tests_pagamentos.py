@@ -823,7 +823,7 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
         evento.status = EventoSyncHub.STATUS_PENDENTE
         evento.sincronizado_em = None
         evento.save(update_fields=["status", "sincronizado_em", "atualizado_em"])
-        self._sincronizar_devolucao_confirmada(evento, **resposta)
+        self._sincronizar_devolucao_confirmada(evento, status="DUPLICADO", **resposta)
         vale.refresh_from_db()
 
         self.assertEqual(vale.saldo, Decimal("70.00"))
@@ -845,10 +845,61 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
         vale.refresh_from_db()
 
         self.assertEqual(evento.status, EventoSyncHub.STATUS_ERRO)
-        self.assertEqual(evento.resposta["valor_total"], "70.00")
+        self.assertEqual(evento.resposta["mapeamento"]["valor_total"], "70.00")
         self.assertIsNone(evento.sincronizado_em)
         self.assertTrue(vale.provisorio)
         self.assertEqual(vale.saldo, Decimal("100.00"))
+
+        evento.proxima_tentativa_em = None
+        evento.save(update_fields=["proxima_tentativa_em", "atualizado_em"])
+        self._sincronizar_devolucao_confirmada(
+            evento,
+            status="DUPLICADO",
+            devolucao_retaguarda_id=505,
+            documento=_devolucao.documento,
+            vale_documento="VT0000505",
+            vale_retaguarda_id=905,
+            valor_total="70.00",
+        )
+        evento.refresh_from_db()
+        vale.refresh_from_db()
+
+        self.assertEqual(evento.status, EventoSyncHub.STATUS_SINCRONIZADO)
+        self.assertEqual(vale.documento, "VT0000505")
+        self.assertEqual(vale.saldo, Decimal("70.00"))
+
+    def test_sync_devolucao_mapeamento_ausente_ou_invalido_nao_usa_raiz_da_resposta(self):
+        _devolucao, vale, evento = self._criar_devolucao_provisoria("100.00")
+        resposta_raiz = {
+            "status": "PROCESSADO",
+            "devolucao_retaguarda_id": 507,
+            "documento": _devolucao.documento,
+            "vale_documento": "VT0000507",
+            "vale_retaguarda_id": 907,
+            "valor_total": "70.00",
+        }
+
+        sincronizar_eventos_pendentes(self.hub, client=self._client_sync(evento, resposta_raiz), evento_ids=[evento.pk])
+        evento.refresh_from_db()
+        vale.refresh_from_db()
+
+        self.assertEqual(evento.status, EventoSyncHub.STATUS_ERRO)
+        self.assertIn("mapeamento valido", evento.ultimo_erro)
+        self.assertEqual(evento.resposta["valor_total"], "70.00")
+        self.assertTrue(vale.provisorio)
+        self.assertEqual(vale.saldo, Decimal("100.00"))
+
+        evento.proxima_tentativa_em = None
+        evento.save(update_fields=["proxima_tentativa_em", "atualizado_em"])
+        sincronizar_eventos_pendentes(
+            self.hub,
+            client=self._client_sync(evento, {"status": "DUPLICADO", "mapeamento": []}),
+            evento_ids=[evento.pk],
+        )
+        evento.refresh_from_db()
+
+        self.assertEqual(evento.status, EventoSyncHub.STATUS_ERRO)
+        self.assertIn("mapeamento valido", evento.ultimo_erro)
 
     def test_sync_devolucao_provisorio_ja_utilizado_entra_em_conflito_e_bloqueia_dependente(self):
         devolucao, vale, evento = self._criar_devolucao_provisoria("100.00")
@@ -934,8 +985,8 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
         )
         return devolucao, vale, evento
 
-    def _sincronizar_devolucao_confirmada(self, evento, **resultado):
-        payload = {"status": "PROCESSADO", **resultado}
+    def _sincronizar_devolucao_confirmada(self, evento, status="PROCESSADO", **resultado):
+        payload = {"status": status, "mapeamento": resultado}
         return sincronizar_eventos_pendentes(self.hub, client=self._client_sync(evento, payload), evento_ids=[evento.pk])
 
     def _client_sync(self, evento, resultado):
