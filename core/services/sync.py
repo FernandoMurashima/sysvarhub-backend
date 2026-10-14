@@ -1,6 +1,7 @@
 import uuid
 import json
 import hashlib
+from decimal import Decimal, InvalidOperation
 from datetime import timedelta
 
 from django.db import transaction
@@ -33,6 +34,11 @@ TIPO_RECEBIMENTO_LOJA_CONFERIDO = "RECEBIMENTO_LOJA_CONFERIDO"
 TIPO_DISTRIBUICAO_LOJA_CONFERIDA = "DISTRIBUICAO_LOJA_CONFERIDA"
 STATUS_CONFIRMADOS = {"PROCESSADO", "DUPLICADO"}
 SEGREDOS_BLOQUEADOS = {"certificado", "private_key", "chave_privada", "senha", "csc", "token_csc"}
+ZERO = Decimal("0.00")
+
+
+class ConciliacaoDevolucaoConflito(Exception):
+    pass
 
 
 def enfileirar_venda_finalizada(venda):
@@ -353,15 +359,32 @@ def sincronizar_eventos_pendentes(hub=None, *, client=None, limite=50, agora=Non
         resultado = resultados.get(evento.chave_idempotencia, {})
         status = resultado.get("status")
         if status in STATUS_CONFIRMADOS:
-            _marcar_recebimento_confirmado(evento, resultado, agora)
-            evento.status = EventoSyncHub.STATUS_SINCRONIZADO
-            evento.sincronizado_em = agora
-            evento.resposta = resultado
-            evento.ultimo_erro = ""
-            evento.save(update_fields=["status", "sincronizado_em", "resposta", "ultimo_erro", "atualizado_em"])
-            _marcar_beneficios_centralizados(evento, agora)
-            _canonicalizar_devolucao_confirmada(evento, resultado, agora)
-            contadores["sincronizados"] += 1
+            try:
+                with transaction.atomic():
+                    evento = EventoSyncHub.objects.select_for_update().get(pk=evento.pk)
+                    _marcar_recebimento_confirmado(evento, resultado, agora)
+                    _canonicalizar_devolucao_confirmada(evento, resultado, agora)
+                    _marcar_beneficios_centralizados(evento, agora)
+                    evento.status = EventoSyncHub.STATUS_SINCRONIZADO
+                    evento.sincronizado_em = agora
+                    evento.resposta = resultado
+                    evento.ultimo_erro = ""
+                    evento.proxima_tentativa_em = None
+                    evento.save(update_fields=["status", "sincronizado_em", "resposta", "ultimo_erro", "proxima_tentativa_em", "atualizado_em"])
+                contadores["sincronizados"] += 1
+            except ConciliacaoDevolucaoConflito as exc:
+                mensagem = str(exc)[:255]
+                with transaction.atomic():
+                    evento = EventoSyncHub.objects.select_for_update().get(pk=evento.pk)
+                    evento.status = EventoSyncHub.STATUS_CONFLITO
+                    evento.resposta = resultado
+                    evento.ultimo_erro = mensagem
+                    evento.save(update_fields=["status", "resposta", "ultimo_erro", "atualizado_em"])
+                    _marcar_devolucao_em_conflito(evento, mensagem)
+                contadores["conflitos"] += 1
+            except Exception as exc:
+                _marcar_retry(evento, str(exc), agora, resposta=resultado)
+                contadores["erros"] += 1
         elif status == "CONFLITO":
             evento.status = EventoSyncHub.STATUS_CONFLITO
             evento.resposta = resultado
@@ -443,28 +466,101 @@ def _canonicalizar_devolucao_confirmada(evento, resultado, agora):
     devolucao_uuid = payload.get("devolucao_uuid")
     if not devolucao_uuid:
         return
-    devolucao = VendaDevolucaoHub.objects.filter(hub=evento.hub, devolucao_uuid=devolucao_uuid).first()
+    devolucao = VendaDevolucaoHub.objects.select_for_update().filter(hub=evento.hub, devolucao_uuid=devolucao_uuid).first()
     if not devolucao:
         return
     documento_confirmado = resultado.get("documento") or ""
     if devolucao.documento and documento_confirmado and documento_confirmado != devolucao.documento:
-        _marcar_devolucao_em_conflito(evento, "Central retornou documento de devolucao diferente do enviado pelo Hub.")
-        return
+        raise ConciliacaoDevolucaoConflito("Central retornou documento de devolucao diferente do enviado pelo Hub.")
+    valor_confirmado = _valor_total_devolucao_confirmado(resultado)
+    vale = ValeTrocaHub.objects.select_for_update().filter(devolucao=devolucao).first()
+    if vale and valor_confirmado is None:
+        raise ValueError("Central nao retornou valor_total para conciliacao do Vale-Troca.")
     devolucao.status = VendaDevolucaoHub.STATUS_FINALIZADA
     devolucao.conflito_mensagem = ""
     devolucao.retaguarda_id = resultado.get("devolucao_retaguarda_id") or devolucao.retaguarda_id
     devolucao.documento_central = documento_confirmado or devolucao.documento_central
     devolucao.confirmado_central_em = agora
     devolucao.save(update_fields=["status", "conflito_mensagem", "retaguarda_id", "documento_central", "confirmado_central_em"])
-    vale = getattr(devolucao, "vale_troca", None)
     if vale:
-        vale.documento = resultado.get("vale_documento") or vale.documento
-        vale.retaguarda_id = resultado.get("vale_retaguarda_id") or vale.retaguarda_id
+        _conciliar_vale_provisorio_confirmado(vale, resultado, valor_confirmado, agora)
+
+
+def _conciliar_vale_provisorio_confirmado(vale, resultado, valor_confirmado, agora):
+    if ValeTrocaMovimentoHub.objects.filter(vale=vale, tipo=ValeTrocaMovimentoHub.TIPO_USO).exists():
+        raise ConciliacaoDevolucaoConflito(
+            "Vale-Troca provisorio ja utilizado; conciliacao com Vale oficial exige tratamento manual."
+        )
+
+    if valor_confirmado <= ZERO:
+        _registrar_ajuste_vale(vale, -money(vale.saldo), "Conciliação Central: crédito líquido zero.")
+        vale.valor_original = ZERO
+        vale.saldo = ZERO
+        vale.status = ValeTrocaHub.STATUS_CANCELADO
         vale.provisorio = False
         vale.origem = ValeTrocaHub.ORIGEM_CENTRAL
         vale.conflito_mensagem = ""
         vale.sincronizado_em = agora
-        vale.save(update_fields=["documento", "retaguarda_id", "provisorio", "origem", "conflito_mensagem", "sincronizado_em", "atualizado_em"])
+        vale.save(update_fields=["valor_original", "saldo", "status", "provisorio", "origem", "conflito_mensagem", "sincronizado_em", "atualizado_em"])
+        return
+
+    documento_oficial = str(resultado.get("vale_documento") or "").strip()
+    if not documento_oficial:
+        raise ValueError("Central nao retornou vale_documento para credito positivo.")
+    retaguarda_id = resultado.get("vale_retaguarda_id")
+    if not retaguarda_id:
+        raise ValueError("Central nao retornou vale_retaguarda_id para credito positivo.")
+
+    _registrar_ajuste_vale(
+        vale,
+        money(valor_confirmado - vale.saldo),
+        f"Conciliação Central: crédito oficial {documento_oficial}.",
+    )
+    vale.documento = documento_oficial
+    vale.retaguarda_id = retaguarda_id
+    vale.valor_original = valor_confirmado
+    vale.saldo = valor_confirmado
+    vale.status = ValeTrocaHub.STATUS_ABERTO
+    vale.provisorio = False
+    vale.origem = ValeTrocaHub.ORIGEM_CENTRAL
+    vale.conflito_mensagem = ""
+    vale.sincronizado_em = agora
+    vale.save(update_fields=["documento", "retaguarda_id", "valor_original", "saldo", "status", "provisorio", "origem", "conflito_mensagem", "sincronizado_em", "atualizado_em"])
+
+
+def _registrar_ajuste_vale(vale, delta, observacao):
+    delta = money(delta)
+    if delta == ZERO:
+        return
+    if delta > ZERO:
+        tipo = ValeTrocaMovimentoHub.TIPO_CREDITO
+        valor = delta
+    else:
+        tipo = ValeTrocaMovimentoHub.TIPO_ESTORNO
+        valor = abs(delta)
+    ValeTrocaMovimentoHub.objects.create(
+        vale=vale,
+        tipo=tipo,
+        valor=valor,
+        saldo_apos=money(vale.saldo + delta),
+        observacao=observacao[:255],
+    )
+
+
+def _valor_total_devolucao_confirmado(resultado):
+    if "valor_total" not in resultado:
+        return None
+    try:
+        valor = money(Decimal(str(resultado.get("valor_total") or "0.00")))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("Central retornou valor_total invalido para devolucao.") from exc
+    if valor < ZERO:
+        raise ValueError("Central retornou valor_total negativo para devolucao.")
+    return valor
+
+
+def money(valor):
+    return Decimal(valor).quantize(Decimal("0.01"))
 
 
 def _marcar_recebimento_confirmado(evento, resultado, agora):
@@ -536,6 +632,11 @@ def _marcar_devolucao_em_conflito(evento, mensagem):
     ValeTrocaHub.objects.filter(hub=evento.hub, devolucao__devolucao_uuid=devolucao_uuid).update(
         conflito_mensagem=mensagem[:255],
     )
+    ValeTrocaHub.objects.filter(
+        hub=evento.hub,
+        devolucao__devolucao_uuid=devolucao_uuid,
+        saldo__gt=0,
+    ).update(status=ValeTrocaHub.STATUS_CANCELADO)
 
 
 def _marcar_recebimento_em_conflito(evento, mensagem, agora):

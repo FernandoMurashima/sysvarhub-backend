@@ -744,6 +744,207 @@ class BeneficiosHubTests(PagamentoHubTestMixin, TestCase):
         self.assertIsNotNone(movimento.centralizado_em)
         self.assertIsNotNone(vale.sincronizado_em)
 
+    def test_sync_devolucao_concilia_vale_provisorio_com_credito_liquido(self):
+        _devolucao, vale, evento = self._criar_devolucao_provisoria("100.00")
+
+        self._sincronizar_devolucao_confirmada(
+            evento,
+            devolucao_retaguarda_id=501,
+            documento=_devolucao.documento,
+            vale_documento="VT0000501",
+            vale_retaguarda_id=901,
+            valor_total="70.00",
+        )
+        vale.refresh_from_db()
+
+        self.assertEqual(vale.documento, "VT0000501")
+        self.assertEqual(vale.retaguarda_id, 901)
+        self.assertEqual(vale.valor_original, Decimal("70.00"))
+        self.assertEqual(vale.saldo, Decimal("70.00"))
+        self.assertFalse(vale.provisorio)
+        self.assertEqual(vale.origem, ValeTrocaHub.ORIGEM_CENTRAL)
+        self.assertEqual(
+            list(vale.movimentos.filter(tipo=ValeTrocaMovimentoHub.TIPO_ESTORNO).values_list("valor", "saldo_apos")),
+            [(Decimal("30.00"), Decimal("70.00"))],
+        )
+
+    def test_sync_devolucao_preserva_vale_sem_cashback_quando_valor_confere(self):
+        _devolucao, vale, evento = self._criar_devolucao_provisoria("100.00")
+
+        self._sincronizar_devolucao_confirmada(
+            evento,
+            devolucao_retaguarda_id=502,
+            documento=_devolucao.documento,
+            vale_documento="VT0000502",
+            vale_retaguarda_id=902,
+            valor_total="100.00",
+        )
+        vale.refresh_from_db()
+
+        self.assertEqual(vale.valor_original, Decimal("100.00"))
+        self.assertEqual(vale.saldo, Decimal("100.00"))
+        self.assertFalse(vale.provisorio)
+        self.assertFalse(vale.movimentos.filter(tipo=ValeTrocaMovimentoHub.TIPO_ESTORNO).exists())
+
+    def test_sync_devolucao_credito_liquido_zero_neutraliza_provisorio_sem_documento_oficial(self):
+        _devolucao, vale, evento = self._criar_devolucao_provisoria("100.00")
+        documento_provisorio = vale.documento
+
+        self._sincronizar_devolucao_confirmada(
+            evento,
+            devolucao_retaguarda_id=503,
+            documento=_devolucao.documento,
+            valor_total="0.00",
+        )
+        vale.refresh_from_db()
+
+        self.assertEqual(vale.documento, documento_provisorio)
+        self.assertIsNone(vale.retaguarda_id)
+        self.assertEqual(vale.valor_original, Decimal("0.00"))
+        self.assertEqual(vale.saldo, Decimal("0.00"))
+        self.assertEqual(vale.status, ValeTrocaHub.STATUS_CANCELADO)
+        self.assertFalse(vale.provisorio)
+        self.assertEqual(
+            list(vale.movimentos.filter(tipo=ValeTrocaMovimentoHub.TIPO_ESTORNO).values_list("valor", "saldo_apos")),
+            [(Decimal("100.00"), Decimal("0.00"))],
+        )
+
+    def test_sync_devolucao_retry_nao_duplica_ajuste_de_conciliacao(self):
+        _devolucao, vale, evento = self._criar_devolucao_provisoria("100.00")
+        resposta = {
+            "devolucao_retaguarda_id": 504,
+            "documento": _devolucao.documento,
+            "vale_documento": "VT0000504",
+            "vale_retaguarda_id": 904,
+            "valor_total": "70.00",
+        }
+
+        self._sincronizar_devolucao_confirmada(evento, **resposta)
+        evento.status = EventoSyncHub.STATUS_PENDENTE
+        evento.sincronizado_em = None
+        evento.save(update_fields=["status", "sincronizado_em", "atualizado_em"])
+        self._sincronizar_devolucao_confirmada(evento, **resposta)
+        vale.refresh_from_db()
+
+        self.assertEqual(vale.saldo, Decimal("70.00"))
+        self.assertEqual(vale.movimentos.filter(tipo=ValeTrocaMovimentoHub.TIPO_ESTORNO).count(), 1)
+
+    def test_sync_devolucao_falha_local_preserva_resposta_sem_sincronizar_evento(self):
+        _devolucao, vale, evento = self._criar_devolucao_provisoria("100.00")
+
+        with patch("core.services.sync._conciliar_vale_provisorio_confirmado", side_effect=RuntimeError("falha local")):
+            self._sincronizar_devolucao_confirmada(
+                evento,
+                devolucao_retaguarda_id=505,
+                documento=_devolucao.documento,
+                vale_documento="VT0000505",
+                vale_retaguarda_id=905,
+                valor_total="70.00",
+            )
+        evento.refresh_from_db()
+        vale.refresh_from_db()
+
+        self.assertEqual(evento.status, EventoSyncHub.STATUS_ERRO)
+        self.assertEqual(evento.resposta["valor_total"], "70.00")
+        self.assertIsNone(evento.sincronizado_em)
+        self.assertTrue(vale.provisorio)
+        self.assertEqual(vale.saldo, Decimal("100.00"))
+
+    def test_sync_devolucao_provisorio_ja_utilizado_entra_em_conflito_e_bloqueia_dependente(self):
+        devolucao, vale, evento = self._criar_devolucao_provisoria("100.00")
+        venda_uuid = self.criar_venda_com_item()
+        venda = VendaHub.objects.get(venda_uuid=venda_uuid)
+        ValeTrocaMovimentoHub.objects.create(
+            vale=vale,
+            venda=venda,
+            tipo=ValeTrocaMovimentoHub.TIPO_USO,
+            valor=Decimal("30.00"),
+            saldo_apos=Decimal("70.00"),
+            observacao="Uso local antes da confirmação",
+        )
+        vale.saldo = Decimal("70.00")
+        vale.save(update_fields=["saldo", "atualizado_em"])
+        evento_venda = EventoSyncHub.objects.create(
+            hub=self.hub,
+            tipo="VENDA_FINALIZADA",
+            chave_idempotencia="VENDA:DEPENDENTE:FINALIZADA",
+            payload={"venda_uuid": str(venda.venda_uuid), "dependencias": {"devolucoes_uuid": [str(devolucao.devolucao_uuid)]}},
+        )
+
+        self._sincronizar_devolucao_confirmada(
+            evento,
+            devolucao_retaguarda_id=506,
+            documento=devolucao.documento,
+            vale_documento="VT0000506",
+            vale_retaguarda_id=906,
+            valor_total="70.00",
+        )
+        evento.refresh_from_db()
+        vale.refresh_from_db()
+        sincronizar_eventos_pendentes(self.hub, client=self._client_sync(evento_venda, {"status": "PROCESSADO"}), evento_ids=[evento_venda.pk])
+        evento_venda.refresh_from_db()
+
+        self.assertEqual(evento.status, EventoSyncHub.STATUS_CONFLITO)
+        self.assertTrue(vale.provisorio)
+        self.assertEqual(vale.status, ValeTrocaHub.STATUS_CANCELADO)
+        self.assertEqual(vale.saldo, Decimal("70.00"))
+        self.assertEqual(evento_venda.status, EventoSyncHub.STATUS_PENDENTE)
+        self.assertIn("Aguardando devolução provisória", evento_venda.ultimo_erro)
+
+    def _criar_devolucao_provisoria(self, valor):
+        cliente = self.criar_cliente()
+        valor = Decimal(valor)
+        devolucao = VendaDevolucaoHub.objects.create(
+            hub=self.hub,
+            documento="00000012345",
+            operador=self.operador,
+            terminal=self.terminal,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            motivo="Troca",
+            valor_total=valor,
+            origem=VendaDevolucaoHub.ORIGEM_VENDA_LOCAL,
+            finalizada_em=timezone.now(),
+        )
+        vale = ValeTrocaHub.objects.create(
+            hub=self.hub,
+            devolucao=devolucao,
+            cliente_uuid=cliente.cliente_uuid,
+            cliente_retaguarda_id=cliente.retaguarda_id,
+            documento=f"VT-HUB-{devolucao.devolucao_uuid.hex[:20]}",
+            valor_original=valor,
+            saldo=valor,
+            status=ValeTrocaHub.STATUS_ABERTO,
+            origem_devolucao_uuid=devolucao.devolucao_uuid,
+            origem=ValeTrocaHub.ORIGEM_HUB_PROVISORIO,
+            provisorio=True,
+        )
+        ValeTrocaMovimentoHub.objects.create(
+            vale=vale,
+            tipo=ValeTrocaMovimentoHub.TIPO_CREDITO,
+            valor=valor,
+            saldo_apos=valor,
+            observacao="Crédito provisório",
+        )
+        evento = EventoSyncHub.objects.create(
+            hub=self.hub,
+            tipo="DEVOLUCAO_FINALIZADA",
+            chave_idempotencia=f"DEVOLUCAO:{devolucao.devolucao_uuid}:FINALIZADA",
+            payload={"devolucao_uuid": str(devolucao.devolucao_uuid), "documento": devolucao.documento, "vale_troca": {"documento": vale.documento}},
+        )
+        return devolucao, vale, evento
+
+    def _sincronizar_devolucao_confirmada(self, evento, **resultado):
+        payload = {"status": "PROCESSADO", **resultado}
+        return sincronizar_eventos_pendentes(self.hub, client=self._client_sync(evento, payload), evento_ids=[evento.pk])
+
+    def _client_sync(self, evento, resultado):
+        class ClientOk:
+            def sync_push(self, **kwargs):
+                return {"resultados": [{"chave_idempotencia": evento.chave_idempotencia, **resultado}]}
+
+        return ClientOk()
+
     def test_consulta_devolucao_por_numero_nfce(self):
         cliente = self.criar_cliente()
         venda_uuid = self.criar_venda_com_item()
