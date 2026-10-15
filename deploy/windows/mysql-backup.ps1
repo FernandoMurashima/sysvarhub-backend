@@ -261,7 +261,7 @@ function Get-HubBackupServerState {
     param([string]$MysqlRoot, [string]$ProgramDataRoot, [string]$CredentialFile)
     $grants = Get-HubBackupQuery $MysqlRoot $CredentialFile 'SHOW GRANTS FOR CURRENT_USER();'
     $sql = @"
-SELECT JSON_OBJECT('partial_revokes',@@GLOBAL.partial_revokes,'version',VERSION(),'port',@@port,'basedir',@@basedir,'datadir',@@datadir,'log_bin',@@log_bin,'binlog_format',@@binlog_format,'server_uuid',@@server_uuid,'server_id',@@server_id,'account',CURRENT_USER(),'database',DATABASE(),'schemas',(SELECT JSON_ARRAYAGG(SCHEMA_NAME) FROM information_schema.SCHEMATA),'tables',(SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='sysvarhub_db' AND TABLE_TYPE='BASE TABLE'),'non_innodb',(SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='sysvarhub_db' AND TABLE_TYPE='BASE TABLE' AND (ENGINE IS NULL OR ENGINE<>'InnoDB')),'bytes',(SELECT COALESCE(SUM(DATA_LENGTH+INDEX_LENGTH),0) FROM information_schema.TABLES WHERE TABLE_SCHEMA='sysvarhub_db'),'routines',(SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='sysvarhub_db'),'events',(SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA='sysvarhub_db'));
+SELECT JSON_OBJECT('partial_revokes',@@GLOBAL.partial_revokes,'version',VERSION(),'port',@@port,'basedir',@@basedir,'datadir',@@datadir,'log_bin',@@log_bin,'binlog_format',@@binlog_format,'binlog_checksum',@@binlog_checksum,'server_uuid',@@server_uuid,'server_id',@@server_id,'account',CURRENT_USER(),'database',DATABASE(),'schemas',(SELECT JSON_ARRAYAGG(SCHEMA_NAME) FROM information_schema.SCHEMATA),'tables',(SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='sysvarhub_db' AND TABLE_TYPE='BASE TABLE'),'non_innodb',(SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='sysvarhub_db' AND TABLE_TYPE='BASE TABLE' AND (ENGINE IS NULL OR ENGINE<>'InnoDB')),'bytes',(SELECT COALESCE(SUM(DATA_LENGTH+INDEX_LENGTH),0) FROM information_schema.TABLES WHERE TABLE_SCHEMA='sysvarhub_db'),'routines',(SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='sysvarhub_db'),'events',(SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA='sysvarhub_db'));
 "@
     try { $state = (Get-HubBackupQuery $MysqlRoot $CredentialFile $sql) | ConvertFrom-Json -ErrorAction Stop } catch { throw "Nao foi possivel validar metadados do MySQL do Hub." }
     if ($state.account -ne 'sysvarhub_backup@127.0.0.1' -or $state.database -ne 'sysvarhub_db' -or $state.port -ne 3307) { throw "Servidor/conta divergente: backup permitido somente na instancia oficial 3307." }
@@ -388,8 +388,7 @@ function Invoke-HubMySqlFullBackup {
     $id = [guid]::NewGuid().ToString('N')
     $started = [DateTime]::UtcNow
     try {
-        $lockPath = Assert-HubBackupLocalPath (Join-Path $backupRoot '.full-backup.lock')
-        try { $lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) } catch { throw "Outro backup completo esta em andamento ou o bloqueio local esta indisponivel." }
+        $lock = Enter-HubBackupLock $backupRoot
         $staging = Join-Path $backupRoot ('.incomplete-' + $id)
         if (Test-Path -LiteralPath $staging) { throw "Area temporaria ja existe; nada sera sobrescrito." }
         $null = New-Item -ItemType Directory -Path $staging
@@ -408,19 +407,15 @@ function Invoke-HubMySqlFullBackup {
         Assert-HubBackupCoordinates $mysqlRoot $credential $coordinates
         $after = Get-HubBackupServerState $mysqlRoot $ProgramDataRoot $credential
         if ($before.server_uuid -ne $after.server_uuid -or ($before.identity | ConvertTo-Json -Compress) -ne ($after.identity | ConvertTo-Json -Compress)) { throw "Identidade MySQL/Hub mudou durante o backup; publicacao bloqueada." }
+        $anchor = Get-HubBinlogPrefixAnchor $before.datadir $coordinates
         $manifest = [ordered]@{
             manifest_version=1; backup_id=$id; type='FULL'; status='VALIDO'; started_at_utc=$started.ToString('o'); completed_at_utc=[DateTime]::UtcNow.ToString('o'); installation=$before.identity
             mysql=[ordered]@{version=$before.version; database='sysvarhub_db'; server_uuid=$before.server_uuid; server_id=$before.server_id; binlog_format=$before.binlog_format}
-            binlog=[ordered]@{file=$coordinates.file; position=$coordinates.position; reference='SNAPSHOT_START'}
+            binlog=[ordered]@{file=$coordinates.file; position=$coordinates.position; reference='SNAPSHOT_START'; anchor=$anchor}
             archive=[ordered]@{name=$archive.Name; size_bytes=$archive.Length; sha256=$checksum; compression='gzip'; sql_size_bytes=(Get-Item -LiteralPath $sqlPath).Length}
         }
         $manifestPath = Join-Path $staging 'manifest.json'
-        $stream = [IO.File]::Open($manifestPath, [IO.FileMode]::CreateNew)
-        try {
-            $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($manifest | ConvertTo-Json -Depth 6))
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush($true)
-        } finally { $stream.Dispose() }
+        Write-HubBackupJson $manifestPath $manifest
         [IO.File]::Delete($sqlPath)
         $destination = Join-Path $backupRoot ('full-' + $started.ToString('yyyyMMddTHHmmssfffZ') + '-' + $id)
         # Rename no mesmo volume: pasta completa e manifesto aparecem juntos, sem overwrite.
@@ -428,14 +423,304 @@ function Invoke-HubMySqlFullBackup {
         $staging = $null
         return $destination
     } finally {
-        try {
-            if ($createdStaging -and $staging -and (Test-Path -LiteralPath $staging)) {
-                # Resolver e limitar o alvo a area temporaria criada por esta execucao.
-                $resolved = Assert-HubBackupLocalPath $staging
-                if ((Split-Path $resolved -Parent) -ine $backupRoot -or (Split-Path $resolved -Leaf) -ne ('.incomplete-' + $id)) { throw 'Alvo temporario divergente.' }
-                [IO.Directory]::Delete($resolved, $true)
-            }
-        } catch { Write-Warning "Area temporaria incompleta preservada e protegida para verificacao assistida." }
+        try { if ($createdStaging -and $staging) { Remove-HubBackupStaging $backupRoot $staging $id } }
         finally { if ($lock) { $lock.Dispose() } }
+    }
+}
+
+
+function Enter-HubBackupLock {
+    param([string]$BackupRoot)
+    $path = Assert-HubBackupLocalPath (Join-Path $BackupRoot '.full-backup.lock')
+    try { return [IO.File]::Open($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch { throw "Backup FULL/incremental em andamento ou bloqueio local indisponivel." }
+}
+
+function Write-HubBackupJson {
+    param([string]$Path, $Value)
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew)
+    try {
+        $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($Value | ConvertTo-Json -Depth 12))
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally { $stream.Dispose() }
+}
+
+function Remove-HubBackupStaging {
+    param([string]$BackupRoot, [string]$Staging, [string]$Id)
+    try {
+        if (-not (Test-Path -LiteralPath $Staging)) { return }
+        $resolved = Assert-HubBackupLocalPath $Staging
+        if ((Split-Path $resolved -Parent) -ine $BackupRoot -or (Split-Path $resolved -Leaf) -ne ('.incomplete-' + $Id)) { throw 'Alvo temporario divergente.' }
+        [IO.Directory]::Delete($resolved, $true)
+    } catch { Write-Warning "Area temporaria incompleta preservada e protegida para verificacao assistida." }
+}
+
+function Get-HubBinlogPrefixAnchor {
+    param([string]$DataDirectory, $Coordinate)
+    Assert-HubBinlogCoordinate $Coordinate
+    $path = Assert-HubBackupLocalPath (Join-Path $DataDirectory $Coordinate.file)
+    $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+    $reader = New-Object IO.BinaryReader($stream)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        if ($stream.Length -lt [long]$Coordinate.position) { throw "Binlog menor que a coordenada confirmada." }
+        $magic = $reader.ReadBytes(4)
+        if ([BitConverter]::ToString($magic) -ne 'FE-62-69-6E') { throw "Binlog local nao homologado ou criptografado." }
+        $null = $sha.TransformBlock($magic,0,4,$magic,0)
+        if ([long]$Coordinate.position -gt 4) {
+            $header = $reader.ReadBytes(19)
+            if ($header.Length -ne 19 -or $header[4] -ne 15) { throw "Cabecalho FDE do binlog invalido." }
+            $size = [BitConverter]::ToUInt32($header,9)
+            if ($size -lt 24 -or $size -gt 1MB -or [long]$Coordinate.position -lt (4+$size)) { throw "Tamanho FDE/coordenada invalido." }
+            $body = $reader.ReadBytes($size-19)
+            if ($body.Length -ne $size-19 -or $body[$body.Length-5] -ne 1) { throw "Binlog exige checksum CRC32 homologado." }
+            # Somente o bit IN_USE e o CRC derivado do FDE podem mudar ao fechar o arquivo.
+            $header[17] = $header[17] -band 254
+            for ($i=$body.Length-4; $i -lt $body.Length; $i++) { $body[$i]=0 }
+            $null = $sha.TransformBlock($header,0,$header.Length,$header,0)
+            $null = $sha.TransformBlock($body,0,$body.Length,$body,0)
+            $remaining = [long]$Coordinate.position - $stream.Position
+            $buffer = New-Object byte[] 65536
+            while ($remaining -gt 0) {
+                $read = $stream.Read($buffer,0,[int][Math]::Min($buffer.Length,$remaining))
+                if ($read -le 0) { throw "Binlog truncado durante a validacao." }
+                $null = $sha.TransformBlock($buffer,0,$read,$buffer,0)
+                $remaining -= $read
+            }
+        }
+        $null = $sha.TransformFinalBlock((New-Object byte[] 0),0,0)
+        return [pscustomobject]@{algorithm='MYSQL8_CRC32_PREFIX_V1';file=$Coordinate.file;position=[long]$Coordinate.position;sha256=[BitConverter]::ToString($sha.Hash).Replace('-','').ToLowerInvariant()}
+    } finally { $reader.Dispose(); $sha.Dispose() }
+}
+
+function Assert-HubBinlogCoordinate {
+    param($Coordinate)
+    $number=0L
+    if ($null -eq $Coordinate -or $Coordinate.file -notmatch '^[A-Za-z0-9_.-]+\.[0-9]{6,}$' -or -not [long]::TryParse([string]$Coordinate.position,[ref]$number) -or $number -lt 4 -or $number -gt 4294967295) { throw "Coordenada de binlog invalida/fora do suporte homologado." }
+}
+
+function Assert-HubBinlogAnchor {
+    param($Anchor, $Coordinate)
+    Assert-HubBinlogCoordinate $Coordinate
+    if ($null -eq $Anchor -or $Anchor.algorithm -ne 'MYSQL8_CRC32_PREFIX_V1' -or $Anchor.file -ne $Coordinate.file -or $Anchor.position -ne $Coordinate.position -or $Anchor.sha256 -notmatch '^[a-f0-9]{64}$') { throw "Ancora de binlog ausente/invalida; gere novo FULL com a versao atual." }
+}
+
+function Assert-HubBinlogSource {
+    param([string]$DataDirectory, $Coordinate, $ExpectedAnchor)
+    Assert-HubBinlogAnchor $ExpectedAnchor $Coordinate
+    $actual = Get-HubBinlogPrefixAnchor $DataDirectory $Coordinate
+    if ($actual.sha256 -ne $ExpectedAnchor.sha256) { throw "Binlog alterado/recriado; continuidade perdida. Gere novo FULL." }
+}
+
+function Read-HubBackupJson {
+    param([string]$Path)
+    $null=Assert-HubBackupLocalPath $Path
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf) -or (Get-Item -LiteralPath $Path).Length -gt 1MB) { throw "Manifesto/estado ausente ou invalido." }
+    try { return [IO.File]::ReadAllText($Path) | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "Manifesto/estado JSON invalido." }
+}
+
+function Assert-HubBackupArchive {
+    param([string]$Directory, $Archive)
+    if ($Archive.name -notin @('sysvarhub_db.sql.gz','binlog-segment.sql.gz') -or $Archive.compression -ne 'gzip' -or $Archive.sha256 -notmatch '^[a-fA-F0-9]{64}$' -or $Archive.size_bytes -lt 1) { throw "Metadados do arquivo de backup invalidos." }
+    $path = Assert-HubBackupLocalPath (Join-Path $Directory $Archive.name)
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -ne $Archive.size_bytes -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ine $Archive.sha256) { throw "Arquivo de backup ausente ou checksum/tamanho divergente." }
+}
+
+function Test-HubBackupIdentity {
+    param($Left,$Right)
+    return ($Left.hub_uuid -eq $Right.hub_uuid -and $Left.empresa_id -eq $Right.empresa_id -and $Left.loja_id -eq $Right.loja_id -and $Left.retaguarda_hub_id -eq $Right.retaguarda_hub_id)
+}
+
+function Assert-HubIncrementalRange {
+    param($Start,$End,$Sources)
+    Assert-HubBinlogCoordinate $Start
+    Assert-HubBinlogCoordinate $End
+    $files=@($Sources)
+    if ($files.Count -lt 1 -or $files[0].file -ne $Start.file -or $files[-1].file -ne $End.file -or $files[-1].position -ne $End.position -or $files[-1].sha256 -ne $End.anchor.sha256 -or $files[0].position -lt $Start.position -or ($files.Count -eq 1 -and $End.position -le $Start.position)) { throw "Intervalo incremental vazio/inconsistente." }
+    $previous=$null
+    foreach ($file in $files) {
+        Assert-HubBinlogAnchor $file $file
+        $null=$file.file -match '^(.+)\.([0-9]+)$'
+        $prefix=$Matches[1]; $number=[long]$Matches[2]
+        if ($previous -and ($previous.prefix -ne $prefix -or $number -ne $previous.number+1)) { throw "Intervalo incremental com lacuna de arquivos." }
+        $previous=[pscustomobject]@{prefix=$prefix;number=$number}
+    }
+}
+
+function Get-HubIncrementalChain {
+    param([string]$BackupRoot,[string]$FullDirectory,$ServerState)
+    $FullDirectory=Assert-HubBackupLocalPath $FullDirectory
+    if ((Split-Path $FullDirectory -Parent) -ine $BackupRoot -or (Split-Path $FullDirectory -Leaf) -notmatch '^full-[0-9]{8}T[0-9]{9}Z-[a-f0-9]{32}$') { throw "FULL deve estar publicado no diretorio oficial de backup." }
+    $fullPath=Join-Path $FullDirectory 'manifest.json'
+    $full=Read-HubBackupJson $fullPath
+    if ($full.manifest_version -ne 1 -or $full.type -ne 'FULL' -or $full.status -ne 'VALIDO' -or $full.backup_id -notmatch '^[a-f0-9]{32}$' -or -not (Split-Path $FullDirectory -Leaf).EndsWith($full.backup_id) -or $full.mysql.database -ne 'sysvarhub_db' -or $full.mysql.server_uuid -ne $ServerState.server_uuid -or -not (Test-HubBackupIdentity $full.installation $ServerState.identity)) { throw "Manifesto FULL/identidade/UUID divergente da instalacao atual." }
+    Assert-HubBackupArchive $FullDirectory $full.archive
+    Assert-HubBinlogAnchor $full.binlog.anchor $full.binlog
+    $fullHash=(Get-FileHash -LiteralPath $fullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $chain=[pscustomobject]@{full=$full;full_hash=$fullHash;sequence=0;last_id=$full.backup_id;last_hash=$fullHash;point=$full.binlog;anchor=$full.binlog.anchor;head_repair=$false}
+    $entries=@(Get-ChildItem -LiteralPath $BackupRoot -Directory -Force | Where-Object { $_.Name -like ('incremental-' + $full.backup_id + '-*') } | Sort-Object Name)
+    $confirmed=@{}
+    $confirmed[0]=[pscustomobject]@{id=$chain.last_id;hash=$chain.last_hash;point=$chain.point}
+    foreach ($entry in $entries) {
+        $dir=Assert-HubBackupLocalPath $entry.FullName
+        $manifestPath=Join-Path $dir 'manifest.json'
+        $item=Read-HubBackupJson $manifestPath
+        $expected=$chain.sequence+1
+        if ($item.manifest_version -ne 1 -or $item.type -ne 'INCREMENTAL' -or $item.status -ne 'VALIDO' -or $item.capture_format -ne 'MYSQLBINLOG_SQL_BOUNDED_V1' -or $item.sequence -ne $expected -or $item.incremental_id -notmatch '^[a-f0-9]{32}$' -or $item.full_backup_id -ne $full.backup_id -or $item.full_manifest_sha256 -ne $fullHash -or $item.previous_id -ne $chain.last_id -or $item.previous_manifest_sha256 -ne $chain.last_hash -or $item.mysql.server_uuid -ne $ServerState.server_uuid -or $item.mysql.database -ne 'sysvarhub_db' -or -not (Test-HubBackupIdentity $item.installation $full.installation)) { throw "Cadeia incremental inconsistente: lacuna, bifurcacao ou manifesto alterado." }
+        $expectedName='incremental-' + $full.backup_id + '-' + $expected.ToString('D8') + '-' + $item.incremental_id
+        if ($entry.Name -ne $expectedName -or $item.start.file -ne $chain.point.file -or $item.start.position -ne $chain.point.position -or $item.start.anchor.sha256 -ne $chain.anchor.sha256) { throw "Cadeia incremental com sobreposicao/lacuna de coordenadas." }
+        Assert-HubBinlogAnchor $item.start.anchor $item.start
+        Assert-HubBinlogAnchor $item.end.anchor $item.end
+        Assert-HubIncrementalRange $item.start $item.end $item.sources
+        Assert-HubBackupArchive $dir $item.archive
+        $chain.sequence=$expected; $chain.last_id=$item.incremental_id; $chain.last_hash=(Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant(); $chain.point=$item.end; $chain.anchor=$item.end.anchor
+        $confirmed[$expected]=[pscustomobject]@{id=$chain.last_id;hash=$chain.last_hash;point=$chain.point}
+    }
+    $headPath=Join-Path $BackupRoot ('incremental-head-' + $full.backup_id + '.json')
+    if (Test-Path -LiteralPath $headPath) {
+        $head=Read-HubBackupJson $headPath
+        $known=$confirmed[[int]$head.sequence]
+        if ($head.version -ne 1 -or $head.point.file -ne $known.point.file -or $head.point.position -ne $known.point.position -or $head.full_backup_id -ne $full.backup_id -or $head.full_manifest_sha256 -ne $fullHash -or $head.server_uuid -ne $ServerState.server_uuid -or $null -eq $known -or $head.last_id -ne $known.id -or $head.last_manifest_sha256 -ne $known.hash) { throw "Ultimo ponto confirmado ausente/alterado; continuidade local perdida." }
+        $chain.head_repair=($head.sequence -ne $chain.sequence)
+    } else { $chain.head_repair=($chain.sequence -gt 0) }
+    return $chain
+}
+
+function Write-HubIncrementalHead {
+    param([string]$BackupRoot,$Chain)
+    $path=Assert-HubBackupLocalPath (Join-Path $BackupRoot ('incremental-head-' + $Chain.full.backup_id + '.json'))
+    $temp=Join-Path $BackupRoot ('.head-' + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+        Write-HubBackupJson $temp ([ordered]@{version=1;full_backup_id=$Chain.full.backup_id;full_manifest_sha256=$Chain.full_hash;server_uuid=$Chain.full.mysql.server_uuid;sequence=$Chain.sequence;last_id=$Chain.last_id;last_manifest_sha256=$Chain.last_hash;point=$Chain.point;confirmed_at_utc=[DateTime]::UtcNow.ToString('o')})
+        if (Test-Path -LiteralPath $path) { [IO.File]::Replace($temp,$path,[System.Management.Automation.Language.NullString]::Value) } else { [IO.File]::Move($temp,$path) }
+    } finally { if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) } }
+}
+
+function Get-HubBinlogWindow {
+    param([string]$MysqlRoot,[string]$CredentialFile,$Start)
+    Assert-HubBinlogCoordinate $Start
+    $master=(Get-HubBackupQuery $MysqlRoot $CredentialFile 'SHOW MASTER STATUS;').TrimEnd("`r","`n") -split "`t"
+    if ($master.Count -lt 4 -or $master[2] -or $master[3]) { throw "Posicao final de binlog indisponivel/filtro nao homologado." }
+    $end=[pscustomobject]@{file=$master[0];position=[long]$master[1]}
+    Assert-HubBinlogCoordinate $end
+    $all=@()
+    foreach ($line in ((Get-HubBackupQuery $MysqlRoot $CredentialFile 'SHOW BINARY LOGS;') -split '\r?\n' | Where-Object { $_.Trim() })) {
+        $parts=$line -split "`t"
+        if ($parts.Count -lt 2 -or $parts[1] -notmatch '^[0-9]+$') { throw "Inventario de binlogs invalido." }
+        $all += [pscustomobject]@{file=$parts[0];position=[long]$parts[1]}
+    }
+    $names=@($all | ForEach-Object { $_.file })
+    $first=[Array]::IndexOf($names,$Start.file); $last=[Array]::IndexOf($names,$end.file)
+    if ($first -lt 0 -or $last -lt $first -or $all[$first].position -lt $Start.position -or $all[$last].position -lt $end.position -or ($first -eq $last -and $end.position -lt $Start.position)) { throw "Binlog ausente, expirado ou regredido; continuidade perdida." }
+    $files=@($all[$first..$last])
+    $previous=$null
+    foreach ($file in $files) {
+        Assert-HubBinlogCoordinate $file
+        $null=$file.file -match '^(.+)\.([0-9]+)$'
+        $prefix=$Matches[1]; $number=[long]$Matches[2]
+        if ($previous -and ($previous.prefix -ne $prefix -or $number -ne $previous.number+1)) { throw "Lacuna na rotacao de binlogs." }
+        $previous=[pscustomobject]@{prefix=$prefix;number=$number}
+    }
+    $files[-1]=[pscustomobject]@{file=$end.file;position=$end.position}
+    return [pscustomobject]@{end=$end;files=$files;changed=($Start.file -ne $end.file -or $Start.position -ne $end.position)}
+}
+
+function Copy-HubBinlogPrefix {
+    param([string]$DataDirectory,[string]$TargetDirectory,$Coordinate)
+    Assert-HubBinlogCoordinate $Coordinate
+    $sourcePath=Assert-HubBackupLocalPath (Join-Path $DataDirectory $Coordinate.file)
+    $source=[IO.File]::Open($sourcePath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]'ReadWrite, Delete')
+    $target=$null
+    try {
+        $target=[IO.File]::Open((Join-Path $TargetDirectory $Coordinate.file),[IO.FileMode]::CreateNew)
+        $remaining=[long]$Coordinate.position; $buffer=New-Object byte[] 65536
+        while ($remaining -gt 0) {
+            $read=$source.Read($buffer,0,[int][Math]::Min($buffer.Length,$remaining))
+            if ($read -le 0) { throw "Binlog truncado/interrompido durante captura." }
+            $target.Write($buffer,0,$read); $remaining-=$read
+        }
+        $target.Flush($true)
+    } finally { if ($target) { $target.Dispose() }; $source.Dispose() }
+}
+
+function Get-HubMysqlbinlogArguments {
+    param([string]$RawDirectory,[string]$SqlPath,$Start,$Window)
+    # Leitura local de snapshots finitos: --database nao e aplicado a logs remotos.
+    $args=@('--no-defaults','--verify-binlog-checksum','--force-if-open','--base64-output=AUTO','--database=sysvarhub_db',"--start-position=$($Start.position)","--stop-position=$($Window.end.position)","--result-file=$SqlPath")
+    foreach ($file in $Window.files) { $args += Join-Path $RawDirectory $file.file }
+    return $args
+}
+
+function Test-HubBinlogSqlChanges {
+    param([string]$Path)
+    $reader=[IO.File]::OpenText($Path)
+    try {
+        while (-not $reader.EndOfStream) {
+            if ($reader.ReadLine() -match '^#.*(?:\bQuery\b|\bTable_map:|\bWrite_rows:|\bUpdate_rows:|\bDelete_rows:|\bTransaction_payload:)') { return $true }
+        }
+        return $false
+    } finally { $reader.Dispose() }
+}
+
+function Invoke-HubMySqlIncrementalBackup {
+    param([string]$FullBackupDirectory,[string]$InstallRoot='C:\Program Files\Sysvar Hub',[string]$ProgramDataRoot='C:\ProgramData\SysvarHub',[ValidateRange(1,86400)][int]$CaptureTimeoutSeconds=1200)
+    $ErrorActionPreference='Stop'
+    Assert-HubBackupOperator
+    $InstallRoot=Assert-HubBackupLocalPath $InstallRoot; $ProgramDataRoot=Assert-HubBackupLocalPath $ProgramDataRoot
+    $backupRoot=Assert-HubBackupLocalPath (Join-Path $ProgramDataRoot 'backup'); $mysqlRoot=Join-Path $InstallRoot 'mysql'; $credential=Join-Path $ProgramDataRoot 'config\mysql-backup.cnf'
+    Assert-HubBackupService $mysqlRoot $ProgramDataRoot
+    $null=Assert-HubMySqlToolchain $mysqlRoot
+    Assert-HubBackupCredential $credential
+    $before=Get-HubBackupServerState $mysqlRoot $ProgramDataRoot $credential
+    if ($before.binlog_checksum -ne 'CRC32') { throw "Captura local exige binlog CRC32 nao criptografado." }
+    Protect-SecretFile $backupRoot
+    $lock=Enter-HubBackupLock $backupRoot
+    $staging=$null; $created=$false; $id=[guid]::NewGuid().ToString('N'); $started=[DateTime]::UtcNow
+    try {
+        $chain=Get-HubIncrementalChain $backupRoot $FullBackupDirectory $before
+        $window=Get-HubBinlogWindow $mysqlRoot $credential $chain.point
+        Assert-HubBinlogSource $before.datadir $chain.point $chain.anchor
+        if ($chain.head_repair) { Write-HubIncrementalHead $backupRoot $chain }
+        if (-not $window.changed) { return }
+        $required=[Math]::Max(256MB, [double](($window.files | Measure-Object position -Sum).Sum)*8+64MB)
+        if ((Get-HubBackupFreeBytes $backupRoot) -lt $required) { throw "Espaco insuficiente para captura incremental com margem de seguranca." }
+        $staging=Join-Path $backupRoot ('.incomplete-' + $id)
+        if (Test-Path -LiteralPath $staging) { throw "Area temporaria existente; nada sera sobrescrito." }
+        $null=New-Item -ItemType Directory -Path $staging; $created=$true
+        Protect-SecretFile $staging
+        $raw=Join-Path $staging 'raw'; $null=New-Item -ItemType Directory -Path $raw
+        $sources=@()
+        foreach ($file in $window.files) {
+            Copy-HubBinlogPrefix $before.datadir $raw $file
+            $sources += Get-HubBinlogPrefixAnchor $raw $file
+        }
+        Assert-HubBinlogSource $raw $chain.point $chain.anchor
+        $sql=Join-Path $staging 'binlog-segment.sql'; $archivePath=Join-Path $staging 'binlog-segment.sql.gz'
+        $null=Invoke-HubMySqlProcess -Executable (Join-Path $mysqlRoot 'bin\mysqlbinlog.exe') -Arguments (Get-HubMysqlbinlogArguments $raw $sql $chain.point $window) -TimeoutSeconds $CaptureTimeoutSeconds
+        if (-not (Test-Path -LiteralPath $sql -PathType Leaf) -or (Get-Item -LiteralPath $sql).Length -lt 1) { throw "mysqlbinlog nao produziu segmento completo." }
+        foreach ($source in $sources) { Assert-HubBinlogSource $before.datadir $source $source }
+        if (-not (Test-HubBinlogSqlChanges $sql)) { return }
+        Compress-HubBackupSql $sql $archivePath
+        $archive=Get-Item -LiteralPath $archivePath; $hash=(Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($archive.Length -lt 1 -or $hash -notmatch '^[a-f0-9]{64}$') { throw "Checksum/tamanho incremental invalido." }
+        $after=Get-HubBackupServerState $mysqlRoot $ProgramDataRoot $credential
+        if ($after.server_uuid -ne $before.server_uuid -or -not (Test-HubBackupIdentity $before.identity $after.identity)) { throw "UUID/identidade mudou durante a captura; continuidade perdida." }
+        Assert-HubBinlogSource $before.datadir $window.end $sources[-1]
+        $sequence=$chain.sequence+1
+        $manifest=[ordered]@{manifest_version=1;type='INCREMENTAL';capture_format='MYSQLBINLOG_SQL_BOUNDED_V1';coordinate_semantics='START_INCLUSIVE_END_EXCLUSIVE';status='VALIDO';incremental_id=$id;sequence=$sequence;full_backup_id=$chain.full.backup_id;full_manifest_sha256=$chain.full_hash;previous_id=$chain.last_id;previous_manifest_sha256=$chain.last_hash;installation=$before.identity;mysql=[ordered]@{database='sysvarhub_db';version=$before.version;server_uuid=$before.server_uuid};started_at_utc=$started.ToString('o');completed_at_utc=[DateTime]::UtcNow.ToString('o');start=[ordered]@{file=$chain.point.file;position=$chain.point.position;anchor=$chain.anchor};end=[ordered]@{file=$window.end.file;position=$window.end.position;anchor=$sources[-1]};sources=$sources;archive=[ordered]@{name=$archive.Name;size_bytes=$archive.Length;sha256=$hash;compression='gzip'}}
+        Write-HubBackupJson (Join-Path $staging 'manifest.json') $manifest
+        # Remover somente snapshots temporarios deste job antes da publicacao atomica.
+        foreach ($file in $window.files) { [IO.File]::Delete((Join-Path $raw $file.file)) }
+        [IO.Directory]::Delete($raw); [IO.File]::Delete($sql)
+        $destination=Join-Path $backupRoot ('incremental-' + $chain.full.backup_id + '-' + $sequence.ToString('D8') + '-' + $id)
+        [IO.Directory]::Move($staging,$destination); $staging=$null
+        $chain.sequence=$sequence; $chain.last_id=$id; $chain.last_hash=(Get-FileHash -LiteralPath (Join-Path $destination 'manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant(); $chain.point=$manifest.end
+        Write-HubIncrementalHead $backupRoot $chain
+        return $destination
+    } finally {
+        try { if ($created -and $staging) { Remove-HubBackupStaging $backupRoot $staging $id } }
+        finally { $lock.Dispose() }
     }
 }

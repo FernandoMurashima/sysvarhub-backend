@@ -116,7 +116,7 @@ O dump usa `--single-transaction --quick --source-data=2 --no-tablespaces --set-
 
 Cada execucao usa uma pasta `.incomplete-<uuid>` dentro de `C:\ProgramData\SysvarHub\backup`, com ACL restrita a SYSTEM/Administradores. O SQL e compactado em streaming para `sysvarhub_db.sql.gz`; a leitura/descompactacao e comparada ao SHA-256 do SQL original. O manifesto registra versao do formato, UUID do backup, datas UTC, identidade da instalacao/loja, versao/banco/UUID/ID do servidor, arquivo/posicao de binlog extraidos do cabecalho do snapshot, tamanho, checksum SHA-256 do gzip e status `VALIDO`.
 
-O SQL temporario e eliminado antes da publicacao. Somente apos todos os passos concluirem, a pasta inteira e renomeada atomicamente no mesmo volume para `full-<dataUTC>-<uuid>`, contendo gzip e `manifest.json`. Nao ha sobrescrita de pastas publicadas, ponteiro mutavel de ultimo backup ou retencao automatica. A trava `.full-backup.lock` evita dumps completos concorrentes. Em falha, somente a area temporaria criada por aquela execucao e removida; se a limpeza falhar, permanece protegida e incompleta, sem publicacao. Backups anteriores nao sao removidos.
+O SQL temporario e eliminado antes da publicacao. Somente apos todos os passos concluirem, a pasta inteira e renomeada atomicamente no mesmo volume para `full-<dataUTC>-<uuid>`, contendo gzip e `manifest.json`. Nao ha sobrescrita de pastas publicadas, ponteiro mutavel de ultimo backup ou retencao automatica. A trava compartilhada `.full-backup.lock` impede concorrencia entre FULL e capturas incrementais. Em falha, somente a area temporaria criada por aquela execucao e removida; se a limpeza falhar, permanece protegida e incompleta, sem publicacao. Backups anteriores nao sao removidos.
 
 ### Limites desta etapa
 
@@ -125,11 +125,65 @@ O SQL temporario e eliminado antes da publicacao. Somente apos todos os passos c
 - O esquema suportado e o do aplicativo, sem rotinas armazenadas/eventos SQL personalizados. Objetos nao homologados exigem revisao de cobertura e privilegios; a conta minima nao substitui uma auditoria administrativa de objetos criados fora do aplicativo.
 - O snapshot InnoDB permite operacao concorrente sem parar servicos. `--source-data=2` requer um bloqueio global breve para obter coordenadas; dumps devem ocorrer fora de atualizacoes de schema e preferencialmente em menor movimento. Nao se promete ausencia absoluta de espera de escrita ou consumo de disco/CPU.
 - A reserva de espaco e estimativa: maior entre 256 MiB e quatro vezes dados+indices mais 64 MiB. Crescimento concorrente pode causar falha; nesse caso nada e publicado.
-- Coordenadas referenciam o inicio do snapshot; nao ha copia/retencao de binlogs nesta etapa. O backup completo nao garante sozinho continuidade incremental apos a expiracao dos logs do servidor.
+- Coordenadas referenciam o inicio do snapshot. FULLs novos tambem registram `binlog.anchor`, uma impressao SHA-256 normalizada do prefixo de origem. O FULL sozinho nao preserva os binlogs posteriores; a captura manual esta descrita abaixo.
 - A geracao e a recuperacao reais precisam de homologacao isolada autorizada; os testes desta etapa usam mocks, subprocessos ficticios e arquivos temporarios.
 
 Testes direcionados da preparacao e do completo:
 
 ```powershell
 powershell.exe -NoProfile -Command "Invoke-Pester -Script deploy/windows/tests/mysql-backup.Tests.ps1,deploy/windows/tests/mysql-full-backup.Tests.ps1 -EnableExit"
+```
+
+
+## Captura incremental manual delimitada
+
+Em Windows PowerShell 5.1 **como Administrador**, selecionar explicitamente a pasta FULL de referencia:
+
+```powershell
+& 'C:\Program Files\Sysvar Hub\scripts\backup-incremental.ps1' `
+    -FullBackupDirectory 'C:\ProgramData\SysvarHub\backup\full-<dataUTC>-<uuid>'
+```
+
+Os parametros opcionais `-InstallRoot`, `-ProgramDataRoot` e `-CaptureTimeoutSeconds` correspondem a instalacao oficial (timeout de decodificacao padrao: 1200 segundos). Nao existem parametros para host, porta, usuario ou banco alternativos. A conta `sysvarhub_backup` realiza todas as consultas SQL de identidade, privilegios, exclusividade e coordenadas. Nao ha conexao MySQL root, alteracao de dados, FLUSH, PURGE, RESET ou rotacao forcada.
+
+### Delimitacao e binlog ativo
+
+1. Revalidar o FULL e toda a cadeia ja publicada, incluindo SHA-256, sequencia, identidade e ponto confirmado.
+2. Obter a posicao corrente por `SHOW MASTER STATUS` e a sequencia por `SHOW BINARY LOGS`.
+3. Sob a mesma trava do FULL, ler apenas os prefixos locais necessarios ate o limite oficial. Os arquivos sao abertos somente para leitura com compartilhamento de leitura/escrita/exclusao; nao sao bloqueados para o MySQL. A origem e o datadir da instancia oficial ja validada, nunca o MySQL80 DEV.
+4. Decodificar os snapshots finitos em **uma chamada** do `mysqlbinlog` homologado, com `--verify-binlog-checksum --force-if-open --base64-output=AUTO --database=sysvarhub_db --start-position=<inicio> --stop-position=<fim> --result-file=<SQL temporario>`. A primeira posicao e inclusiva e a ultima exclusiva; todos os arquivos intermediarios entram na ordem exata. O filtro `--database` e aplicado localmente, conforme o [manual mysqlbinlog](https://dev.mysql.com/doc/refman/8.0/en/mysqlbinlog.html).
+5. Revalidar prefixos e identidade, compactar/verificar o SQL, publicar o gzip e manifesto juntos e confirmar o checkpoint.
+
+O arquivo ativo **nao e declarado encerrado nem arquivado como binlog completo**. O artefato publicado e um segmento SQL executavel delimitado (`MYSQLBINLOG_SQL_BOUNDED_V1`), incluindo os eventos de linha em base64. Cabecalhos e contexto de decodificacao podem se repetir; as alteracoes ficam restritas ao intervalo `[inicio,fim)`. Os snapshots binarios temporarios podem incluir o prefixo anterior para permitir decodificacao nativa, mas sao protegidos por ACL e removidos antes da publicacao. Somente o trecho ainda nao confirmado e preservado no incremental.
+
+Nao se usa data/hora para cortar transacoes, nem `--short-form`, `--force-read`, `--stop-never` ou captura de arquivo aberto ate um EOF movel. Novas transacoes posteriores ao ponto escolhido ficam para a proxima execucao. Sem avanco de posicao, ou com somente metadados de rotacao sem eventos relevantes, nenhum incremental e publicado e o ponto anterior permanece confirmado.
+
+### Ancora adicionada ao FULL: necessidade e compatibilidade
+
+Arquivo, posicao e UUID nao detectam sozinhos a recriacao do binlog com o mesmo nome/UUID. Por isso, **somente os FULLs gerados com esta versao** acrescentam `binlog.anchor` ao manifesto existente, sem remover ou renomear campos. FULLs antigos continuam preservados, mas nao iniciam uma cadeia incremental segura: gerar novo FULL manualmente apos a adequacao/homologacao autorizada. Nao ha preenchimento retroativo de uma ancora que nao foi registrada na origem.
+
+A ancora `MYSQL8_CRC32_PREFIX_V1` calcula SHA-256 do prefixo ate a coordenada, normalizando apenas o bit `IN_USE` do evento FDE e seu CRC derivado, que podem mudar no fechamento normal. Os demais bytes permanecem vinculados. O checksum nativo CRC32 dos eventos e verificado pelo mysqlbinlog. O fim de cada captura recebe nova ancora; antes da seguinte, ela deve coincidir com a origem. Alteracao de UUID, prefixo recriado/truncado, arquivo expirado ou lacuna na numeracao bloqueia o avanco.
+
+### Manifestos, checkpoint e retomada
+
+Cada pasta publicada tem nome `incremental-<idFULL>-<sequencia8digitos>-<uuid>` e contem somente `binlog-segment.sql.gz` e `manifest.json`. O manifesto inclui instalacao/empresa/loja, ID e SHA do manifesto FULL, ID/SHA do predecessor, UUID do servidor, sequencia, inicio/fim e suas ancoras, limites das origens, datas UTC, tamanho, SHA-256, formato e status `VALIDO`.
+
+O arquivo `incremental-head-<idFULL>.json` registra o ultimo ponto confirmado e o hash do manifesto correspondente. Sua substituicao e atomica, apos a publicacao da pasta. Se houver interrupcao entre essas duas etapas, a tentativa seguinte valida a extensao completa ja publicada e repara o checkpoint sem recapturar o mesmo intervalo. Um checkpoint apontando para manifesto ausente/alterado bloqueia a cadeia. Falhas antes da publicacao nao avancam o checkpoint nem removem FULLs/incrementais validos anteriores.
+
+A publicacao, ACL, compactacao com verificacao de round-trip, escrita de JSON e limpeza limitada ao staging reaproveitam os mecanismos do FULL. Nao ha retencao, agendamento, transmissao ou restauracao nesta etapa.
+
+### Limites e impacto
+
+- Suporte homologado: MySQL 8.0.26+ da serie 8.0, instancia exclusiva do Hub, ROW, binlogs locais nao criptografados com CRC32 e posicoes ate 4 GiB por arquivo. Outros formatos/objetos administrativos exigem adequacao assistida.
+- O acesso SQL usa somente a conta de backup. A leitura/decodificacao local nao autentica em outro servidor e exige acesso Windows administrativo ao datadir oficial; os prefixos sao validados pelo formato antes de uso.
+- O ponto inicial ainda nao preservado precisa continuar disponivel no servidor. Expiracao/perda de continuidade exige novo FULL; nao se inventa uma posicao alternativa nem se purga qualquer arquivo.
+- Arquivos SQL e binarios temporarios permanecem privados por ACL, sem impressao de conteudo ou credenciais. Gzip nao adiciona criptografia.
+- Nao ha bloqueio global para a captura nem rotacao forcada. Ha custo de leitura local, hashing, decodificacao e compressao; o prefixo do arquivo corrente pode ser relido para validacao. A estimativa de espaco e conservadora, mas nao e uma reserva fisica contra crescimento concorrente.
+- Revalidar todos os hashes da cadeia e do FULL custa leitura de disco proporcional aos arquivos preservados. A homologacao de captura/recuperacao real permanece pendente em ambiente isolado autorizado; nenhum backup real foi executado nos testes.
+- O formato exige que a futura restauracao preserve a ordem dos segmentos e o contexto necessario em uma unica conexao, conforme o manual. Nao ha rotina de restauracao implementada aqui.
+
+Testes direcionados (somente mocks, binlogs sinteticos e arquivos ficticios):
+
+```powershell
+powershell.exe -NoProfile -Command "Invoke-Pester -Script deploy/windows/tests/mysql-backup.Tests.ps1,deploy/windows/tests/mysql-full-backup.Tests.ps1,deploy/windows/tests/mysql-incremental-backup.Tests.ps1 -EnableExit"
 ```

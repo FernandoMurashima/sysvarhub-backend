@@ -193,6 +193,7 @@ Describe 'Publicacao completa e falhas sem afetar backups anteriores' {
         Mock Protect-SecretFile { }
         Mock Get-HubBackupServerState { $script:serverState }
         Mock Get-HubBackupFreeBytes { 10GB }
+        Mock Get-HubBinlogPrefixAnchor { [pscustomobject]@{algorithm="MYSQL8_CRC32_PREFIX_V1";file=$Coordinate.file;position=$Coordinate.position;sha256=("a"*64)} }
         Mock Assert-HubBackupCoordinates { }
         Mock Compress-HubBackupSql { & $script:compressImplementation -SqlPath $SqlPath -ArchivePath $ArchivePath }
         Mock Invoke-HubMySqlProcess {
