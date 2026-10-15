@@ -99,7 +99,7 @@ Describe 'Protecao dos scripts executados como SYSTEM' {
     BeforeEach {
         $script:app=Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
         $script:scripts=Join-Path $app 'scripts'; $null=New-Item -ItemType Directory -Path $scripts
-        foreach ($name in @('backup-run.ps1','mysql-backup-control.ps1','mysql-backup.ps1')) { Set-Content (Join-Path $scripts $name) '# fixture sem efeito' }
+        foreach ($name in @('backup-run.ps1','mysql-backup-control.ps1','mysql-backup.ps1','mysql-backup-transmission.ps1')) { Set-Content (Join-Path $scripts $name) '# fixture sem efeito' }
         $script:untrusted=$false; $script:untrustedOwner=$false
         Mock Get-Acl {
             $sid=if ($script:untrusted) { 'S-1-5-32-545' } else { 'S-1-5-32-544' }

@@ -302,3 +302,85 @@ As suites FULL/incremental tambem exercitam compartilhamento da trava, controlad
 checkpoint interrompido e retry sem duplicacao, sem backup real.
 
 Referencia do plano: [schema oficial do Agendador Windows](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-schema).
+
+
+## Transmissao Hub para Central — Prompt 8 (preparada, desativada)
+
+O runner gera/valida primeiro a cadeia local e, somente nos resultados locais
+SEM_ALTERACOES, INCREMENTAL_VALIDO ou FULL_RENOVADO, consulta a politica de envio.
+Falha de envio nao invalida o backup local nem altera checkpoint, vendas, caixa ou
+fila de sincronizacao. O runner usa saida 1 para falha local e 2 para falha de envio;
+os diagnosticos preservam a validade local separadamente. Nenhuma tarefa foi registrada/ativada e nenhum backup real
+foi transmitido nesta implementacao. Homologacao de infraestrutura/volume e futura.
+
+O suporte devera primeiro disponibilizar a API da Central conforme
+`sysvarbackend/docs/hub-backup-recebimento.md` (migrations, storage privado,
+criptografia, HTTPS/proxy e habilitacao autorizados separadamente), atualizar o
+runtime empacotado do Hub e conferir pareamento e certificado. O cliente reutiliza
+HubConfig, Authorization Hub e a URL da Central ja cadastrada; nao aceita URL/token
+na politica, redirecionamentos HTTP ou desativacao da verificacao TLS. Exige URL
+HTTPS na raiz do dominio (porta HTTPS explicita permitida). Usa confianca do sistema,
+sem proxy HTTP automatico. A instancia deve continuar oficial e exclusiva,
+SysvarHubMySQL/3307; MySQL80/3306 nunca e utilizado pelo transmissor.
+
+**Ativacao futura explicita, nao executada:** provisionar com DACL exclusiva de
+SYSTEM/Administradores o arquivo `C:\ProgramData\SysvarHub\config\backup-transmission.json`:
+
+```json
+{
+  "version": 1,
+  "enabled": true,
+  "bandwidth_bytes_per_second": 262144,
+  "cycle_seconds": 120,
+  "request_timeout_seconds": 30,
+  "finalize_timeout_seconds": 300
+}
+```
+
+Ausencia desse arquivo equivale a enabled=false, sem consultas de envio, acesso a
+credencial ou MySQL adicional. Para suspender envios futuros, definir enabled=false;
+nao encerrar processos nem apagar backups. Conferir ACLs antes da ativacao e manter
+os limites compativeis com a Central. Habilitar a tarefa local permanece uma acao
+separada do suporte, segundo a secao anterior. Em PowerShell 5.1 elevado, a execucao
+manual preparada e dot-source de `mysql-backup-transmission.ps1`, seguido de
+`Invoke-HubBackupTransmission`; nao cria FULL nem incremental. Preferir
+`backup-run.ps1` para executar geracao/validacao antes do envio.
+
+O cliente preserva os bytes UTF-8 originais do manifesto (inclusive BOM e CRLF),
+negocia tamanho fixo de parte, calcula SHA de cada parte e envia em blocos de ate
+64 KiB com controle de banda. Memoria de dados e limitada ao bloco; manifesto ate
+1 MiB. O orcamento do ciclo e conferido entre partes; uma parte em andamento e a
+finalizacao podem ultrapassa-lo conforme tamanho negociado, banda e timeouts de
+conexao/leitura. A configuracao padrao usa
+256 KiB/s e ciclo de 120 segundos; ajustar o timeout de finalizacao para arquivos
+maiores conforme o contrato Central. Nao ha servico adicional nem thread no PDV.
+
+FULLs sao enviados antes de seus incrementais; cadeias anteriores sao preservadas.
+A selecao usa Get-HubIncrementalChain e a mesma trava da geracao, liberada antes do
+HTTP. Uma trava separada impede dois transmissores. A validacao local atual confere
+hashes completos das cadeias; avaliar I/O em homologacao de volume. Binlogs atuais
+nao sao transmitidos diretamente. Nao envia diretorios temporarios ou incrementais
+orfãos, nem ignora cadeia invalida para enviar uma posterior.
+
+O checkpoint privado `backup-transmission-state.json` usa escrita atomica/fsync e
+registra manifesto, tentativa/upload oficial, offset confirmado, pendencias,
+tamanhos, ultimo FULL/incremental e horario UTC confirmado (Unix seconds), falhas e
+backoff de 15 minutos ate 24 horas. Retomada consulta GET progresso; timeout sem
+resposta nao altera identidades. Inatividade HTTP 408 renova iniciar com o MESMO
+manifesto/backup. Conflitos, credencial revogada, TLS invalido ou cadeia interrompida
+exigem suporte. Nao reinicia automaticamente upload corrompido nem inventa UUIDs.
+Depois de reparar a causa, `-ResumeAfterSupport` permite nova verificacao; nao
+ignora divergencias nem limpa historico. Checkpoint invalido e preservado.
+
+O resumo compacto `backup-transmission-diagnostic.json` alimenta `transmission`
+na consulta da tarefa, sem carregar todos os checkpoints. `transmission_preflight`
+registra falhas anteriores ao envio. Diferenciar pela data da tentativa. Situacoes:
+BACKUP_LOCAL_VALIDO, ENVIO_PENDENTE, ENVIO_EM_ANDAMENTO, RECEBIDO_CENTRAL,
+FALHA_REPETIR e INTERVENCAO_SUPORTE. **RECEBIDO_CENTRAL nao significa VALIDADO para
+recuperacao.** A validacao retornada pela Central e mantida separada. Nao ha retencao,
+restauracao ou remocao de backups locais.
+
+Testes isolados: `integracao.tests_backup_transmission` (servidor HTTPS local com
+certificado de teste, arquivos ficticios), `integracao.tests_backup_transmission_command`
+e `tests/mysql-backup-transmission.Tests.ps1`. Sem MySQL, transmissao operacional ou
+tarefas reais. Transporte baseado na [biblioteca HTTP oficial do Python](https://docs.python.org/3.11/library/http.client.html).

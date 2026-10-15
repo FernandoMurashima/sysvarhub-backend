@@ -25,7 +25,7 @@ function Assert-HubBackupTaskFiles {
     param([string]$InstallRoot)
     $scripts=Assert-HubBackupLocalPath (Join-Path $InstallRoot 'scripts')
     $paths=@($scripts)
-    foreach ($name in @('backup-run.ps1','mysql-backup-control.ps1','mysql-backup.ps1')) {
+    foreach ($name in @('backup-run.ps1','mysql-backup-control.ps1','mysql-backup.ps1','mysql-backup-transmission.ps1')) {
         $path=Assert-HubBackupLocalPath (Join-Path $scripts $name)
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'Pacote de controle de backup incompleto.' }
         $paths+=$path
@@ -69,7 +69,12 @@ function Get-HubBackupTaskStatus {
     if (Test-Path -LiteralPath $statePath) { $diagnostic=Read-HubBackupJson $statePath }
     $info=$null
     if ($task.Count -eq 1) { $info=Get-ScheduledTaskInfo -TaskName 'SysvarHubMySQLBackup' -TaskPath '\' -ErrorAction Stop }
-    return [pscustomobject]@{task_exists=($task.Count -eq 1);task_state=if($task.Count -eq 1){[string]$task[0].State}else{'NAO_REGISTRADA'};task_info=$info;diagnostic=$diagnostic}
+    $transmission=$null; $preflight=$null
+    $transmissionPath=Join-Path $ProgramDataRoot 'backup\backup-transmission-diagnostic.json'
+    $preflightPath=Join-Path $ProgramDataRoot 'backup\backup-transmission-preflight.json'
+    if (Test-Path -LiteralPath $transmissionPath) { $transmission=Read-HubBackupJson $transmissionPath }
+    if (Test-Path -LiteralPath $preflightPath) { $preflight=Read-HubBackupJson $preflightPath }
+    return [pscustomobject]@{transmission=$transmission;transmission_preflight=$preflight;task_exists=($task.Count -eq 1);task_state=if($task.Count -eq 1){[string]$task[0].State}else{'NAO_REGISTRADA'};task_info=$info;diagnostic=$diagnostic}
 }
 
 function Disable-HubBackupTask {
