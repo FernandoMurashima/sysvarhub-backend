@@ -1,6 +1,6 @@
 import uuid
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 
 from django.db import models, transaction
 from django.db.models import Case, DecimalField, Sum, Value, When
@@ -261,7 +261,10 @@ def aplicar_promocao(catalogo_item, quantidade):
         desconto = money(promocao.valor) * Decimal(quantidade)
     elif promocao.tipo == PromocaoHub.TIPO_PRECO_FIXO:
         desconto = money(max(ZERO, (preco - Decimal(promocao.valor)) * Decimal(quantidade)))
-    return preco, money(desconto), {
+    # O teto em centavos não pode arredondar para cima o bruto de quatro casas.
+    bruto = (preco * Decimal(quantidade)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    desconto = min(money(desconto), bruto)
+    return preco, desconto, {
         "promocao_retaguarda_id": promocao.retaguarda_id,
         "promocao_nome": promocao.nome,
         "promocao_tipo": promocao.tipo,

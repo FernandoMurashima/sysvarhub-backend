@@ -38,6 +38,7 @@ from core.models import (
     ValeTrocaMovimentoHub,
     VendaDevolucaoHub,
 )
+from core.services.beneficios import aplicar_promocao
 from core.services.caixa import fechar_caixa
 from core.services.devolucoes import finalizar_devolucao_manual_offline
 from core.services.sync import enfileirar_devolucao_finalizada, enfileirar_venda_finalizada, sincronizar_eventos_pendentes
@@ -48,6 +49,7 @@ from core.services.vendas import (
     adicionar_pagamento,
     adicionar_pagamento_cashback,
     calcular_disponivel_local,
+    calcular_total_item,
     dados_pagamento,
     listar_formas_pagamento,
     registrar_evento,
@@ -3172,3 +3174,85 @@ class TrocaOfflineSyncTests(PagamentoHubTestMixin, TestCase):
         self.assertEqual(self.evento_devolucao.resposta["status"], "DUPLICADO")
         self.assertEqual(self.evento_devolucao.payload, snapshot)
         self.assertEqual(self.ciclo(client, 6)["sincronizados"], 1)
+
+
+class PromocaoLimiteDescontoTests(VendaHubTestMixin, TestCase):
+    def criar_promocao(self, tipo, valor):
+        promocao, _ = PromocaoHub.objects.update_or_create(
+            hub=self.hub, retaguarda_id=900,
+            defaults={
+                "nome": "Promoção com limite", "tipo": tipo, "valor": Decimal(valor),
+                "escopo": PromocaoHub.ESCOPO_PRODUTO,
+                "produto_ids": [self.catalogo_item.retaguarda_produto_id],
+                "acumula_cashback": False, "prioridade": 3,
+                "inicio": timezone.now() - timedelta(days=1),
+                "fim": timezone.now() + timedelta(days=1),
+                "sincronizado_em": timezone.now(),
+            },
+        )
+        return promocao
+
+    def test_limite_inferior_igual_superior_para_tipos_e_quantidades(self):
+        self.catalogo_item.preco_venda = Decimal("100.0000")
+        casos = [
+            (PromocaoHub.TIPO_VALOR_FIXO, "25", 1, "25.00"),
+            (PromocaoHub.TIPO_VALOR_FIXO, "100", 1, "100.00"),
+            (PromocaoHub.TIPO_VALOR_FIXO, "150", 1, "100.00"),
+            (PromocaoHub.TIPO_VALOR_FIXO, "150", 3, "300.00"),
+            (PromocaoHub.TIPO_PERCENTUAL, "10", 3, "30.00"),
+            (PromocaoHub.TIPO_PERCENTUAL, "100", 1, "100.00"),
+            (PromocaoHub.TIPO_PERCENTUAL, "150", 3, "300.00"),
+            (PromocaoHub.TIPO_PRECO_FIXO, "20", 3, "240.00"),
+            (PromocaoHub.TIPO_PRECO_FIXO, "0", 1, "100.00"),
+            (PromocaoHub.TIPO_PRECO_FIXO, "-10", 3, "300.00"),
+        ]
+        for tipo, valor, quantidade, esperado in casos:
+            with self.subTest(tipo=tipo, valor=valor, quantidade=quantidade):
+                promocao = self.criar_promocao(tipo, valor)
+                preco, desconto, snapshot = aplicar_promocao(self.catalogo_item, quantidade)
+                self.assertEqual(preco, Decimal("100.0000"))
+                self.assertEqual(desconto, Decimal(esperado))
+                self.assertLessEqual(desconto, preco * quantidade)
+                self.assertGreaterEqual(calcular_total_item(quantidade, preco, desconto), Decimal("0.00"))
+                self.assertEqual(snapshot, {
+                    "promocao_retaguarda_id": promocao.retaguarda_id,
+                    "promocao_nome": promocao.nome, "promocao_tipo": tipo,
+                    "promocao_valor": Decimal(valor), "promocao_acumula_cashback": False,
+                })
+
+    def test_teto_com_fracao_de_centavo_preserva_arredondamento_do_calculo(self):
+        self.catalogo_item.preco_venda = Decimal("10.0150")
+        for tipo, valor in (
+            (PromocaoHub.TIPO_VALOR_FIXO, "20"),
+            (PromocaoHub.TIPO_PERCENTUAL, "100"),
+            (PromocaoHub.TIPO_PRECO_FIXO, "0"),
+        ):
+            with self.subTest(tipo=tipo):
+                self.criar_promocao(tipo, valor)
+                preco, desconto, _ = aplicar_promocao(self.catalogo_item, 1)
+                self.assertEqual(desconto, Decimal("10.01"))
+                self.assertLessEqual(desconto, preco)
+                self.assertEqual(calcular_total_item(1, preco, desconto), Decimal("0.01"))
+        self.criar_promocao(PromocaoHub.TIPO_PERCENTUAL, "10")
+        preco, desconto, _ = aplicar_promocao(self.catalogo_item, 1)
+        self.assertEqual(desconto, Decimal("1.00"))
+        self.assertEqual(calcular_total_item(1, preco, desconto), Decimal("9.02"))
+
+    def test_item_persistido_nao_negativo_ao_incluir_incrementar_e_alterar_quantidade(self):
+        self.catalogo_item.preco_venda = Decimal("100.0000")
+        self.catalogo_item.save(update_fields=["preco_venda"])
+        self.criar_promocao(PromocaoHub.TIPO_VALOR_FIXO, "150")
+        resposta = self.post_item({"quantidade": 2})
+        self.assertEqual(resposta.status_code, 200, resposta.data)
+        item = VendaItemHub.objects.get()
+        self.assertEqual((item.desconto, item.total_item), (Decimal("200.00"), Decimal("0.00")))
+        self.assertEqual(self.post_item().status_code, 200)
+        item.refresh_from_db()
+        self.assertEqual((item.quantidade, item.desconto, item.total_item), (3, Decimal("300.00"), Decimal("0.00")))
+        resposta = self.client.patch(f"/api/terminal/venda/item/{item.item_uuid}/", {"quantidade": 1}, format="json")
+        self.assertEqual(resposta.status_code, 200, resposta.data)
+        item.refresh_from_db()
+        self.assertEqual((item.desconto, item.total_item), (Decimal("100.00"), Decimal("0.00")))
+        self.assertEqual(item.promocao_valor, Decimal("150.0000"))
+        self.assertFalse(item.promocao_acumula_cashback)
+        self.assertEqual(resposta.data["venda"]["itens"][0]["promocao"]["id"], 900)
