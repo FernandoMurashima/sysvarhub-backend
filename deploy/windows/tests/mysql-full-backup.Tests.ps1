@@ -205,6 +205,15 @@ Describe 'Publicacao completa e falhas sem afetar backups anteriores' {
         (Get-FileHash (Join-Path $previous 'anterior.gz')).Hash | Should Be $previousHash
         @(Get-ChildItem -LiteralPath $backupRoot -Directory -Force | Where-Object { $_.Name -like '.incomplete-*' }).Count | Should Be 0
     }
+    It 'reutiliza trava externa sem libera-la antes do controlador' {
+        $lock=Enter-HubBackupLock $backupRoot
+        try {
+            $destination=Invoke-HubMySqlFullBackup -InstallRoot $installRoot -ProgramDataRoot $dataRoot -BackupLock $lock
+            Test-Path (Join-Path $destination 'manifest.json') | Should Be $true
+            $lock.CanWrite | Should Be $true
+            { Enter-HubBackupLock $backupRoot } | Should Throw 'em andamento'
+        } finally { $lock.Dispose() }
+    }
     It 'publica gzip e manifesto validos juntos, com checksum e coordenadas' {
         $destination = Invoke-HubMySqlFullBackup $installRoot $dataRoot
         $manifest = Get-Content -LiteralPath (Join-Path $destination 'manifest.json') -Raw | ConvertFrom-Json

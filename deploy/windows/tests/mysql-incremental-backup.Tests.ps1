@@ -1,6 +1,6 @@
 $ErrorActionPreference='Stop'
 $WindowsRoot=Split-Path $PSScriptRoot -Parent
-. (Join-Path $WindowsRoot 'mysql-backup.ps1')
+. (Join-Path $WindowsRoot 'mysql-backup-control.ps1')
 $script:realCompress=(Get-Command Compress-HubBackupSql).ScriptBlock
 $script:realHead=(Get-Command Write-HubIncrementalHead).ScriptBlock
 
@@ -84,7 +84,7 @@ Describe 'Captura incremental isolada com FULL ficticio' {
         $sql=Join-Path $caseRoot 'full-ficticio.sql'; Set-Content $sql '-- SQL inteiramente ficticio'
         $archive=Join-Path $fullDir 'sysvarhub_db.sql.gz'
         & $script:realCompress $sql $archive
-        $script:fullManifest=[ordered]@{manifest_version=1;type='FULL';status='VALIDO';backup_id=$fullId;installation=$identity;mysql=[ordered]@{database='sysvarhub_db';server_uuid=$state.server_uuid};binlog=[ordered]@{file=$point.file;position=$point.position;anchor=$anchor};archive=[ordered]@{name='sysvarhub_db.sql.gz';size_bytes=(Get-Item $archive).Length;sha256=(Get-FileHash $archive).Hash.ToLowerInvariant();compression='gzip'}}
+        $script:fullManifest=[ordered]@{manifest_version=1;type='FULL';status='VALIDO';backup_id=$fullId;completed_at_utc=[DateTime]::UtcNow.ToString('o');installation=$identity;mysql=[ordered]@{database='sysvarhub_db';server_uuid=$state.server_uuid};binlog=[ordered]@{file=$point.file;position=$point.position;anchor=$anchor};archive=[ordered]@{name='sysvarhub_db.sql.gz';size_bytes=(Get-Item $archive).Length;sha256=(Get-FileHash $archive).Hash.ToLowerInvariant();compression='gzip'}}
         Write-HubBackupJson (Join-Path $fullDir 'manifest.json') $fullManifest
         $script:fullHash=(Get-FileHash (Join-Path $fullDir 'manifest.json')).Hash
         $script:fullArchiveHash=(Get-FileHash $archive).Hash
@@ -255,6 +255,42 @@ Describe 'Captura incremental isolada com FULL ficticio' {
         Add-Content -LiteralPath (Join-Path $one 'binlog-segment.sql.gz') -Value 'corrupcao ficticia'
         { Invoke-HubMySqlIncrementalBackup $fullDir $installRoot $dataRoot } | Should Throw 'checksum/tamanho'
     }
+    It 'controlador reutiliza captura e checkpoint reais em arquivos ficticios sem duplicar no retry' {
+        $first=Invoke-HubBackupControl $installRoot $dataRoot
+        $first.status | Should Be 'INCREMENTAL_VALIDO'
+        $first.last_incremental.sequence | Should Be 1
+        $first.published_bytes | Should BeGreaterThan 0
+        $second=Invoke-HubBackupControl $installRoot $dataRoot
+        $second.status | Should Be 'SEM_ALTERACOES'
+        $second.last_incremental.sequence | Should Be 1
+        @(Get-ChildItem $backupRoot -Directory -Filter 'incremental-*').Count | Should Be 1
+        Assert-MockCalled Invoke-HubMySqlProcess -Scope It -Times 1 -Exactly
+    }
+    It 'controlador repara checkpoint apos interrupcao sem recapturar nem reiniciar cadeia' {
+        $script:failHead=$true
+        (Invoke-HubBackupControl $installRoot $dataRoot).status | Should Be 'FALHA_REPETIR'
+        $script:failHead=$false
+        $result=Invoke-HubBackupControl $installRoot $dataRoot
+        $result.status | Should Be 'SEM_ALTERACOES'
+        $result.last_incremental.sequence | Should Be 1
+        $head=Read-HubBackupJson (Join-Path $backupRoot ('incremental-head-' + $fullId + '.json'))
+        $head.sequence | Should Be 1
+        @(Get-ChildItem $backupRoot -Directory -Filter 'incremental-*').Count | Should Be 1
+        Assert-MockCalled Invoke-HubMySqlProcess -Scope It -Times 1 -Exactly
+    }
+    It 'controlador descobre cadeia incremental existente na primeira tentativa' {
+        $null=Invoke-HubMySqlIncrementalBackup $fullDir $installRoot $dataRoot
+        $result=Invoke-HubBackupControl $installRoot $dataRoot
+        $result.status | Should Be 'SEM_ALTERACOES'
+        $result.last_incremental.sequence | Should Be 1
+        Assert-MockCalled Invoke-HubMySqlProcess -Scope It -Times 1 -Exactly
+    }
+    It 'controlador bloqueia incremental existente corrompido' {
+        $one=Invoke-HubMySqlIncrementalBackup $fullDir $installRoot $dataRoot
+        Add-Content -LiteralPath (Join-Path $one 'binlog-segment.sql.gz') -Value 'corrupcao ficticia'
+        (Invoke-HubBackupControl $installRoot $dataRoot).support_required | Should Be $true
+        Assert-MockCalled Invoke-HubMySqlProcess -Scope It -Times 1 -Exactly
+    }
     It 'bloqueia MySQL DEV antes de qualquer captura' {
         Mock Assert-HubBackupService { throw 'MySQL80/DEV nao permitido' }
         { Invoke-HubMySqlIncrementalBackup $fullDir $installRoot $dataRoot } | Should Throw 'DEV'
@@ -264,6 +300,27 @@ Describe 'Captura incremental isolada com FULL ficticio' {
         Mock Get-HubBackupFreeBytes { 1 }
         { Invoke-HubMySqlIncrementalBackup $fullDir $installRoot $dataRoot } | Should Throw 'Espaco'
         Assert-MockCalled Invoke-HubMySqlProcess -Scope It -Times 0 -Exactly
+    }
+    It 'renova FULL apos captura real ficticia mantendo nova ancora e cadeia anterior' {
+        Mock Test-HubFullRenewalWindow { $true }
+        Mock Invoke-HubMySqlFullBackup {
+            $name='full-20261016T120000000Z-dddddddddddddddddddddddddddddddd'
+            $dir=Join-Path $script:backupRoot $name; $null=New-Item -ItemType Directory -Path $dir
+            Copy-Item -LiteralPath (Join-Path $script:fullDir 'sysvarhub_db.sql.gz') -Destination $dir
+            $manifest=Read-HubBackupJson (Join-Path $script:fullDir 'manifest.json')
+            $manifest.backup_id='dddddddddddddddddddddddddddddddd'
+            $manifest.completed_at_utc=[DateTime]::UtcNow.ToString('o')
+            $manifest.binlog.position=$script:masterPosition
+            $manifest.binlog.anchor=Get-HubBinlogPrefixAnchor $script:mysqlData $manifest.binlog
+            Write-HubBackupJson (Join-Path $dir 'manifest.json') $manifest
+            return $dir
+        }
+        $result=Invoke-HubBackupControl $installRoot $dataRoot
+        $result.status | Should Be 'FULL_RENOVADO'
+        $result.active_full | Should Match 'dddddddd'
+        $result.last_incremental.full_backup_id | Should Be $fullId
+        @(Get-ChildItem $backupRoot -Directory -Filter 'incremental-*').Count | Should Be 1
+        Test-Path $fullDir | Should Be $true
     }
 }
 

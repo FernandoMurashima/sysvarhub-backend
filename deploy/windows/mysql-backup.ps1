@@ -223,8 +223,10 @@ function Invoke-HubMySqlProcess {
 
 function Get-HubBackupQuery {
     param([string]$MysqlRoot, [string]$CredentialFile, [string]$Sql)
-    return Invoke-HubMySqlProcess -Executable (Join-Path $MysqlRoot 'bin\mysql.exe') `
-        -Arguments ((Get-HubBackupConnectionArguments $CredentialFile) + @('--batch','--raw','--skip-column-names','--database=sysvarhub_db')) -InputSql $Sql
+    try {
+        return Invoke-HubMySqlProcess -Executable (Join-Path $MysqlRoot 'bin\mysql.exe') `
+            -Arguments ((Get-HubBackupConnectionArguments $CredentialFile) + @('--batch','--raw','--skip-column-names','--database=sysvarhub_db')) -InputSql $Sql
+    } catch { $_.Exception.Data['HubBackupFailure']='MYSQL'; throw }
 }
 
 function Assert-HubBackupGrants {
@@ -365,7 +367,8 @@ function Invoke-HubMySqlFullBackup {
     param(
         [string]$InstallRoot = 'C:\Program Files\Sysvar Hub',
         [string]$ProgramDataRoot = 'C:\ProgramData\SysvarHub',
-        [ValidateRange(1,86400)][int]$DumpTimeoutSeconds = 1200
+        [ValidateRange(1,86400)][int]$DumpTimeoutSeconds = 1200,
+        [IO.FileStream]$BackupLock = $null
     )
     $ErrorActionPreference = 'Stop'
     Assert-HubBackupOperator
@@ -388,7 +391,7 @@ function Invoke-HubMySqlFullBackup {
     $id = [guid]::NewGuid().ToString('N')
     $started = [DateTime]::UtcNow
     try {
-        $lock = Enter-HubBackupLock $backupRoot
+        $lock = Get-HubBackupOperationLock $backupRoot $BackupLock
         $staging = Join-Path $backupRoot ('.incomplete-' + $id)
         if (Test-Path -LiteralPath $staging) { throw "Area temporaria ja existe; nada sera sobrescrito." }
         $null = New-Item -ItemType Directory -Path $staging
@@ -424,7 +427,7 @@ function Invoke-HubMySqlFullBackup {
         return $destination
     } finally {
         try { if ($createdStaging -and $staging) { Remove-HubBackupStaging $backupRoot $staging $id } }
-        finally { if ($lock) { $lock.Dispose() } }
+        finally { if ($lock -and -not $BackupLock) { $lock.Dispose() } }
     }
 }
 
@@ -665,7 +668,7 @@ function Test-HubBinlogSqlChanges {
 }
 
 function Invoke-HubMySqlIncrementalBackup {
-    param([string]$FullBackupDirectory,[string]$InstallRoot='C:\Program Files\Sysvar Hub',[string]$ProgramDataRoot='C:\ProgramData\SysvarHub',[ValidateRange(1,86400)][int]$CaptureTimeoutSeconds=1200)
+    param([string]$FullBackupDirectory,[string]$InstallRoot='C:\Program Files\Sysvar Hub',[string]$ProgramDataRoot='C:\ProgramData\SysvarHub',[ValidateRange(1,86400)][int]$CaptureTimeoutSeconds=1200,[IO.FileStream]$BackupLock=$null,$VerifiedChain=$null)
     $ErrorActionPreference='Stop'
     Assert-HubBackupOperator
     $InstallRoot=Assert-HubBackupLocalPath $InstallRoot; $ProgramDataRoot=Assert-HubBackupLocalPath $ProgramDataRoot
@@ -676,10 +679,14 @@ function Invoke-HubMySqlIncrementalBackup {
     $before=Get-HubBackupServerState $mysqlRoot $ProgramDataRoot $credential
     if ($before.binlog_checksum -ne 'CRC32') { throw "Captura local exige binlog CRC32 nao criptografado." }
     Protect-SecretFile $backupRoot
-    $lock=Enter-HubBackupLock $backupRoot
+    $lock=Get-HubBackupOperationLock $backupRoot $BackupLock
     $staging=$null; $created=$false; $id=[guid]::NewGuid().ToString('N'); $started=[DateTime]::UtcNow
     try {
-        $chain=Get-HubIncrementalChain $backupRoot $FullBackupDirectory $before
+        # Contexto interno do controlador: validado sob a mesma trava exclusiva.
+        if ($VerifiedChain) {
+            if (-not $BackupLock -or $VerifiedChain.full.mysql.server_uuid -ne $before.server_uuid -or -not (Test-HubBackupIdentity $VerifiedChain.full.installation $before.identity) -or (Split-Path $FullBackupDirectory -Leaf) -notlike ('full-*-' + $VerifiedChain.full.backup_id)) { throw 'Contexto de cadeia divergente.' }
+            $chain=$VerifiedChain
+        } else { $chain=Get-HubIncrementalChain $backupRoot $FullBackupDirectory $before }
         $window=Get-HubBinlogWindow $mysqlRoot $credential $chain.point
         Assert-HubBinlogSource $before.datadir $chain.point $chain.anchor
         if ($chain.head_repair) { Write-HubIncrementalHead $backupRoot $chain }
@@ -716,11 +723,25 @@ function Invoke-HubMySqlIncrementalBackup {
         [IO.Directory]::Delete($raw); [IO.File]::Delete($sql)
         $destination=Join-Path $backupRoot ('incremental-' + $chain.full.backup_id + '-' + $sequence.ToString('D8') + '-' + $id)
         [IO.Directory]::Move($staging,$destination); $staging=$null
-        $chain.sequence=$sequence; $chain.last_id=$id; $chain.last_hash=(Get-FileHash -LiteralPath (Join-Path $destination 'manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant(); $chain.point=$manifest.end
+        $chain.sequence=$sequence; $chain.last_id=$id; $chain.last_hash=(Get-FileHash -LiteralPath (Join-Path $destination 'manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant(); $chain.point=$manifest.end; $chain.anchor=$manifest.end.anchor
         Write-HubIncrementalHead $backupRoot $chain
         return $destination
     } finally {
         try { if ($created -and $staging) { Remove-HubBackupStaging $backupRoot $staging $id } }
-        finally { $lock.Dispose() }
+        finally { if (-not $BackupLock) { $lock.Dispose() } }
     }
+}
+
+# Uso interno: o controlador mantem a mesma trava durante selecao e captura.
+function Get-HubBackupOperationLock {
+    param([string]$BackupRoot,[IO.FileStream]$BackupLock)
+    if (-not $BackupLock) { return Enter-HubBackupLock $BackupRoot }
+    $expected=Assert-HubBackupLocalPath (Join-Path $BackupRoot '.full-backup.lock')
+    if (-not $BackupLock.CanWrite -or $BackupLock.Name -ine $expected) { throw 'Trava de backup invalida.' }
+    # Um handle compartilhado nao pode ser usado para contornar a exclusao mutua.
+    $probe=$null
+    try { $probe=[IO.File]::Open($expected,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite) }
+    catch [IO.IOException] { return $BackupLock }
+    finally { if ($probe) { $probe.Dispose() } }
+    throw 'Trava de backup nao e exclusiva.'
 }

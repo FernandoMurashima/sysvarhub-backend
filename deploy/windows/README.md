@@ -187,3 +187,118 @@ Testes direcionados (somente mocks, binlogs sinteticos e arquivos ficticios):
 ```powershell
 powershell.exe -NoProfile -Command "Invoke-Pester -Script deploy/windows/tests/mysql-backup.Tests.ps1,deploy/windows/tests/mysql-full-backup.Tests.ps1,deploy/windows/tests/mysql-incremental-backup.Tests.ps1 -EnableExit"
 ```
+
+
+## Controle local e agendamento preparado (Prompt 5)
+
+`backup-run.ps1` executa **uma tentativa** do controlador `mysql-backup-control.ps1`.
+A importacao dos helpers nao registra tarefas nem acessa o MySQL. O instalador do
+Hub continua sem habilitar ou registrar o agendamento; os scripts adicionais sao
+incluidos no pacote pelo mecanismo existente de copia de `*.ps1`.
+
+O plano do Agendador usa SYSTEM (`ServiceAccount`), execucao sem login, PowerShell
+5.1 sem perfil e sem interface, prioridade 7 (BelowNormal), repeticao indefinida
+`PT15M`, `IgnoreNew` e recuperacao de disparo perdido. Nao depende de internet.
+A tarefa nao termina a captura por atingir outro disparo; as ferramentas preservam
+seus timeouts. O runner tambem reduz sua prioridade e compartilha **a mesma trava
+exclusiva** usada pelos comandos manuais FULL/incremental durante toda a tentativa.
+Nao e criado outro servico Windows.
+
+### Selecao, continuidade e renovacao
+
+- Seleciona automaticamente a pasta FULL publicada mais recente e valida manifesto,
+  SHA-256, identidade/UUID e toda sua cadeia. Areas `.incomplete-*` nao sao candidatas.
+  FULL mais recente invalido exige suporte; nao ha fallback silencioso para outro.
+- Sem FULL, registra `INICIALIZACAO_PENDENTE`; o primeiro FULL continua sendo uma
+  acao manual autorizada do suporte, usando `backup-full.ps1`.
+- Persiste o nome e SHA do FULL ativo em `backup/backup-control.json`. A cadeia ativa
+  e revalidada antes de adotar um FULL manual mais recente ou renovar o FULL.
+  Desaparecimento, corrupcao, UUID divergente ou lacuna bloqueiam o avanco.
+- A cada tentativa valida a origem e consulta a coordenada corrente. Sem avanco nao
+  chama a captura; com somente metadados o helper incremental nao publica arquivo.
+  Checkpoint e recuperacao de publicacao interrompida continuam nos helpers existentes.
+- Renovacao padrao: FULL com pelo menos **7 dias**, na primeira execucao entre
+  **03:00 (inclusive) e 04:00 (exclusive)** do horario local do Windows. A idade usa UTC;
+  nao ha obrigacao de operador logado. Janelas que cruzam meia-noite sao aceitas.
+- Havendo mudancas, preserva primeiro o incremental; depois revalida a continuidade
+  antes da renovacao. So adota o novo FULL depois da publicacao e validacao completa.
+  Nenhuma cadeia anterior e substituida ou apagada. Se o FULL falhar, preserva a selecao
+  anterior e tenta novamente na proxima janela elegivel.
+- Indisponibilidade MySQL/falha de captura produz `FALHA_REPETIR`. Problema de cadeia
+  ou configuracao produz `INTERVENCAO_SUPORTE`, bloqueio persistente. Uma nova execucao
+  agendada nao o remove e nao gera FULL para esconder perda de continuidade.
+
+O suporte pode configurar `C:\ProgramData\SysvarHub\config\backup-policy.json`,
+protegido pela ACL administrativa da instalacao. Se ausente, valem os padroes:
+
+```json
+{
+  "version": 1,
+  "renewal_days": 7,
+  "window_start": "03:00",
+  "window_end": "04:00",
+  "minimum_free_bytes": 1073741824,
+  "warning_storage_bytes": 68719476736,
+  "timeout_seconds": 1200
+}
+```
+
+As rotinas FULL/incremental continuam verificando suas margens de espaco especificas,
+mesmo com o minimo de 1 GiB do controlador. O alerta de 64 GiB nao apaga arquivos.
+Tempo, bytes publicados, espaco livre e armazenamento observado no inicio da tentativa
+ficam no diagnostico. Os hashes de toda a cadeia sao relidos por seguranca a cada
+tentativa; o resultado validado sob a trava e reutilizado na captura para nao duplicar
+essa leitura. O inventario de armazenamento usa metadados e rejeita junctions.
+Ha custo de disco proporcional ao tamanho da cadeia; baixa prioridade nao garante
+latencia do PDV. A janela e os limites precisam de homologacao em hardware de loja.
+
+### Ativacao futura pelo suporte — nao realizada nesta etapa
+
+Em Windows PowerShell 5.1 elevado, **somente na instalacao oficial ja adequada**
+(SysvarHubMySQL/3307, instancia exclusiva, ferramentas homologadas, conta e ACLs
+preparadas, espaco disponivel e FULL inicial validado):
+
+```powershell
+# Apenas mostra o XML planejado; nao grava nem registra tarefa.
+& 'C:\Program Files\Sysvar Hub\scripts\backup-task-install.ps1'
+
+# Acao futura explicita: registra DESATIVADA, sem iniciar backup.
+& 'C:\Program Files\Sysvar Hub\scripts\backup-task-install.ps1' -Register
+
+# Consulta tarefa e diagnostico; nao modifica o agendamento.
+& 'C:\Program Files\Sysvar Hub\scripts\backup-task-status.ps1' |
+    ConvertTo-Json -Depth 12
+
+# Somente depois da revisao/autorizacao do suporte: habilita os disparos futuros.
+Enable-ScheduledTask -TaskName 'SysvarHubMySQLBackup' -TaskPath '\'
+
+# Desativa disparos futuros; nao mata uma captura em andamento.
+& 'C:\Program Files\Sysvar Hub\scripts\backup-task-disable.ps1'
+```
+
+O registro recusa qualquer tarefa homonima existente (sem `-Force`) e verifica
+proprietario/permissoes do codigo que sera executado como SYSTEM. A desativacao exige
+descricao, executavel, argumentos e identidade oficiais; uma tarefa divergente e
+preservada para revisao assistida. Nenhum desses comandos foi executado contra o
+Agendador nesta implementacao. Instalacoes antigas nao sao adaptadas automaticamente.
+
+O diagnostico JSON inclui ultimo FULL, ultimo incremental valido (com seu FULL de
+origem), tentativa UTC, sucesso UTC, duracao, tamanho, situacao, codigo de falha,
+alertas e `support_required`. Nao armazena consultas, conteudo, senhas ou mensagens
+nativas. `Get-ScheduledTaskInfo` complementa o resultado do processo; erros do runner
+retornam codigo 1. Falta do FULL inicial e espera por outra execucao nao inventam sucesso.
+
+Em bloqueio, suporte deve preservar arquivos/checkpoints e investigar a causa.
+Apos reparar a **mesma cadeia**, pode executar manualmente `backup-run.ps1
+-ResumeAfterSupport`; isso exige nova validacao completa e nao ignora divergencias.
+Estado JSON invalido e preservado, sem reinicializacao automatica. Se a cadeia nao
+puder ser reparada, um novo FULL e a substituicao **explicitamente assistida** da
+selecao local exigem procedimento autorizado; nao ha botao de reset automatico.
+Nao ha restauracao, transmissao, retencao ou remocao de backups neste prompt.
+
+Testes adicionais isolados: `tests/mysql-backup-control.Tests.ps1` e
+`tests/mysql-backup-task.Tests.ps1`, com mocks do MySQL/Agendador e arquivos ficticios.
+As suites FULL/incremental tambem exercitam compartilhamento da trava, controlador,
+checkpoint interrompido e retry sem duplicacao, sem backup real.
+
+Referencia do plano: [schema oficial do Agendador Windows](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-schema).
