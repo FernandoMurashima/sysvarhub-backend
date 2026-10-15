@@ -19,8 +19,6 @@ $MysqlBackupFile = Join-Path $ConfigRoot "mysql-backup.cnf"
 $ServiceExe = Join-Path $InstallRoot "runtime\SysvarHubService.exe"
 $Mysqld = Join-Path $InstallRoot "mysql\bin\mysqld.exe"
 $Mysql = Join-Path $InstallRoot "mysql\bin\mysql.exe"
-$AclSystem = "*S-1-5-18:F"
-$AclAdministrators = "*S-1-5-32-544:F"
 
 function New-Secret([int]$Length = 48) {
     $bytes = New-Object byte[] $Length
@@ -31,13 +29,6 @@ function New-Secret([int]$Length = 48) {
         $rng.Dispose()
     }
     return [Convert]::ToBase64String($bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
-}
-
-function Protect-SecretFile([string]$Path) {
-    icacls $Path /inheritance:r | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Falha ao proteger arquivo de credenciais." }
-    icacls $Path /grant:r $AclSystem $AclAdministrators | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Falha ao restringir arquivo de credenciais." }
 }
 
 function Write-MySqlAdminFile([string]$Password) {
