@@ -81,8 +81,10 @@ def adicionar_pagamento_cashback_online(terminal, operador, sessao_operador, *, 
                 or pagamento_existente.cashback_origem != VendaPagamentoHub.CASHBACK_ORIGEM_CENTRAL
                 or money(pagamento_existente.valor) != valor
                 or not pagamento_existente.cashback_reserva_id
+                or pagamento_existente.status != VendaPagamentoHub.STATUS_ATIVO
             ):
                 raise VendaConflictError(ERRO_OPERACAO_PAGAMENTO_DIVERGENTE)
+            validar_contexto_pagamento_cashback(pagamento_existente)
             return venda, False
 
         if venda.vendedor_retaguarda_id is None:
@@ -106,41 +108,15 @@ def adicionar_pagamento_cashback_online(terminal, operador, sessao_operador, *, 
         if valor > pendente:
             raise VendaConflictError("Cashback não pode gerar troco; use apenas o saldo pendente da venda.")
 
-        try:
-            resposta = _client(terminal_bloqueado.hub).cashback_reservar_venda(
-                token=terminal_bloqueado.hub.retaguarda_token,
-                payload={
-                    "venda_uuid": str(venda.venda_uuid),
-                    "operacao_uuid": str(operacao_uuid),
-                    "cliente_id": venda.cliente_retaguarda_id,
-                    "valor": f"{valor:.2f}",
-                },
-            )
-        except RetaguardaError as exc:
-            raise VendaConflictError(f"Central ONLINE obrigatória para reservar Cashback: {exc}") from exc
-        reserva = resposta.get("reserva") if isinstance(resposta, dict) else None
-        if not isinstance(reserva, dict):
-            raise VendaConflictError("Reserva de Cashback não retornada pela Central.")
-        reserva_id = reserva.get("id")
-        if type(reserva_id) is not int or reserva_id <= 0:
-            raise VendaConflictError("Identificação da reserva de Cashback inválida.")
-        cliente_id = reserva.get("cliente_id")
-        if type(cliente_id) is not int or cliente_id <= 0:
-            raise VendaConflictError("Cliente da reserva de Cashback inválido.")
-        try:
-            valor_reservado = Decimal(str(reserva.get("valor")))
-            venda_reservada = uuid.UUID(str(reserva.get("venda_uuid")))
-            operacao_reservada = uuid.UUID(str(reserva.get("operacao_uuid")))
-        except (ValueError, TypeError, InvalidOperation) as exc:
-            raise VendaConflictError("Reserva de Cashback inválida retornada pela Central.") from exc
-        if cliente_id != venda.cliente_retaguarda_id:
-            raise VendaConflictError("Reserva de Cashback pertence a outro cliente.")
-        if venda_reservada != venda.venda_uuid or operacao_reservada != operacao_uuid:
-            raise VendaConflictError("Reserva de Cashback pertence a outra venda ou operação.")
-        if not valor_reservado.is_finite() or valor_reservado != valor:
-            raise VendaConflictError("Valor da reserva de Cashback diverge do pagamento.")
-        if reserva.get("status") != "RESERVADA":
-            raise VendaConflictError("Reserva de Cashback não está ativa.")
+        resposta = reservar_na_central(terminal_bloqueado.hub, {
+            "venda_uuid": str(venda.venda_uuid),
+            "operacao_uuid": str(operacao_uuid),
+            "cliente_id": venda.cliente_retaguarda_id,
+            "valor": f"{valor:.2f}",
+            "total_venda": f"{money(venda.total):.2f}",
+        })
+        autorizacao = validar_resposta_reserva(resposta, venda, operacao_uuid, valor)
+        reserva_id = autorizacao["id"]
 
         try:
             pagamento = VendaPagamentoHub.objects.create(
@@ -164,7 +140,9 @@ def adicionar_pagamento_cashback_online(terminal, operador, sessao_operador, *, 
                 operador_inclusao=operador,
                 sessao_operador_inclusao=sessao_operador,
             )
-            registrar_evento(venda, VendaEventoHub.TIPO_PAGAMENTO_ADICIONADO, terminal_bloqueado, operador, sessao_operador, dados_pagamento(pagamento))
+            dados_evento = dados_pagamento(pagamento)
+            dados_evento["cashback_autorizacao"] = autorizacao
+            registrar_evento(venda, VendaEventoHub.TIPO_PAGAMENTO_ADICIONADO, terminal_bloqueado, operador, sessao_operador, dados_evento)
         except Exception as exc:
             transaction.set_rollback(True)
             try:
@@ -202,3 +180,73 @@ def liberar_reserva_pagamento_cashback(pagamento):
         )
     except RetaguardaError as exc:
         raise VendaConflictError(f"Não foi possível liberar reserva de Cashback na Central: {exc}") from exc
+
+
+def validar_resposta_reserva(resposta, venda, operacao_uuid, valor):
+    reserva = resposta.get("reserva") if isinstance(resposta, dict) else None
+    if not isinstance(reserva, dict):
+        raise VendaConflictError("Reserva de Cashback não retornada pela Central.")
+    if type(reserva.get("autorizacao_versao")) is not int or reserva["autorizacao_versao"] != 2:
+        raise VendaConflictError("Autorização de Cashback exige resposta oficial da Central na versão 2.")
+    reserva_id = reserva.get("id")
+    if type(reserva_id) is not int or reserva_id <= 0:
+        raise VendaConflictError("Identificação da reserva de Cashback inválida.")
+    cliente_id = reserva.get("cliente_id")
+    if type(cliente_id) is not int or cliente_id <= 0:
+        raise VendaConflictError("Cliente da reserva de Cashback inválido.")
+    try:
+        valor_reservado = Decimal(str(reserva.get("valor")))
+        total_autorizado = Decimal(str(reserva.get("total_venda")))
+        limite_uso = Decimal(str(reserva.get("limite_uso")))
+        venda_reservada = uuid.UUID(str(reserva.get("venda_uuid")))
+        operacao_reservada = uuid.UUID(str(reserva.get("operacao_uuid")))
+    except (ValueError, TypeError, InvalidOperation) as exc:
+        raise VendaConflictError("Reserva de Cashback inválida retornada pela Central.") from exc
+    if cliente_id != venda.cliente_retaguarda_id:
+        raise VendaConflictError("Reserva de Cashback pertence a outro cliente.")
+    if venda_reservada != venda.venda_uuid or operacao_reservada != operacao_uuid:
+        raise VendaConflictError("Reserva de Cashback pertence a outra venda ou operação.")
+    if not valor_reservado.is_finite() or valor_reservado != valor:
+        raise VendaConflictError("Valor da reserva de Cashback diverge do pagamento.")
+    if reserva.get("status") != "RESERVADA":
+        raise VendaConflictError("Reserva de Cashback não está ativa.")
+    if not total_autorizado.is_finite() or total_autorizado != money(venda.total):
+        raise VendaConflictError("Total autorizado de Cashback diverge do total comercial da venda; cancele e reautorize o pagamento.")
+    if not limite_uso.is_finite() or limite_uso < valor or limite_uso > total_autorizado or limite_uso != money(limite_uso):
+        raise VendaConflictError("Limite da autorização de Cashback inválido.")
+    return {
+        "id": reserva_id, "autorizacao_versao": 2, "venda_uuid": str(venda_reservada),
+        "operacao_uuid": str(operacao_reservada), "cliente_id": cliente_id,
+        "valor": f"{valor_reservado:.2f}", "total_venda": f"{total_autorizado:.2f}",
+        "limite_uso": f"{limite_uso:.2f}", "status": "RESERVADA",
+    }
+
+
+def validar_contexto_pagamento_cashback(pagamento):
+    if (pagamento.tipo or "").upper() != CASHBACK or pagamento.cashback_origem != VendaPagamentoHub.CASHBACK_ORIGEM_CENTRAL:
+        return
+    evento = VendaEventoHub.objects.filter(
+        venda=pagamento.venda, tipo=VendaEventoHub.TIPO_PAGAMENTO_ADICIONADO,
+        dados__pagamento_uuid=str(pagamento.pagamento_uuid),
+    ).order_by("-id").first()
+    autorizacao = evento.dados.get("cashback_autorizacao") if evento else None
+    if not isinstance(autorizacao, dict):
+        raise VendaConflictError("Pagamento Cashback sem autorização de versão 2; remova e reautorize online.")
+    if autorizacao.get("id") != pagamento.cashback_reserva_id:
+        raise VendaConflictError("Reserva do pagamento Cashback diverge da autorização original.")
+    validar_resposta_reserva({"reserva": autorizacao}, pagamento.venda, pagamento.operacao_uuid, money(pagamento.valor))
+
+
+def reservar_na_central(hub, payload):
+    client = _client(hub)
+    for tentativa in range(2):
+        try:
+            return client.cashback_reservar_venda(token=hub.retaguarda_token, payload=payload)
+        except RetaguardaError as exc:
+            causa = exc.__cause__
+            timeout = isinstance(causa, TimeoutError) or isinstance(getattr(causa, "reason", None), TimeoutError)
+            if tentativa == 0 and timeout:
+                continue  # A Central pode ter reservado antes do timeout: repetir a mesma identidade e contexto.
+            raise VendaConflictError(
+                f"Central ONLINE obrigatória para reservar Cashback: {exc}. Tente novamente com a mesma operação."
+            ) from exc

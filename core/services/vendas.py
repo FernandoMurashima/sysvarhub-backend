@@ -782,6 +782,9 @@ def finalizar_venda(terminal, operador, sessao_operador, *, venda_uuid):
         )
         if not pagamentos:
             raise VendaConflictError("Venda sem pagamento.")
+        from core.services.cashback_online import validar_contexto_pagamento_cashback
+        for pagamento in pagamentos:
+            validar_contexto_pagamento_cashback(pagamento)
         try:
             validar_cashback_vale_troca_exclusivos(venda, pagamentos=pagamentos)
         except ValueError as exc:
