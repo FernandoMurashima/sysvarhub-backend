@@ -1,10 +1,10 @@
 import uuid
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_EVEN
 
 from django.db import models, transaction
 from django.utils import timezone
 
-from core.models import CatalogoItemHub, ClienteHub, ValeTrocaHub, ValeTrocaMovimentoHub, VendaDevolucaoHub, VendaDevolucaoItemHub, VendaHub, VendaItemHub
+from core.models import CatalogoItemHub, ClienteHub, ValeTrocaHub, ValeTrocaMovimentoHub, VendaDevolucaoHub, VendaDevolucaoItemHub, VendaHub, VendaItemHub, VendaPagamentoHub
 from core.services.central_status import CENTRAL_STATUS_ONLINE, calcular_status_central
 from core.services.numeracao_devolucoes import NumeracaoDevolucaoHubError, consumir_documento_devolucao
 from core.services.sync import enfileirar_devolucao_finalizada
@@ -314,28 +314,84 @@ def finalizar_devolucao_local(terminal, operador, *, venda_uuid, itens, motivo="
                 estoque_fisico=models.F("estoque_fisico") + Decimal(quantidade),
                 estoque_disponivel=models.F("estoque_disponivel") + Decimal(quantidade),
             )
-        vale = ValeTrocaHub.objects.create(
-            hub=terminal.hub,
-            devolucao=devolucao,
-            cliente_uuid=venda.cliente_uuid,
-            cliente_retaguarda_id=venda.cliente_retaguarda_id,
-            documento=f"VT-HUB-{devolucao.devolucao_uuid.hex[:20]}",
-            valor_original=total,
-            saldo=total,
-            status=ValeTrocaHub.STATUS_ABERTO,
-            origem_devolucao_uuid=devolucao.devolucao_uuid,
-            origem=ValeTrocaHub.ORIGEM_HUB_PROVISORIO,
-            provisorio=True,
-        )
-        ValeTrocaMovimentoHub.objects.create(
-            vale=vale,
-            tipo=ValeTrocaMovimentoHub.TIPO_CREDITO,
-            valor=total,
-            saldo_apos=total,
-            observacao=f"Crédito gerado pela devolução Hub {devolucao.devolucao_uuid}",
-        )
+        credito_liquido, cashback_restituir = calcular_credito_liquido_devolucao(venda, devolucao)
+        if cashback_restituir > 0 or venda.pagamentos.filter(tipo__iexact="CASHBACK", status=VendaPagamentoHub.STATUS_ATIVO).exists():
+            devolucao.dados_origem = {
+                "cashback_restituicao_prevista": str(cashback_restituir),
+                "credito_liquido_previsto": str(credito_liquido),
+            }
+            devolucao.save(update_fields=["dados_origem"])
+        if credito_liquido > 0:
+            vale = ValeTrocaHub.objects.create(
+                hub=terminal.hub,
+                devolucao=devolucao,
+                cliente_uuid=venda.cliente_uuid,
+                cliente_retaguarda_id=venda.cliente_retaguarda_id,
+                documento=f"VT-HUB-{devolucao.devolucao_uuid.hex[:20]}",
+                valor_original=credito_liquido,
+                saldo=credito_liquido,
+                status=ValeTrocaHub.STATUS_ABERTO,
+                origem_devolucao_uuid=devolucao.devolucao_uuid,
+                origem=ValeTrocaHub.ORIGEM_HUB_PROVISORIO,
+                provisorio=True,
+            )
+            ValeTrocaMovimentoHub.objects.create(
+                vale=vale,
+                tipo=ValeTrocaMovimentoHub.TIPO_CREDITO,
+                valor=credito_liquido,
+                saldo_apos=credito_liquido,
+                observacao=f"Crédito gerado pela devolução Hub {devolucao.devolucao_uuid}",
+            )
         transaction.on_commit(lambda devolucao_id=devolucao.pk: enfileirar_devolucao_finalizada(VendaDevolucaoHub.objects.get(pk=devolucao_id)))
     return devolucao
+
+
+def calcular_credito_liquido_devolucao(venda, devolucao):
+    """Estima o crédito líquido; a restituição de Cashback pertence à Central."""
+    zero = Decimal("0.00")
+    cashback = venda.pagamentos.filter(
+        tipo__iexact="CASHBACK", status=VendaPagamentoHub.STATUS_ATIVO,
+    ).aggregate(total=models.Sum("valor"))["total"] or zero
+    if cashback <= zero:
+        return devolucao.valor_total, zero
+
+    # financeiro.services.money da Central usa ROUND_HALF_EVEN na restituição.
+    def arredondar(valor):
+        return Decimal(valor).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+
+    def bruto_central(registro):
+        # A Central arredonda o desconto unitário antes de calcular a devolução.
+        total = zero
+        for item in registro.itens.all():
+            original = item.venda_item
+            desconto_unitario = money(original.desconto / Decimal(original.quantidade))
+            total += money((original.preco_unitario - desconto_unitario) * item.quantidade)
+        return total
+
+    valor_bruto = bruto_central(devolucao)
+    cashback = arredondar(cashback)
+    base_itens = arredondar(venda.itens.aggregate(total=models.Sum("total_item"))["total"] or zero)
+    if base_itens <= zero:
+        raise VendaConflictError("Base dos itens inválida para calcular a restituição de Cashback.")
+    acumulado = zero
+    restituido = zero
+    anteriores = venda.devolucoes.exclude(pk=devolucao.pk).prefetch_related("itens__venda_item", "vale_troca").order_by("pk")
+    for anterior in anteriores:
+        bruto = bruto_central(anterior)
+        acumulado += bruto
+        alvo = cashback if acumulado >= base_itens else arredondar(cashback * acumulado / base_itens)
+        if anterior.confirmado_central_em:
+            vale = getattr(anterior, "vale_troca", None)
+            # O saldo pode ter sido consumido; a restituição usa o crédito original.
+            liquido_confirmado = vale.valor_original if vale else zero
+            incremento = max(zero, bruto - liquido_confirmado)
+        else:
+            incremento = max(zero, min(cashback, alvo) - restituido)
+        restituido += incremento
+    acumulado = arredondar(acumulado + valor_bruto)
+    alvo = cashback if acumulado >= base_itens else arredondar(cashback * acumulado / base_itens)
+    incremento = arredondar(max(zero, min(cashback, alvo) - restituido))
+    return money(max(zero, valor_bruto - incremento)), incremento
 
 
 def finalizar_devolucao_manual_offline(terminal, operador, *, documento_venda="", itens, motivo="", devolucao_uuid=None):
