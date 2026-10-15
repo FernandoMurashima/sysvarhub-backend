@@ -8,10 +8,11 @@ from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
 from django.core.management import call_command
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from lxml import etree
 
+from core import tests_pagamentos as pagamentos_tests
 from core.models import (
     ConfiguracaoFiscalHub,
     EventoSyncHub,
@@ -20,6 +21,7 @@ from core.models import (
     NFCeHub,
     VendaHub,
     VendaItemHub,
+    VendaPagamentoHub,
 )
 from core.services.nfce import (
     CANONICALIZATION_ALGORITHM,
@@ -34,6 +36,7 @@ from core.services.nfce import (
     SefazNFCeClientDesenvolvimento,
     SefazNFCeClientReal,
     ResultadoSefazNFCe,
+    _tpag_pagamento,
     calcular_dv_chave,
     gerar_chave_acesso,
     gerar_nfce_local,
@@ -279,6 +282,19 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
                 nfce = self.gerar_nfce(venda, codigo_numerico=f"{indice + 1:08d}")
 
                 self.assertEqual(self.tpag_do_xml(nfce), [tpag])
+
+    def test_pagamento_sem_forma_gera_erro_controlado_tpag(self):
+        venda = self.venda_finalizada()
+        pagamento = venda.pagamentos.get(status="ATIVO")
+        pagamento.forma_pagamento = None
+        pagamento.save(update_fields=["forma_pagamento"])
+        with self.assertRaises(NFCeErroDominio) as ctx:
+            self.gerar_nfce(venda)
+        self.assertEqual(ctx.exception.codigo, "PAGAMENTO_TIPO_SEM_TPAG")
+
+    def test_tpag_vale_troca_sem_forma_preservado(self):
+        pagamento = VendaPagamentoHub(tipo="VALE_TROCA")
+        self.assertEqual(_tpag_pagamento(pagamento), "05")
 
     def test_duas_formas_credito_usam_tpag_credito(self):
         credito_a = self.criar_forma("CR1", "CREDITO")
@@ -864,3 +880,53 @@ class NFCeHubTests(PagamentoHubTestMixin, TestCase):
             padding.PKCS1v15(),
             hashes.SHA1(),
         )
+
+
+class CashbackNFCeFinalizacaoTests(PagamentoHubTestMixin, TransactionTestCase):
+    habilitar_nfce = pagamentos_tests.VendaFinalizacaoTests.habilitar_nfce
+
+    @override_settings(
+        SYSVARHUB_NFCE_MATERIAL_MODE="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_CLIENT="DESENVOLVIMENTO",
+        SYSVARHUB_NFCE_SEFAZ_DESENVOLVIMENTO_RESULTADO="AUTORIZADA",
+        SYSVARHUB_NFCE_QRCODE_URL="https://sefaz.test/qrcode",
+        SYSVARHUB_NFCE_URL_CHAVE="https://sefaz.test/consulta",
+    )
+    def test_finalizacao_cashback_central_pix_preserva_tpag_e_total_fiscal(self):
+        self.habilitar_nfce()
+        self.catalogo_item.preco_venda = Decimal("100.00")
+        self.catalogo_item.save(update_fields=["preco_venda"])
+        cliente = self.criar_cliente()
+        venda_uuid = self.criar_venda_com_item()
+        self.assertEqual(self.put_cliente(cliente).status_code, 200)
+        self.criar_cashback_disponivel(cliente, saldo="0.00")
+        operacao_uuid = uuid.uuid4()
+        with patch("core.services.cashback_online.RetaguardaClient") as central:
+            central.return_value.cashback_reservar_venda.side_effect = self.reserva_central(id=55)
+            resposta = self.pagar_cashback_online(venda_uuid, "30.00", operacao_uuid=operacao_uuid)
+        self.assertEqual(resposta.status_code, 201, resposta.data)
+        self.assertEqual(self.pagar(venda_uuid, self.pix, "70.00").status_code, 201)
+
+        resposta = self.finalizar(venda_uuid)
+        self.assertEqual(resposta.status_code, 200, resposta.data)
+        venda = VendaHub.objects.get(venda_uuid=venda_uuid)
+        self.assertEqual(venda.status, VendaHub.STATUS_FINALIZADA)
+        self.assertEqual(venda.total, Decimal("100.00"))
+        cashback = venda.pagamentos.get(tipo="CASHBACK")
+        self.assertIsNone(cashback.forma_pagamento_id)
+        self.assertEqual(cashback.cashback_origem, VendaPagamentoHub.CASHBACK_ORIGEM_CENTRAL)
+        self.assertEqual(cashback.cashback_reserva_id, 55)
+        self.assertEqual(cashback.cashback_valor_reservado, Decimal("30.00"))
+        self.assertEqual(cashback.operacao_uuid, operacao_uuid)
+        nfce = NFCeHub.objects.get(venda=venda)
+        ns = {"n": "http://www.portalfiscal.inf.br/nfe"}
+        root = ET.fromstring(nfce.xml_assinado)
+        self.assertEqual([node.text for node in root.findall("n:infNFe/n:pag/n:detPag/n:tPag", ns)], ["19", "17"])
+        self.assertEqual([node.text for node in root.findall("n:infNFe/n:pag/n:detPag/n:vPag", ns)], ["30.00", "70.00"])
+        total_fiscal = root.find("n:infNFe/n:total/n:ICMSTot", ns)
+        self.assertEqual(Decimal(total_fiscal.find("n:vNF", ns).text), venda.total)
+        self.assertEqual(total_fiscal.find("n:vProd", ns).text, "100.00")
+        self.assertEqual(total_fiscal.find("n:vDesc", ns).text, "0.00")
+        self.assertEqual(self.finalizar(venda_uuid).status_code, 200)
+        self.assertEqual(NFCeHub.objects.filter(venda=venda).count(), 1)
+        self.assertEqual(venda.pagamentos.filter(tipo="CASHBACK").count(), 1)
