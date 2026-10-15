@@ -6,6 +6,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "mysql-backup.ps1")
 
 $BuildRoot = Join-Path $PSScriptRoot "build"
 $DistRoot = Join-Path $PSScriptRoot "dist"
@@ -30,10 +31,7 @@ function Resolve-Iscc {
 
 function Assert-MySqlRoot {
     param([string]$Root)
-    if (-not $Root -or -not (Test-Path (Join-Path $Root "bin\mysqld.exe")) -or -not (Test-Path (Join-Path $Root "bin\mysql.exe"))) {
-        throw "MySqlRoot invalido. Informe uma distribuicao oficial extraida contendo bin\mysqld.exe e bin\mysql.exe."
-    }
-    return (Resolve-Path $Root).Path
+    return (Assert-HubMySqlToolchain $Root)
 }
 
 function Get-FreeTcpPort {
@@ -220,8 +218,7 @@ Copy-Item -Path (Join-Path $ResolvedMySql "*") -Destination (Join-Path $StagingR
 Copy-Item -Path (Join-Path $PSScriptRoot "*.ps1") -Destination (Join-Path $StagingRoot "scripts") -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot "sysvarhub.env.example") -Destination (Join-Path $StagingRoot "config-template\sysvarhub.env.example")
 
-if (-not (Test-Path (Join-Path $StagingRoot "mysql\bin\mysqld.exe"))) { throw "mysqld.exe ausente no staging." }
-if (-not (Test-Path (Join-Path $StagingRoot "mysql\bin\mysql.exe"))) { throw "mysql.exe ausente no staging." }
+$null = Assert-HubMySqlToolchain (Join-Path $StagingRoot "mysql")
 if (-not (Test-Path (Join-Path $StagingRoot "frontend\index.html"))) { throw "Frontend ausente no staging." }
 
 Invoke-RuntimeGate -RuntimeRoot (Join-Path $StagingRoot "runtime") -FrontendRoot (Join-Path $StagingRoot "frontend")

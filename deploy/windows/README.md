@@ -65,3 +65,36 @@ O build do frontend nao e versionado. O instalador final devera embutir runtime 
 3. O servico fica online enviando heartbeat para a Central.
 4. A Central solicita a primeira sincronizacao pelo painel.
 5. O Hub recebe o comando no heartbeat, executa a carga completa e informa o resultado.
+
+## Preparacao de backup MySQL (sem rotina de backup ativa)
+
+Instalacoes novas usam uma instancia dedicada `SysvarHubMySQL`, TCP `127.0.0.1:3307`, sem conectar ao MySQL DEV (`MySQL80`, porta 3306). O instalador escreve `my.ini` somente quando nao existem configuracao, credenciais, dados ou servico anteriores. Estados incompletos exigem adequacao assistida, sem recriar configuracao ou reinicializar dados existentes.
+
+A configuracao nova explicita InnoDB, `log_bin`, `binlog_format=ROW`, `sync_binlog=1`, `innodb_flush_log_at_trx_commit=1`, `server_id` e `binlog_expire_logs_seconds`. Parametros do instalador: `-MySqlServerId` (padrao 1) e `-BinlogRetentionDays` (padrao 30; intervalo 1 a 365 dias). A retencao e por idade, nao um limite de espaco; precisa ser dimensionada antes da implantacao. Esses parametros nao alteram `my.ini` existente e nao provocam reinicio para aplicar configuracoes.
+
+O build e o preflight do instalador exigem `mysqld.exe`, `mysql.exe`, `mysqldump.exe` e `mysqlbinlog.exe`, da mesma versao oficial MySQL **8.0.x**, a partir de **8.0.26** (contrato `--source-data`). A validacao usa metadados dos executaveis, sem iniciar servidor ou executar backups. Outras series, inclusive 8.4, exigem homologacao especifica. O pacote e validado antes da limpeza do build e novamente no staging.
+
+### Conta exclusiva de backup
+
+Somente na instancia recem-criada e apos confirmar que nao existem outros bancos de usuario, o instalador provisiona `sysvarhub_backup@127.0.0.1`. Nao reutiliza conta anterior nem altera suas credenciais. Os privilegios preparados sao:
+
+- `SELECT`, `SHOW VIEW`, `TRIGGER` apenas no banco literal `sysvarhub_db` (escape do `_` conforme `partial_revokes`, sem ampliar acesso por curinga);
+- `RELOAD`, `REPLICATION CLIENT`, `REPLICATION SLAVE` globais, necessarios para coordenadas/bloqueio breve do dump e leitura dos binlogs.
+
+Nao sao concedidos `ALL PRIVILEGES`, `GRANT OPTION`, `FILE`, `PROCESS` ou permissoes gerais de escrita. O contrato previsto para o dump e `--single-transaction --quick --source-data=2 --no-tablespaces --set-gtid-purged=OFF --databases sysvarhub_db`. Este prompt nao executa nem implementa o dump. Rotinas armazenadas/eventos SQL nao fazem parte do esquema atual; se introduzidos, revisar cobertura e privilegios antes de considerar o backup completo.
+
+A credencial aleatoria fica em `config\mysql-backup.cnf`, com destino TCP fixo 3307. O arquivo e criado sem sobrescrita, recebe ACL restrita a SYSTEM/Administradores antes de gravar o segredo e nao e impresso. A conta administrativa e usada somente pelo provisionamento do instalador, nunca como identidade de um processo de backup. Falhas parciais exigem assistencia; nao ha tentativa automatica de apagar ou recriar contas.
+
+**Escopo dos binlogs:** `REPLICATION SLAVE` nao pode ser limitado por banco. Uma filtragem do dump nao protege um binlog bruto de instancia compartilhada. Portanto, nao provisionar essa conta nem capturar logs no MySQL DEV ou em instancia com outros bancos. A futura rotina devera confirmar identidade, porta, exclusividade, versao e continuidade dos logs antes de iniciar/retomar captura; nao basta encontrar um arquivo de credenciais. Nenhum worker, captura, transmissao ou restauracao foi ativado aqui.
+
+### Instalacoes existentes
+
+Configuracao e conta de backup existentes permanecem intactas; o instalador emite aviso de adequacao assistida para backup. A atualizacao normal preexistente do instalador permanece separada dessa preparacao. Antes de habilitar backups em uma instalacao antiga, o suporte deve verificar configuracao efetiva, exclusividade do servidor, versao em execucao versus ferramentas, permissao minima, espaco e retencao. Eventual alteracao de configuracao/reinicio exige janela e autorizacao proprias; nao e realizada automaticamente pela preparacao de backup.
+
+Testes isolados (nao executam o instalador nem conectam ao MySQL):
+
+```powershell
+powershell.exe -NoProfile -Command "Invoke-Pester -Script deploy/windows/tests/mysql-backup.Tests.ps1 -EnableExit"
+```
+
+Fontes tecnicas: [mysqldump](https://dev.mysql.com/doc/refman/8.0/en/mysqldump.html) e [mysqlbinlog](https://dev.mysql.com/doc/refman/8.0/en/mysqlbinlog.html).

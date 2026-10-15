@@ -1,9 +1,12 @@
 param(
     [string]$InstallRoot = "C:\Program Files\Sysvar Hub",
-    [string]$ProgramDataRoot = "C:\ProgramData\SysvarHub"
+    [string]$ProgramDataRoot = "C:\ProgramData\SysvarHub",
+    [ValidateRange(1, 2147483647)][int]$MySqlServerId = 1,
+    [ValidateRange(1, 365)][int]$BinlogRetentionDays = 30
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "mysql-backup.ps1")
 
 $ConfigRoot = Join-Path $ProgramDataRoot "config"
 $LogRoot = Join-Path $ProgramDataRoot "logs"
@@ -12,13 +15,12 @@ $MysqlData = Join-Path $ProgramDataRoot "mysql\data"
 $EnvFile = Join-Path $ConfigRoot "sysvarhub.env"
 $MysqlAdminFile = Join-Path $ConfigRoot "mysql-admin.cnf"
 $MyIni = Join-Path $ConfigRoot "my.ini"
+$MysqlBackupFile = Join-Path $ConfigRoot "mysql-backup.cnf"
 $ServiceExe = Join-Path $InstallRoot "runtime\SysvarHubService.exe"
 $Mysqld = Join-Path $InstallRoot "mysql\bin\mysqld.exe"
 $Mysql = Join-Path $InstallRoot "mysql\bin\mysql.exe"
 $AclSystem = "*S-1-5-18:F"
 $AclAdministrators = "*S-1-5-32-544:F"
-
-New-Item -ItemType Directory -Force -Path $ConfigRoot, $LogRoot, (Join-Path $ProgramDataRoot "backup"), $DataRoot, $MysqlData | Out-Null
 
 function New-Secret([int]$Length = 48) {
     $bytes = New-Object byte[] $Length
@@ -33,7 +35,9 @@ function New-Secret([int]$Length = 48) {
 
 function Protect-SecretFile([string]$Path) {
     icacls $Path /inheritance:r | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Falha ao proteger arquivo de credenciais." }
     icacls $Path /grant:r $AclSystem $AclAdministrators | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Falha ao restringir arquivo de credenciais." }
 }
 
 function Write-MySqlAdminFile([string]$Password) {
@@ -81,6 +85,7 @@ function Invoke-MySqlCommand {
         [string[]]$Arguments,
         [string]$InputSql,
         [switch]$Probe,
+        [switch]$ReadOutput,
         [string]$FailureMessage = "Comando MySQL falhou."
     )
 
@@ -88,9 +93,9 @@ function Invoke-MySqlCommand {
     $ErrorActionPreference = "Continue"
     try {
         if ($InputSql) {
-            $null = $InputSql | & $Mysql @Arguments 2>&1
+            $output = @($InputSql | & $Mysql @Arguments 2>&1)
         } else {
-            $null = & $Mysql @Arguments 2>&1
+            $output = @(& $Mysql @Arguments 2>&1)
         }
         $exitCode = $LASTEXITCODE
     } finally {
@@ -104,6 +109,7 @@ function Invoke-MySqlCommand {
     if ($exitCode -ne 0) {
         throw $FailureMessage
     }
+    if ($ReadOutput) { return $output }
 }
 
 function Get-MySqlAdminArgs {
@@ -137,6 +143,18 @@ function Set-MySqlRootPasswordFromAdminFile {
     }
 }
 
+# Preflight somente de leitura, antes de criar/configurar qualquer instalacao.
+$null = Assert-HubMySqlToolchain (Join-Path $InstallRoot "mysql")
+$IsNewMySqlInstallation = Test-HubMySqlNewInstallation -ConfigRoot $ConfigRoot -MysqlData $MysqlData `
+    -ServiceExists ($null -ne (Get-Service -Name "SysvarHubMySQL" -ErrorAction SilentlyContinue))
+if (-not $IsNewMySqlInstallation -and (-not (Test-Path -LiteralPath $MyIni) -or -not (Test-Path -LiteralPath (Join-Path $MysqlData "mysql")))) {
+    throw "Instalacao MySQL existente ou incompleta: configuracao/dados exigem adequacao assistida. Nenhum my.ini sera recriado nem dados reinicializados."
+}
+if ($IsNewMySqlInstallation -and (Test-MySqlTcpReady 1)) {
+    throw "Porta 3307 ja ocupada. Nao provisionar contas em um servidor desconhecido; requer adequacao assistida."
+}
+New-Item -ItemType Directory -Force -Path $ConfigRoot, $LogRoot, (Join-Path $ProgramDataRoot "backup"), $DataRoot, $MysqlData | Out-Null
+
 if (-not (Test-Path $EnvFile)) {
     $SecretKey = New-Secret 64
     $DbPassword = New-Secret 48
@@ -169,20 +187,9 @@ if (-not (Test-Path $EnvFile)) {
     }
 }
 
-if (-not (Test-Path $MyIni)) {
-    @(
-        "[mysqld]",
-        "basedir=$($InstallRoot.Replace('\','/'))/mysql",
-        "datadir=$($MysqlData.Replace('\','/'))",
-        "port=3307",
-        "bind-address=127.0.0.1",
-        "character-set-server=utf8mb4",
-        "collation-server=utf8mb4_unicode_ci",
-        "default-storage-engine=INNODB",
-        "innodb_flush_log_at_trx_commit=1",
-        "[client]",
-        "default-character-set=utf8mb4"
-    ) | Set-Content -LiteralPath $MyIni -Encoding ASCII
+if ($IsNewMySqlInstallation) {
+    Get-HubMySqlNewConfig -InstallRoot $InstallRoot -MysqlData $MysqlData -ServerId $MySqlServerId -RetentionDays $BinlogRetentionDays |
+        Set-Content -LiteralPath $MyIni -Encoding ASCII
 }
 
 $MysqlSystemDir = Join-Path $MysqlData "mysql"
@@ -227,6 +234,8 @@ Invoke-MySqlCommand `
     -Arguments (Get-MySqlAdminArgs) `
     -InputSql "CREATE DATABASE IF NOT EXISTS sysvarhub_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE USER IF NOT EXISTS 'sysvarhub'@'127.0.0.1' IDENTIFIED BY '$DbPassword'; GRANT ALL PRIVILEGES ON sysvarhub_db.* TO 'sysvarhub'@'127.0.0.1'; FLUSH PRIVILEGES;" `
     -FailureMessage "Preparacao do banco Sysvar Hub falhou."
+
+$null = Initialize-HubMySqlBackupAccount -NewInstallation $IsNewMySqlInstallation -CredentialFile $MysqlBackupFile
 
 & $ServiceExe manage migrate --noinput
 if ($LASTEXITCODE -ne 0) { throw "Migrations falharam." }
