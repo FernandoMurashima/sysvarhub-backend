@@ -297,6 +297,9 @@ class BackupSender:
                 # Confirm the immediate predecessor, avoiding remote rescans and starvation.
                 start = max(0, pending_indices[0] - 1) if pending_indices else len(entries)
                 for entry in entries[start:]:
+                    # Django's UUID route converter requires the canonical hyphenated spelling.
+                    # Keep checkpoint/manifest IDs unchanged (32 hex digits).
+                    route_uuid = str(uuid.UUID(entry["id"]))
                     saved = state["files"].get(entry["id"], {})
                     if time.monotonic() - started >= self.max_seconds:
                         break
@@ -305,7 +308,7 @@ class BackupSender:
                     state["status"] = "ENVIO_EM_ANDAMENTO"
                     self.save(state)
                     if saved.get("progress"):
-                        progress = validate_progress(self.client.request("GET", entry["id"] + "/progresso/"), entry, saved["progress"])
+                        progress = validate_progress(self.client.request("GET", route_uuid + "/progresso/"), entry, saved["progress"])
                     else:
                         with safe_path(entry["manifest_path"]).open("rb") as manifest_stream:
                             original = manifest_stream.read(1024 * 1024 + 1)
@@ -338,7 +341,7 @@ class BackupSender:
                             stream.seek(offset)
                             digest = file_hash(stream, length)
                             stream.seek(offset)
-                            response = self.client.request("PUT", entry["id"] + "/partes/" + str(progress["proxima_parte"]) + "/",
+                            response = self.client.request("PUT", route_uuid + "/partes/" + str(progress["proxima_parte"]) + "/",
                                 stream=stream, length=length, headers={"X-Upload-Id": progress["upload_uuid"],
                                 "X-Upload-Offset": str(offset), "X-Chunk-SHA256": digest})
                             confirmed = validate_progress(response, entry, progress)
@@ -349,7 +352,7 @@ class BackupSender:
                             self.save(state)
                     # Only a confirmed final response permits the next chain member.
                     # Receiving a file does not imply validation for recovery.
-                    response = self.client.request("POST", entry["id"] + "/finalizar/", {"upload_uuid": progress["upload_uuid"]})
+                    response = self.client.request("POST", route_uuid + "/finalizar/", {"upload_uuid": progress["upload_uuid"]})
                     progress = validate_progress(response, entry, progress)
                     if progress["estado"] != "RECEBIDO":
                         raise TransferError("RECEIPT_REQUIRED", True)

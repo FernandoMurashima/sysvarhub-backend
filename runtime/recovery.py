@@ -115,7 +115,7 @@ def load_package(plan):
         else:
             coordinate(item['fim'])
             prior_point = previous['inicio'] if previous['tipo'] == 'FULL' else previous['fim']
-            if item.get('predecessor_uuid') != previous['backup_uuid'] or item['inicio'] != prior_point or item['fim'] == item['inicio']:
+            if item.get('predecessor_uuid') != previous['backup_uuid'] or any(item['inicio'][key] != prior_point[key] for key in ('file','position','anchor')) or item['fim'] == item['inicio']:
                 raise RecoveryError('CHAIN_GAP_OR_OVERLAP')
         path = local_path(root / expected_name)
         before = fingerprint(path)

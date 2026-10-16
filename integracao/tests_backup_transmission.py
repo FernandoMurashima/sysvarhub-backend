@@ -61,7 +61,9 @@ class Simulator(BaseHTTPRequestHandler):
             server.expected[identifier] = doc["archive"]["sha256"]
             progress = server.sessions[identifier]
         else:
-            identifier = self.path.split("/")[4]
+            route_uuid = self.path.split("/")[4]
+            assert route_uuid == str(uuid.UUID(route_uuid))  # Match Central's <uuid:...> converter.
+            identifier = uuid.UUID(route_uuid).hex
             progress = server.sessions[identifier]
             if "/partes/" in self.path:
                 index = int(self.path.split("/")[-2])
@@ -186,6 +188,14 @@ class TransmissionTests(unittest.TestCase):
         self.assertEqual([len(call[3]) for call in parts], [7, 7, 7, 7, 7, 1])
         self.assertEqual(bytes(self.server.received[self.documents[0]["id"]]), b"FICTITIOUS-GZIP-FILE-ONLY-1234567890")
         self.assertIsNotNone(state["last_full"])
+
+    def test_canonical_routes_preserve_original_checkpoint_ids(self):
+        state = self.run_sender()
+        identifier = self.documents[0]["id"]
+        self.assertIn(identifier, state["files"])
+        calls = [call for call in self.server.calls if not call[1].endswith("iniciar/")]
+        self.assertTrue(calls)
+        self.assertTrue(all(call[1].split("/")[4] == str(uuid.UUID(identifier)) for call in calls))
 
     def test_incrementals_in_sequence_after_confirmed_full(self):
         self.add_backup(True)
@@ -402,7 +412,7 @@ class TransmissionTests(unittest.TestCase):
         self.assertEqual(state["status"], "RECEBIDO_CENTRAL")
         queries = [call for call in self.server.calls if call[0] == "GET"]
         self.assertEqual(len(queries), 1)
-        self.assertIn(self.documents[-2]["id"], queries[0][1])
+        self.assertIn(str(uuid.UUID(self.documents[-2]["id"])), queries[0][1])
 
     def test_incremental_backoff_keeps_growing_after_predecessor_confirmation(self):
         self.run_sender()
@@ -452,7 +462,7 @@ class TransmissionTests(unittest.TestCase):
                 if size < 0 or size > 65536:
                     raise AssertionError("unbounded transport read")
                 return super().read(size)
-        progress = self.client.request("PUT", self.documents[0]["id"] + "/partes/0/", stream=Bounded(payload),
+        progress = self.client.request("PUT", str(uuid.UUID(self.documents[0]["id"])) + "/partes/0/", stream=Bounded(payload),
             length=len(payload), headers={"X-Upload-Id": initial["upload_uuid"], "X-Upload-Offset": "0",
                                          "X-Chunk-SHA256": hashlib.sha256(payload).hexdigest()})
         self.assertEqual(progress["offset"], len(payload))

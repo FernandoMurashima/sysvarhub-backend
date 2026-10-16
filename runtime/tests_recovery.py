@@ -118,6 +118,14 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(sizes,list(map(len,self.payloads)))
         self.assertEqual(len(paths),3)
 
+    def test_central_full_reference_is_metadata_and_anchor_still_enforced(self):
+        self.doc['arquivos'][0]['inicio']['reference']='SNAPSHOT_START'
+        self.save_manifest()
+        self.assertEqual(len(r.load_package(self.plan)[1]),3)
+        self.doc['arquivos'][1]['inicio']['anchor']['sha256']='b'*64
+        self.save_manifest()
+        with self.assertRaisesRegex(r.RecoveryError,'CHAIN_GAP_OR_OVERLAP'): r.load_package(self.plan)
+
     def test_incomplete_or_missing_selected_point(self):
         self.doc['arquivos'].pop(); self.save_manifest()
         with self.assertRaisesRegex(r.RecoveryError,'TARGET_POINT_MISSING'):
