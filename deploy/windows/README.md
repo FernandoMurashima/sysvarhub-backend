@@ -384,3 +384,11 @@ Testes isolados: `integracao.tests_backup_transmission` (servidor HTTPS local co
 certificado de teste, arquivos ficticios), `integracao.tests_backup_transmission_command`
 e `tests/mysql-backup-transmission.Tests.ps1`. Sem MySQL, transmissao operacional ou
 tarefas reais. Transporte baseado na [biblioteca HTTP oficial do Python](https://docs.python.org/3.11/library/http.client.html).
+
+
+## Recuperacao assistida — Prompt 11
+
+Modo explicito, DRY-RUN por padrao, sem liberacao automatica do PDV.
+Procedimento, conta temporaria, pacote autorizado e limitacoes em
+[RECUPERACAO.md](RECUPERACAO.md). Apenas testes isolados foram executados;
+nenhuma restauracao real foi homologada nesta etapa.

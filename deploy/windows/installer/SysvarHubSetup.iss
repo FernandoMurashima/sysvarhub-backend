@@ -152,6 +152,11 @@ end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
+  if (ExpandConstant('{param:RECOVERY|0}') = '1') and (ExpandConstant('{param:CONFIRMRECOVERY|0}') <> '1') then
+  begin
+    Result := 'Recuperacao exige /RECOVERY=1 /CONFIRMRECOVERY=1 e acompanhamento do suporte.';
+    exit;
+  end;
   SysvarLocalAgentWasRunning := False;
   SysvarLocalAgentTouched := False;
 
@@ -180,6 +185,11 @@ begin
   begin
     PowerShell := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
     Parameters := ExpandConstant('-ExecutionPolicy Bypass -File "{app}\scripts\install-hub.ps1" -InstallRoot "{app}"');
+
+    if ExpandConstant('{param:RECOVERY|0}') = '1' then
+    begin
+      Parameters := Parameters + ' -RecoveryMode -ConfirmRecoveryPreparation';
+    end;
 
     if not Exec(PowerShell, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     begin

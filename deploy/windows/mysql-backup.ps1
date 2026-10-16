@@ -142,7 +142,7 @@ function Assert-HubBackupLocalPath {
 }
 
 function Assert-HubBackupCredential {
-    param([string]$Path)
+    param([string]$Path, [ValidateSet('sysvarhub_backup','sysvarhub_restore')][string]$ExpectedUser = 'sysvarhub_backup')
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Credencial exclusiva de backup ausente; requer adequacao assistida." }
     $null = Assert-HubBackupLocalPath $Path
     $acl = Get-Acl -LiteralPath $Path
@@ -159,7 +159,7 @@ function Assert-HubBackupCredential {
         if (-not $section -or $line -notmatch '^([a-z]+)=(.*)$' -or $values.ContainsKey($Matches[1])) { throw "Formato da credencial de backup invalido." }
         $values[$Matches[1]] = $Matches[2]
     }
-    if ($values.Count -ne 5 -or $values.user -ne 'sysvarhub_backup' -or $values.host -ne '127.0.0.1' -or $values.port -ne '3307' -or $values.protocol -ne 'TCP' -or $values.password -notmatch '^[A-Za-z0-9_-]+$') { throw "Credencial deve pertencer exclusivamente a sysvarhub_backup em 127.0.0.1:3307." }
+    if ($values.Count -ne 5 -or $values.user -ne $ExpectedUser -or $values.host -ne '127.0.0.1' -or $values.port -ne '3307' -or $values.protocol -ne 'TCP' -or $values.password -notmatch '^[A-Za-z0-9_-]+$') { throw "Credencial deve pertencer exclusivamente a $ExpectedUser em 127.0.0.1:3307." }
 }
 
 function Get-HubBackupConnectionArguments {

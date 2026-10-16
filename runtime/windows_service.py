@@ -10,6 +10,8 @@ LOGGER = logging.getLogger(__name__)
 
 
 def bootstrap():
+    from runtime.recovery_guard import assert_operation_allowed
+    assert_operation_allowed()
     load_env_file(ENV_FILE)
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "sysvarhub.settings")
 
@@ -258,6 +260,10 @@ def main():
         return
 
     command = sys.argv[1]
+
+    if command == "recover":
+        from runtime.recovery import main as recovery_main
+        raise SystemExit(recovery_main(sys.argv[2:]))
 
     if command == "console":
         run_console()

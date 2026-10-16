@@ -13,6 +13,9 @@ from runtime.windows_runtime import ENV_FILE, load_env_file, local_hostnames_and
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+from runtime.recovery_guard import assert_operation_allowed
+
+assert_operation_allowed()
 load_env_file(ENV_FILE)
 
 

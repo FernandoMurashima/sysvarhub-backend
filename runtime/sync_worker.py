@@ -34,6 +34,8 @@ class SyncWorker:
             self.stop_event.wait(self.interval)
 
     def executar_ciclo(self):
+        from runtime.recovery_guard import assert_operation_allowed
+        assert_operation_allowed()
         hub = HubConfig.objects.first()
         if not hub or not hub.ativo or not hub.retaguarda_token or not hub.retaguarda_url:
             return

@@ -2,11 +2,22 @@ param(
     [string]$InstallRoot = "C:\Program Files\Sysvar Hub",
     [string]$ProgramDataRoot = "C:\ProgramData\SysvarHub",
     [ValidateRange(1, 2147483647)][int]$MySqlServerId = 1,
-    [ValidateRange(1, 365)][int]$BinlogRetentionDays = 30
+    [ValidateRange(1, 365)][int]$BinlogRetentionDays = 30,
+    [switch]$RecoveryMode,
+    [switch]$ConfirmRecoveryPreparation
 )
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "mysql-backup.ps1")
+
+# Recuperacao e uma entrada explicita; o fluxo normal continua inalterado sem marcador.
+$RecoveryMarker = Join-Path $ProgramDataRoot 'config\recovery-block.json'
+if ($RecoveryMode) {
+    . (Join-Path $PSScriptRoot 'mysql-recovery.ps1')
+    $null = Initialize-HubRecoveryMode $ProgramDataRoot -SupportConfirmed:$ConfirmRecoveryPreparation
+} elseif (Test-Path -LiteralPath $RecoveryMarker) {
+    throw 'Instalacao bloqueada para recuperacao assistida. Nao aplicar migrations nem iniciar o Hub.'
+}
 
 $ConfigRoot = Join-Path $ProgramDataRoot "config"
 $LogRoot = Join-Path $ProgramDataRoot "logs"
@@ -221,10 +232,27 @@ if ($NeedsRootPasswordBootstrap) {
     throw "Estado administrativo do MySQL inconsistente: credencial local ausente ou invalida, e root sem senha nao esta acessivel. Execute recuperacao explicita antes de reinstalar."
 }
 
+if ($RecoveryMode) {
+    Assert-HubRecoveryStopped
+    Assert-HubBackupService (Join-Path $InstallRoot 'mysql') $ProgramDataRoot
+    $probeSql = "SELECT JSON_OBJECT('port',@@port,'version',VERSION(),'basedir',@@basedir,'datadir',@@datadir,'other',(SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('mysql','information_schema','performance_schema','sys','sysvarhub_db')),'objects',(SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='sysvarhub_db')+(SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='sysvarhub_db')+(SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA='sysvarhub_db'));"
+    $probe = ((Invoke-MySqlCommand -Arguments ((Get-MySqlAdminArgs) + @('--batch','--skip-column-names')) -InputSql $probeSql -ReadOutput) -join '') | ConvertFrom-Json
+    $toolVersion = Get-HubMySqlBinaryVersion $Mysqld
+    if ($probe.port -ne 3307 -or $probe.other -ne 0 -or $probe.objects -ne 0 -or $probe.version -notmatch ('^' + [regex]::Escape($toolVersion.ToString()) + '(?:[-.]|$)') -or [IO.Path]::GetFullPath($probe.basedir).TrimEnd('\') -ine [IO.Path]::GetFullPath((Join-Path $InstallRoot 'mysql')).TrimEnd('\') -or [IO.Path]::GetFullPath($probe.datadir).TrimEnd('\') -ine [IO.Path]::GetFullPath($MysqlData).TrimEnd('\')) {
+        throw 'Destino de recuperacao nao vazio, compartilhado ou incompativel. Preparacao assistida necessaria; nenhum dado sera apagado.'
+    }
+}
+
 Invoke-MySqlCommand `
     -Arguments (Get-MySqlAdminArgs) `
     -InputSql "CREATE DATABASE IF NOT EXISTS sysvarhub_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE USER IF NOT EXISTS 'sysvarhub'@'127.0.0.1' IDENTIFIED BY '$DbPassword'; GRANT ALL PRIVILEGES ON sysvarhub_db.* TO 'sysvarhub'@'127.0.0.1'; FLUSH PRIVILEGES;" `
     -FailureMessage "Preparacao do banco Sysvar Hub falhou."
+
+if ($RecoveryMode) {
+    Assert-HubRecoveryStopped
+    Write-Host 'MYSQL_PREPARADO_HUB_BLOQUEADO: provisionar conta assistida e validar pacote; nenhuma migration ou operacao do PDV executada.'
+    return
+}
 
 $null = Initialize-HubMySqlBackupAccount -NewInstallation $IsNewMySqlInstallation -CredentialFile $MysqlBackupFile
 
